@@ -1,0 +1,54 @@
+[project]
+name = "mia-train"
+version = "0.1.0"
+description = "PyTorch-native distributed training framework"
+# 3.11 is the real floor: src/utils/config.py reads .toml with stdlib `tomllib`, which was
+# added in 3.11. DESIGN.md makes TOML the config format and core code must stay dependency-free,
+# so there is no 3.10-compatible reader to fall back on.
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0",
+    "tensorboard>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+    "mypy>=1.8",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra --strict-markers"
+markers = [
+    "unit: fast single-process CPU unit tests for registries, configs, and single layers",
+    "cpu_dist: multi-process CPU distributed tests using the Gloo backend (no GPU required)",
+    "gpu_dist: multi-process GPU distributed tests requiring CUDA hardware",
+    "slow: long-running tests, e.g. convergence sanity checks",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+files = ["src", "tests"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true

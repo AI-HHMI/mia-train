@@ -1,0 +1,20 @@
+# Template for cluster-local configuration.
+# Copy this file to active.toml (git-ignored, never committed) and fill in
+# real paths/settings for your environment. Core code in src/ must read
+# paths from active.toml at runtime and must never hardcode cluster paths.
+
+[environment]
+python_venv = "/path/to/venv"           # absolute path to the project's virtualenv
+dataset_root = "/path/to/datasets"      # root directory containing training/eval datasets
+# Must be an ABSOLUTE path: run artifacts land here regardless of the launching directory.
+checkpoint_dir = "/path/to/checkpoints" # root directory for DCP checkpoints and run outputs
+
+[scheduler]
+name = "lsf"                 # one of: "lsf", "slurm", "local"
+project = "project_name"     # billing/allocation group (e.g. LSF -P flag)
+queue_cpu = "cpu_queue_name"
+queue_gpu = "gpu_queue_name"
+
+[distributed]
+nccl_socket_ifname = "eth0"  # NCCL_SOCKET_IFNAME, cluster-specific network interface
+master_port = 29500

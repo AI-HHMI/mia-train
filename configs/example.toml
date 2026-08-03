@@ -1,0 +1,42 @@
+# Reference for the run-configuration schema consumed by src/train.py.
+# The `name` in each component section is a registry key; every other key in that
+# section is passed to the implementation's constructor as a keyword argument.
+# No concrete model/algorithm/dataset is implemented yet, so the names here are
+# placeholders and this file is not yet runnable as-is.
+
+experiment_name = "example"
+
+[model]
+name = "my_model"       # key registered via @ModelRegistry.register(...)
+
+[algorithm]
+name = "my_algorithm"   # key registered via @AlgorithmRegistry.register(...)
+
+[data]
+name = "my_dataset"     # key registered via @DataRegistry.register(...)
+
+# Optional. Omit to disable validation; requires trainer.val_every > 0 to run.
+# [val_data]
+# name = "my_dataset"
+
+[trainer]
+max_steps = 1000
+batch_size = 8
+lr = 3e-4
+warmup_steps = 100
+min_lr_ratio = 0.1
+weight_decay = 0.1
+grad_clip_norm = 1.0
+precision = "bf16"      # "fp32" or "bf16"
+log_every = 10
+checkpoint_every = 500  # 0 disables checkpointing
+val_every = 0           # 0 disables validation
+num_workers = 4
+seed = 0
+
+# Must multiply to the torchrun world size (total GPUs).
+# See deploy/lsf/README.md for choosing these on the cluster.
+[parallelism]
+dp_replicate = 1
+dp_shard = 1
+tp = 1
