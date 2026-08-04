@@ -1,8 +1,9 @@
 # Submitting `mia-train` jobs on LSF (Janelia)
 
-Cluster-wide policy, queue tables, and the slot model live in
-[`.claude/rules/cluster.md`](../../.claude/rules/cluster.md) — the admin-authored hint sheet. This
-file only covers **`mia-train`-specific** recipes. Read the hint sheet first.
+Cluster-wide policy, queue tables, and the slot model live in the admin-authored HPC hint sheet,
+kept locally at `.claude/rules/cluster.md`. That file is **not committed** — it contains internal
+infrastructure detail — so ask the HPC team for a copy. Read it first; this file only covers
+**`mia-train`-specific** recipes.
 
 ## Substitute your own values
 

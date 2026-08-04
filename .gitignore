@@ -1,6 +1,8 @@
 # Machine-local cluster configuration (paths, queues) — never committed.
 configs/cluster/active.toml
 
+.claude/
+
 # Run artifacts. These normally land in [environment].checkpoint_dir, but a run
 # launched with an explicit relative --output-root can still create these here.
 outputs/

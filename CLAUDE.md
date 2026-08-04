@@ -31,10 +31,12 @@ whose failure would otherwise be silent or unclear.
 
 ## Cluster & Execution Rules
 
-0. **Read the cluster hint sheet first.** `.claude/rules/cluster.md` is the admin-authored
-Janelia HPC hint sheet (LSF queues, the slot model, storage tiers, and a list of mistakes AI
-agents commonly make on this cluster). Read it before submitting jobs or advising on job scripts.
-Repo-specific submission recipes live in `deploy/lsf/README.md`.
+0. **Read the cluster hint sheet first, if it is present.** `.claude/rules/cluster.md` is the
+admin-authored HPC hint sheet (LSF queues, the slot model, storage tiers, and a list of mistakes
+AI agents commonly make on this cluster). Read it before submitting jobs or advising on job
+scripts. It is deliberately **not committed** — see `.gitignore` — because it carries internal
+infrastructure detail that should not travel with the repo; ask the HPC team for a copy. Committed,
+repo-specific submission recipes live in `deploy/lsf/README.md`.
 
 1. **Environment & Paths**
 - **Local Environment Config:** Read `configs/cluster/active.toml` for dataset paths, checkpoint directories, and virtual environment paths. Never hardcode absolute cluster paths in `src/`.
