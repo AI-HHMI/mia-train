@@ -9,6 +9,10 @@ requires-python = ">=3.11"
 dependencies = [
     "torch>=2.0",
     "tensorboard>=2.0",
+    # miao (distribution name: miao-io) supplies the OME-NGFF volume dataset that
+    # src/data/miao_dataset.py wraps. It is not published on PyPI, so it is documented
+    # here rather than pinned: install it from the AI-HHMI/miao repository, e.g.
+    #   pip install -e /path/to/miao
 ]
 
 [project.optional-dependencies]
@@ -52,3 +56,11 @@ files = ["src", "tests"]
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
+
+# zarr ships `py.typed`, so mypy parses its installed source — which uses PEP 695 `type`
+# statements (3.12+) that mypy rejects under our 3.11 target, aborting the whole run. We only
+# touch zarr in test scaffolding (tests/conftest.py writes an OME-NGFF fixture), so treat it as
+# untyped like miao and pydantic rather than lowering `python_version` below the 3.11 floor.
+[[tool.mypy.overrides]]
+module = ["zarr.*"]
+follow_imports = "skip"

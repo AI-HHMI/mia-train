@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 from typing import Any
 
+import torch
 import torch.nn as nn
 from torch.distributed.tensor.parallel import ParallelStyle
 
@@ -17,6 +18,33 @@ class BaseModel(nn.Module, abc.ABC):
     @abc.abstractmethod
     def flops(self, input_shape: tuple[int, ...]) -> int:
         """Estimated forward-pass FLOPs for a single input of the given shape (no batch dim)."""
+
+    def prepare_input(self, batch: torch.Tensor, axes: str) -> torch.Tensor:
+        """Turn a dataset-shaped batch into whatever this architecture consumes.
+
+        `axes` is the dataset's per-sample axis order, e.g. miao's "lcxyz" — batch dimension
+        excluded. How many scale levels an architecture accepts, and where it expects the
+        channel axis, are properties of the architecture, so each one states and enforces its
+        own contract here: a single-resolution encoder rejects a multi-scale batch, while a
+        multi-scale one consumes the level axis directly.
+
+        Only algorithms that hand raw dataset batches to a model need this; the base class
+        cannot guess a correct answer, so it declines rather than inventing one.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement prepare_input, so it cannot be driven "
+            "by an algorithm that passes dataset-shaped batches through the model"
+        )
+
+    def extra_forward_methods(self) -> tuple[str, ...]:
+        """Methods besides `forward` through which this model's parameters get used.
+
+        FSDP2 all-gathers sharded parameters around `nn.Module.forward` and nothing else, so a
+        model an algorithm drives directly — MAE runs `ViT3D.embed`, masks the tokens, then runs
+        `ViT3D.encode` — must name those methods for `parallelize_model` to wrap them. Left empty
+        by architectures that are only ever called through `forward`.
+        """
+        return ()
 
     def num_parameters(self, trainable_only: bool = False) -> int:
         return sum(p.numel() for p in self.parameters() if not trainable_only or p.requires_grad)

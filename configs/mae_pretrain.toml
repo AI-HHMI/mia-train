@@ -1,0 +1,93 @@
+# MAE pretraining on the LMD v0.0.1 EM volumes.
+#
+# Launch on a GPU node (see deploy/lsf/README.md); far too large for CPU:
+#   torchrun --standalone --nproc_per_node=4 src/train.py --config configs/mae_pretrain.toml
+#
+# [parallelism] must multiply to the torchrun world size.
+
+experiment_name = "mae_pretrain_lmd"
+
+[model]
+name = "vit3d"
+img_size = [128, 128, 128]
+patch_size = [16, 16, 16]   # 8^3 = 512 patches per sample
+in_channels = 1
+embed_dim = 768
+depth = 12
+num_heads = 12
+
+[algorithm]
+name = "mae"
+# The sample axis order is taken from the dataset, so it is not repeated here.
+mask_ratio = 0.75
+decoder_embed_dim = 384
+decoder_depth = 4
+decoder_num_heads = 6
+norm_pix_loss = true
+
+[data]
+name = "miao_volumes"
+# The two volumes are stored with different axis orders on disk (jiefu is zyx, h01 is xyz);
+# output_axes normalizes both into this layout.
+output_axes = "lcxyz"
+patch_size = [128, 128, 128]
+samples_per_epoch = 100000
+
+# What these volumes actually contain, from their OME metadata (units are NANOMETRES):
+#   jiefu: isotropic, levels 16/32/64/128/256/512 nm -> 16 nm is the floor
+#   h01:   anisotropic, x/y 4/8/16/32/64 nm but z pinned at 33 nm until level 4
+#
+# Do not go below 33 nm here. miao selects the coarsest level whose voxel is <= the target on
+# EVERY axis, so a 32 nm request disqualifies every h01 level (z is 33) and silently falls back
+# to the finest one: measured, that reads 16.5 M voxels per sample instead of 0.28 M for the
+# same 64^3 output — ~59x the I/O for no extra information. Below 16 nm, jiefu is upsampled
+# outright. 33 nm is the finest isotropic scale both volumes genuinely have.
+#
+# vit3d is single-scale, so exactly one level per sample. Two ways to get that:
+#
+#   1. Fixed scale (below): every sample is read at the same resolution.
+#   2. Sampled scale: comment out the resolutions line and uncomment the block after it. miao
+#      then draws a fresh resolution per sample, so the scale varies across the batch while
+#      each sample stays independent and batch_size still means samples per step.
+resolutions = [[33, 33, 33]]
+
+# [data.resolution_sampling]
+# strategy = "log_uniform"
+# ranges = [[[33], [128]]]  # isotropic [min, max] nm; keep the floor at 33, see the note above
+# n_scales = 1              # must be 1: vit3d takes a single level per sample
+# sort = true
+
+[[data.volumes]]
+name = "Jiefu Cerebellum FIB-SEM"
+path = "/groups/miaai/miaai/lmd-v0.0.1/jiefu-cerebellum-fibsem_crop.zarr"
+image_key = "raw"
+zarr_version = "zarr3"
+weight = 0.5
+normalize = true
+
+[[data.volumes]]
+name = "H01 Human Cortex"
+path = "/groups/miaai/miaai/lmd-v0.0.1/h01-human-cortex.zarr"
+image_key = "raw"
+zarr_version = "zarr3"
+weight = 0.5
+normalize = true
+
+[trainer]
+max_steps = 100000
+batch_size = 2          # samples per step per rank (one scale level each)
+lr = 1.5e-4
+warmup_steps = 2000
+min_lr_ratio = 0.01
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+log_every = 50
+checkpoint_every = 2000
+num_workers = 4
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 4
+tp = 1

@@ -22,6 +22,15 @@ class BaseDataset(abc.ABC):
             self._dataset = self.build_dataset()
         return self._dataset
 
+    @property
+    def sample_axes(self) -> str | None:
+        """Axis order of one sample, if the source defines one (e.g. miao's "lcxyz").
+
+        Lets an algorithm adopt the data's layout instead of having it restated in config,
+        where the two could drift apart. `None` means the source makes no such promise.
+        """
+        return None
+
     def build_dataloader(
         self,
         *,

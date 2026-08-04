@@ -79,3 +79,29 @@ def load_run_config(path: Path) -> RunConfig:
 def as_plain_dict(config: RunConfig) -> dict[str, Any]:
     """Fully resolved settings, including defaults absent from the source file."""
     return dataclasses.asdict(config)
+
+
+def flatten_resolved(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Nested resolved settings as dotted paths, e.g. {"model.kwargs.embed_dim": 768}."""
+    flat: dict[str, Any] = {}
+    for key, value in config.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict):
+            flat.update(flatten_resolved(value, f"{path}."))
+        else:
+            flat[path] = value
+    return flat
+
+
+def diff_resolved(old: dict[str, Any], new: dict[str, Any]) -> dict[str, tuple[Any, Any]]:
+    """Settings that differ between two resolved configs, as path -> (old, new).
+
+    Used when resuming, to say plainly what changed since the run was started rather than
+    letting a silent difference alter training half way through.
+    """
+    before, after = flatten_resolved(old), flatten_resolved(new)
+    return {
+        path: (before.get(path), after.get(path))
+        for path in sorted(set(before) | set(after))
+        if before.get(path) != after.get(path)
+    }

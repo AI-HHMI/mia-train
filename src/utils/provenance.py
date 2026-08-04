@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -59,10 +60,23 @@ def write_run_artifacts(
         (output_dir / "git_commit.txt").write_text(
             f"no git repository at {repo_dir}; run provenance unavailable\n", encoding="utf-8"
         )
+        _append_attempt(output_dir, "no git repository")
         return
 
-    (output_dir / "git_commit.txt").write_text(
-        f"{metadata['commit']}{' (dirty)' if metadata['dirty'] else ''}\n", encoding="utf-8"
-    )
+    stamp = f"{metadata['commit']}{' (dirty)' if metadata['dirty'] else ''}"
+    (output_dir / "git_commit.txt").write_text(f"{stamp}\n", encoding="utf-8")
     if metadata["dirty"]:
         (output_dir / "dirty.patch").write_text(metadata["diff"], encoding="utf-8")
+    _append_attempt(output_dir, stamp)
+
+
+def _append_attempt(output_dir: Path, commit_stamp: str) -> None:
+    """Record this attempt, since a resumed run overwrites the single-attempt artifacts.
+
+    `git_commit.txt` and `resolved_config.json` describe the attempt that wrote them, so a
+    resume replaces them and the earlier code state would otherwise be lost — even though it
+    produced some of the steps in the checkpoint.
+    """
+    line = f"{datetime.now().isoformat(timespec='seconds')}  {commit_stamp}\n"
+    with (output_dir / "attempts.log").open("a", encoding="utf-8") as handle:
+        handle.write(line)

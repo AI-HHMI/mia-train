@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -15,7 +16,7 @@ from data.base import BaseDataset
 from data.registry import DataRegistry
 from distributed.parallel_dims import ParallelDims
 from engine.config import TrainerConfig
-from engine.run import build_trainer, resolve_output_dir
+from engine.run import _prepare_run_dir, build_trainer, resolve_output_dir
 from models.base import BaseModel
 from models.registry import ModelRegistry
 from utils.config import ComponentConfig, RunConfig
@@ -95,9 +96,9 @@ def _build_from_registries_and_train(
     trainer = build_trainer(config, Path(output_dir), mesh=mesh)
 
     batch = next(iter(trainer.train_loader))
-    before = trainer.algorithm.training_step(batch)["loss"].item()
+    before = trainer.algorithm(batch)["loss"].item()
     trainer.train()
-    after = trainer.algorithm.training_step(batch)["loss"].item()
+    after = trainer.algorithm(batch)["loss"].item()
     return before, after
 
 
@@ -137,3 +138,46 @@ def test_build_from_registries_and_train(run_distributed):
 def test_unregistered_model_name_raises(run_distributed):
     with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
         assert all(run_distributed(_unregistered_model_name_raises, world_size=2, args=(tmp,)))
+
+
+def _resume_latest_agrees_across_ranks(rank: int, world_size: int, root: str) -> str:
+    # Every rank must be handed the SAME directory to resume into. The caller seeds one, so the
+    # scan itself is deterministic here and this pins the broadcast rather than a race: without
+    # it, only rank 0 fills in the name and the others resume into output_root / "".
+    # The rank-dependent-timestamp case is covered by test_output_dir_agrees_across_ranks.
+    return str(resolve_output_dir(Path(root), "agree", "latest"))
+
+
+def _prep_failure_reaches_every_rank(rank: int, world_size: int, root: str) -> bool:
+    """An incompatible resume must fail on ALL ranks, not hang them in the barrier."""
+    output_dir = Path(root) / "hasconfig_20260101_000000"
+    try:
+        _prepare_run_dir(
+            output_dir, Path(root) / "config.toml", {"model": {"kwargs": {"d": 2}}}, rank
+        )
+    except RuntimeError as error:
+        return "could not prepare" in str(error)
+    return False
+
+
+@pytest.mark.cpu_dist
+def test_resume_latest_agrees_across_ranks(run_distributed):
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        existing = Path(tmp) / "agree_20260101_000000"
+        existing.mkdir()
+        paths = run_distributed(_resume_latest_agrees_across_ranks, world_size=2, args=(tmp,))
+    assert paths == [str(existing), str(existing)]
+
+
+@pytest.mark.cpu_dist
+def test_prep_failure_reaches_every_rank(run_distributed):
+    # Before this was broadcast, rank 0 raised alone and the others waited out the collective
+    # timeout — a bad config cost ten minutes instead of failing at once.
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        directory = Path(tmp) / "hasconfig_20260101_000000"
+        directory.mkdir()
+        (directory / "resolved_config.json").write_text(
+            json.dumps({"model": {"kwargs": {"d": 1}}}), encoding="utf-8"
+        )
+        (Path(tmp) / "config.toml").write_text("x = 1\n", encoding="utf-8")
+        assert all(run_distributed(_prep_failure_reaches_every_rank, world_size=2, args=(tmp,)))

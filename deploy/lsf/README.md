@@ -87,6 +87,39 @@ Notes:
 - Artifacts do **not** depend on the `cd` above — they go to the configured `checkpoint_dir`.
   The `cd` is only so `src/train.py` and the relative `--config` path resolve.
 
+## Resuming: write the submission script once, resubmit unchanged
+
+Long runs get interrupted — wall-time limits, node failures, preemption. Pass `--resume` and the
+same script serves both the first launch and every resubmission: it continues the newest run of
+this `experiment_name`, or starts fresh if there isn't one. No timestamp to look up, nothing to
+edit between attempts.
+
+```bash
+#!/bin/bash    # submit_pretrain.sh — safe to resubmit as-is
+cd "$MIA_TRAIN"
+"$VENV/bin/torchrun" --standalone --nproc_per_node=4 \
+    src/train.py --config configs/mae_pretrain.toml --resume
+```
+
+```bash
+# -r makes LSF requeue on node failure; because the script is idempotent, the requeue resumes
+bsub -P $PROJECT -q gpu_h100 -gpu "num=4" -n 48 -W 24:00 -r -J mia_pretrain \
+  -cwd $JOBS -o $JOBS/pretrain_%J.log -e $JOBS/pretrain_%J.err \
+  $JOBS/submit_pretrain.sh
+```
+
+To walk a run through several wall-time windows unattended, chain submissions with a dependency
+so each one starts when the last ends: `bsub -w "ended(<jobid>)" ... $JOBS/submit_pretrain.sh`.
+
+Notes:
+
+- `--resume <dir>` continues one exact directory, for when "newest" is not what you want.
+- Changing settings between attempts is allowed and reported: a new `lr` or a higher `max_steps`
+  logs a `[resume] continuing ... with changed settings` line. Changing the **architecture** is
+  refused, because the checkpoint holds the old parameters.
+- Each attempt appends to `attempts.log` in the run directory, since `git_commit.txt` and
+  `resolved_config.json` describe only the attempt that wrote them.
+
 ## Multi-node training
 
 > **Untested in this repo so far.** The recipe below follows cluster policy and the standard

@@ -13,7 +13,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 from algorithms.base import BaseAlgorithm
 from data.base import BaseDataset
 from distributed.parallel_dims import ParallelDims
-from distributed.parallelize import parallelize_model
+from distributed.parallelize import parallelize_algorithm
+from utils.device import move_to_device
 from utils.metrics import MetricLogger, reduce_metrics
 
 from .checkpoint import CheckpointManager
@@ -24,7 +25,7 @@ _AUTOCAST_DTYPES = {"bf16": torch.bfloat16}
 
 
 class Trainer:
-    """Runs the training loop, calling `algorithm.training_step(batch)` without inspecting it.
+    """Runs the training loop, calling the algorithm on each batch without inspecting it.
 
     Owns parallelism application, optimizer and LR schedule, mixed precision, metric logging,
     and DCP checkpointing — the pieces DESIGN.md requires the engine to handle exactly once.
@@ -50,7 +51,10 @@ class Trainer:
         torch.manual_seed(config.seed)
 
         if mesh is not None:
-            parallelize_model(algorithm.model, mesh, self.dims)
+            # The algorithm, not just its model: an algorithm's own parameters (MAE's decoder)
+            # have to be sharded alongside the model's, or grad clipping mixes DTensors with
+            # plain tensors.
+            parallelize_algorithm(algorithm, mesh, self.dims)
         self.algorithm = algorithm.to(self.device)
 
         self.optimizer = build_optimizer(self.algorithm, config)
@@ -105,6 +109,7 @@ class Trainer:
     def train(self) -> int:
         """Train until `max_steps`, resuming from the newest checkpoint if one exists."""
         step = self.checkpoints.load_latest()
+        resumed_from = step
         for _ in range(step):
             self.scheduler.step()
 
@@ -112,9 +117,11 @@ class Trainer:
         self.algorithm.train()
 
         while step < self.config.max_steps:
-            batch = next(batches)
+            batch = move_to_device(next(batches), self.device)
             with self._autocast():
-                metrics = self.algorithm.training_step(batch)
+                # Through __call__, not training_step: `BaseAlgorithm.forward` aliases it, and
+                # plain replication only all-reduces gradients from forward hooks.
+                metrics = self.algorithm(batch)
             metrics["loss"].backward()
 
             if self.config.grad_clip_norm is not None:
@@ -141,6 +148,17 @@ class Trainer:
                 self.logger.log(step, self.validate(), prefix="val")
                 self.algorithm.train()
 
+        # Save the final state unless the last step happened to land on the cadence. Otherwise
+        # finishing a run discards up to `checkpoint_every - 1` steps of training, since
+        # `max_steps` need not be a multiple of it. Skipped when nothing was trained, so
+        # re-running a finished run does not rewrite an identical checkpoint.
+        if (
+            self.config.checkpoint_every
+            and step > resumed_from
+            and step % self.config.checkpoint_every != 0
+        ):
+            self.checkpoints.save(step)
+
         self.logger.close()
         return step
 
@@ -155,7 +173,7 @@ class Trainer:
         with torch.no_grad():
             for batch in self.val_loader:
                 with self._autocast():
-                    metrics = self.algorithm.validation_step(batch)
+                    metrics = self.algorithm.validation_step(move_to_device(batch, self.device))
                 for name, value in reduce_metrics(metrics).items():
                     totals[name] = totals.get(name, 0.0) + value
                 batches += 1

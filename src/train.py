@@ -25,12 +25,29 @@ def parse_args() -> argparse.Namespace:
             "[environment].checkpoint_dir from configs/cluster/active.toml"
         ),
     )
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="latest",
+        default=None,
+        metavar="RUN_DIR",
+        help=(
+            "continue a previous run instead of starting fresh. Bare --resume takes the newest "
+            "run of this experiment (and starts fresh if there is none), so the same submission "
+            "script works for the first launch and every resubmission; pass a directory to "
+            "continue that exact run"
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    output_dir = run(args.config, args.output_root)
+    # Imported here rather than at module scope: it pulls in miao (~2s, via tensorstore and
+    # zarr), which neither --help nor the argument-parsing tests should have to pay for.
+    import components  # noqa: F401  (populates the registries; see its docstring)
+
+    output_dir = run(args.config, args.output_root, args.resume)
     print(f"run artifacts: {output_dir}", flush=True)
 
 

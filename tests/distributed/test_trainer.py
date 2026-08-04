@@ -74,9 +74,9 @@ def _fsdp_training_reduces_loss(rank: int, world_size: int, output_dir: str) -> 
         max_steps=30, batch_size=4, lr=1e-2, log_every=1000, precision="fp32", seed=0
     )
     trainer = _build_trainer(Path(output_dir), config, world_size)
-    first = trainer.algorithm.training_step(next(iter(trainer.train_loader)))["loss"].item()
+    first = trainer.algorithm(next(iter(trainer.train_loader)))["loss"].item()
     trainer.train()
-    last = trainer.algorithm.training_step(next(iter(trainer.train_loader)))["loss"].item()
+    last = trainer.algorithm(next(iter(trainer.train_loader)))["loss"].item()
     return first, last
 
 

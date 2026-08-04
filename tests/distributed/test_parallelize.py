@@ -27,6 +27,26 @@ class _ToyModel(BaseModel):
         return {"w1": ColwiseParallel(), "w2": RowwiseParallel()}
 
 
+class _MethodEntryModel(BaseModel):
+    """Used through `encode` rather than `forward`, the way MAE drives a ViT3D."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(8, 8)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encode(x)
+
+    def flops(self, input_shape: tuple[int, ...]) -> int:
+        return 0
+
+    def extra_forward_methods(self) -> tuple[str, ...]:
+        return ("encode",)
+
+
 class _NoPlanModel(BaseModel):
     def __init__(self) -> None:
         super().__init__()
@@ -79,6 +99,26 @@ def _tp_plus_fsdp_worker(rank: int, world_size: int) -> bool:
     return _has_grad_after_forward_backward(model, "w1.weight")
 
 
+def _declared_forward_method_worker(rank: int, world_size: int) -> bool:
+    dims = ParallelDims(dp_shard=world_size)
+    mesh = dims.build_mesh("cpu")
+    model = _MethodEntryModel()
+    parallelize_model(model, mesh, dims)
+    assert isinstance(model.proj.weight, DTensor)  # sharded before anything is called
+    model.encode(torch.randn(2, 8)).sum().backward()  # never goes through forward()
+    return model.proj.weight.grad is not None
+
+
+def _replicate_rejects_method_entry_worker(rank: int, world_size: int) -> bool:
+    dims = ParallelDims(dp_replicate=world_size)
+    mesh = dims.build_mesh("cpu")
+    try:
+        parallelize_model(_MethodEntryModel(), mesh, dims)
+    except ValueError as error:
+        return "dp_replicate" in str(error)
+    return False
+
+
 def _tp_without_plan_raises_worker(rank: int, world_size: int) -> bool:
     dims = ParallelDims(tp=world_size)
     mesh = dims.build_mesh("cpu")
@@ -108,6 +148,20 @@ def test_hsdp_shards_and_replicates(run_distributed):
 @pytest.mark.cpu_dist
 def test_tp_plus_fsdp_composes(run_distributed):
     assert all(run_distributed(_tp_plus_fsdp_worker, world_size=4))
+
+
+@pytest.mark.cpu_dist
+def test_fsdp_wraps_the_forward_methods_a_model_declares(run_distributed):
+    # FSDP2 all-gathers around `forward` only. A model an algorithm calls into by another name
+    # would otherwise still hold sharded DTensors, and the op would reject the plain input.
+    assert all(run_distributed(_declared_forward_method_worker, world_size=2))
+
+
+@pytest.mark.cpu_dist
+def test_replicate_rejects_a_model_used_outside_forward(run_distributed):
+    # `replicate` syncs gradients from forward hooks, so it cannot cover such calls; failing
+    # loudly beats silently averaging nothing.
+    assert all(run_distributed(_replicate_rejects_method_entry_worker, world_size=2))
 
 
 @pytest.mark.cpu_dist
