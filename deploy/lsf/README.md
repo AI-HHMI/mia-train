@@ -87,6 +87,56 @@ Notes:
 - Artifacts do **not** depend on the `cd` above — they go to the configured `checkpoint_dir`.
   The `cd` is only so `src/train.py` and the relative `--config` path resolve.
 
+## Attention kernel
+
+Transformer self-attention goes through `src/models/attention.py`, not `nn.MultiheadAttention`,
+so the kernel is swappable. `[model].attention_backend` selects it:
+
+| value | behaviour |
+| :--- | :--- |
+| `auto` (default) | FlashAttention-4 when the device and dtype allow, else torch SDPA |
+| `flash4` | demand FA4; construction fails with the reason if it is unusable |
+| `sdpa` | always torch SDPA |
+
+FA4 needs **Hopper or Blackwell** (`gpu_h100`, `gpu_h200`; not `gpu_a100`, `gpu_l4` or `gpu_t4`)
+and half precision — it is inactive under `precision = "fp32"`, where `auto` silently falls back
+and `flash4` raises. Use `flash4` when timing the kernel, so a run that could not use it fails
+instead of quietly reporting SDPA's numbers.
+
+`flash-attn-4` is an optional dependency: absent, everything runs on SDPA.
+
+### When FA4 actually pays
+
+Measured on `gpu_h100` and `gpu_h200` (bf16, non-causal, 64-wide heads), FA4 wins only at long
+context, and the crossover is high enough to matter for the configs in this repo:
+
+| tokens per sample | attention kernel alone | whole MAE step |
+| :--- | :--- | :--- |
+| 128 | **0.5x** — FA4 loses at every batch size tried (1–32) | 0.92x |
+| 512–1024 | **0.5x** at batch ≤ 2, reaching ~1.1x by batch 32 | 0.88x |
+| 4096 | 1.2x | 1.00x |
+| 8192+ | 1.2–1.26x | 1.04x |
+
+Below ~2k tokens FA4's fixed per-call cost is roughly twice SDPA's and dominates. Batch size
+amortises it the same way sequence length does, so the crossover moves with total work rather
+than sequence length alone — but at 128 tokens there is too little work to amortise at any batch
+size worth using. The whole-step column is compressed because attention is a small share of a
+short-sequence step: the MLP and patch-embedding GEMMs set the pace, so a 2x loss on attention
+costs only ~8% of the step.
+
+`mae_pretrain.toml`'s 128³ volume at 16³ patches is 512 patches, and MAE masks 75% of them, so the
+encoder attends over 128 tokens — the regime where `sdpa` is the faster choice. FA4 starts paying
+for itself around 256³–320³ volumes (4k–8k patches).
+
+Two things worth knowing before benchmarking this yourself:
+- **The SDPA baseline is cuDNN, not flash.** `F.scaled_dot_product_attention` dispatches, and on
+  Hopper it picks its cuDNN kernel, which is good. Forcing its `FLASH_ATTENTION` backend instead
+  is ~0.65x, so comparing against *that* would overstate FA4's win as ~1.9x.
+- **H100 and H200 are indistinguishable here** (within 2% at every size). Attention at these
+  shapes is tensor-core bound, not bandwidth bound, so the H200's faster HBM buys nothing; its
+  advantage is the 141GB of VRAM. At $0.80 vs $0.50 per GPU-hour, prefer `gpu_h100` unless you
+  need the capacity.
+
 ## Resuming: write the submission script once, resubmit unchanged
 
 Long runs get interrupted — wall-time limits, node failures, preemption. Pass `--resume` and the

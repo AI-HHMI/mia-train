@@ -55,7 +55,10 @@ class MAE(BaseAlgorithm):
             torch.zeros(1, model.num_patches, decoder_embed_dim)
         )
         self.decoder_blocks = nn.ModuleList(
-            TransformerBlock(decoder_embed_dim, decoder_num_heads, 4.0)
+            # Same attention kernel as the encoder, rather than a second knob to keep in sync.
+            TransformerBlock(
+                decoder_embed_dim, decoder_num_heads, 4.0, model.attention_backend
+            )
             for _ in range(decoder_depth)
         )
         self.decoder_norm = nn.LayerNorm(decoder_embed_dim)

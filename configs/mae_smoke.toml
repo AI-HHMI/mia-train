@@ -19,6 +19,10 @@ embed_dim = 384
 depth = 6
 num_heads = 6
 
+# "auto" prefers FlashAttention-4 (Hopper/Blackwell, half precision) over torch SDPA.
+# Use "flash4" to demand it, or "sdpa" to force the torch kernel; see configs/mae_pretrain.toml.
+attention_backend = "auto"
+
 [algorithm]
 name = "mae"
 # Axis order comes from the dataset, so it is not restated here.

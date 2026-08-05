@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.utils.data as data
 
 from algorithms.mae import MAE
@@ -163,3 +164,32 @@ def test_loss_ignores_visible_patches():
     after = (per_patch_corrupted * mask).sum() / mask.sum()
 
     assert torch.allclose(baseline, after), "visible patches must not contribute to the loss"
+
+
+def _algorithm_with_backend(backend: str) -> MAE:
+    encoder = ViT3D(
+        img_size=(16, 16, 16), patch_size=(8, 8, 8), in_channels=1,
+        embed_dim=32, depth=2, num_heads=4, attention_backend=backend,
+    )
+    return MAE(
+        encoder, input_axes="lzyx", decoder_embed_dim=16, decoder_depth=2, decoder_num_heads=4
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("backend", ["sdpa", "auto"])
+def test_decoder_uses_the_encoders_attention_backend(backend):
+    # The decoder takes its kernel from the encoder instead of exposing a second knob, so nothing
+    # can leave the two halves of the model on different kernels. Without this, a decoder pinned
+    # to the default would still train and still pass every other test.
+    algorithm = _algorithm_with_backend(backend)
+    assert [block.attn.backend for block in algorithm.encoder.blocks] == [backend] * 2
+    assert [block.attn.backend for block in algorithm.decoder_blocks] == [backend] * 2
+
+
+@pytest.mark.unit
+def test_no_part_of_the_model_uses_torch_multihead_attention():
+    # Encoder and decoder together: the swappable kernel is only swappable if every attention
+    # call goes through our module.
+    algorithm = _algorithm_with_backend("sdpa")
+    assert not any(isinstance(m, nn.MultiheadAttention) for m in algorithm.modules())

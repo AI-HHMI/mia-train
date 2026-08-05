@@ -159,3 +159,23 @@ def test_base_model_declines_to_guess_an_input_layout():
 
     with pytest.raises(NotImplementedError, match="prepare_input"):
         _NoPrepare().prepare_input(torch.randn(1, 1, 4, 4, 4), "lzyx")
+
+
+@pytest.mark.unit
+def test_blocks_use_the_configured_attention_backend():
+    model = _tiny(attention_backend="sdpa")
+    assert model.attention_backend == "sdpa"
+    assert all(block.attn.backend == "sdpa" for block in model.blocks)
+
+
+@pytest.mark.unit
+def test_attention_backend_defaults_to_auto():
+    assert _tiny().attention_backend == "auto"
+    assert all(block.attn.backend == "auto" for block in _tiny().blocks)
+
+
+@pytest.mark.unit
+def test_blocks_hold_our_own_attention_module():
+    from models.attention import SelfAttention
+
+    assert all(isinstance(block.attn, SelfAttention) for block in _tiny().blocks)

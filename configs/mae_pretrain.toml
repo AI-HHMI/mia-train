@@ -16,6 +16,12 @@ embed_dim = 768
 depth = 12
 num_heads = 12
 
+# Attention kernel: "auto" uses FlashAttention-4 when the GPU and dtype allow and falls back to
+# torch SDPA otherwise; "flash4" demands it and fails loudly if unavailable, which is what you
+# want when benchmarking; "sdpa" always uses torch. FA4 needs Hopper or Blackwell and half
+# precision, so it is inactive under precision = "fp32".
+attention_backend = "auto"
+
 [algorithm]
 name = "mae"
 # The sample axis order is taken from the dataset, so it is not repeated here.

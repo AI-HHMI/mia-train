@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 
+from .attention import SelfAttention
 from .base import BaseModel
 from .registry import ModelRegistry
 
@@ -16,18 +17,18 @@ class TransformerBlock(nn.Module):
     this module's interface rather than an internal detail.
     """
 
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float) -> None:
+    def __init__(
+        self, dim: int, num_heads: int, mlp_ratio: float, attention_backend: str = "auto"
+    ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.attn = SelfAttention(dim, num_heads, backend=attention_backend)
         self.norm2 = nn.LayerNorm(dim)
         hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        normed = self.norm1(x)
-        attended, _ = self.attn(normed, normed, normed, need_weights=False)
-        x = x + attended
+        x = x + self.attn(self.norm1(x))
         return x + self.mlp(self.norm2(x))
 
 
@@ -53,6 +54,7 @@ class ViT3D(BaseModel):
         depth: int = 6,
         num_heads: int = 6,
         mlp_ratio: float = 4.0,
+        attention_backend: str = "auto",
     ) -> None:
         super().__init__()
         img_size = tuple(img_size)  # type: ignore[assignment]
@@ -70,6 +72,7 @@ class ViT3D(BaseModel):
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.embed_dim = embed_dim
+        self.attention_backend = attention_backend
         self.grid_size = tuple(s // p for s, p in zip(img_size, patch_size, strict=True))
 
         self.patch_embed = nn.Conv3d(
@@ -78,7 +81,8 @@ class ViT3D(BaseModel):
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         self.blocks = nn.ModuleList(
-            TransformerBlock(embed_dim, num_heads, mlp_ratio) for _ in range(depth)
+            TransformerBlock(embed_dim, num_heads, mlp_ratio, attention_backend)
+            for _ in range(depth)
         )
         self.norm = nn.LayerNorm(embed_dim)
 
