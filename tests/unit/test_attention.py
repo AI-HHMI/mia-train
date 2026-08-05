@@ -10,8 +10,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from models import attention as attention_module
-from models.attention import BACKENDS, SelfAttention, flash4_status
+from layers import attention as attention_module
+from layers.attention import BACKENDS, SelfAttention, flash4_status
 
 
 def _installed_flash4_stub() -> types.ModuleType:

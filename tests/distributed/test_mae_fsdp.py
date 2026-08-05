@@ -59,7 +59,7 @@ def _build(output_dir: str, world_size: int, max_steps: int, dataset: BaseDatase
     # input_axes deliberately omitted: MAE must take "lzyx" from the dataset.
     algorithm = MAE(
         encoder, dataset, mask_ratio=0.5, norm_pix_loss=False,
-        decoder_embed_dim=16, decoder_depth=1, decoder_num_heads=4,
+        decoder_embed_dim=16, decoder_depth=1, decoder_num_heads=2,
     )
     dims = ParallelDims(dp_shard=world_size)
     return Trainer(

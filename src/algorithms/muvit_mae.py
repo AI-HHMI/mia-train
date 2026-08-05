@@ -26,9 +26,9 @@ import torch
 import torch.nn as nn
 
 from data.base import BaseDataset
-from models.attention import CrossAttention, SelfAttention
+from layers.attention import CrossAttention, SelfAttention
+from layers.rope import AxialRotaryEmbedding
 from models.muvit import SPATIAL_RANK, MuViT3D
-from models.rope import AxialRotaryEmbedding
 
 from .base import BaseAlgorithm
 from .registry import AlgorithmRegistry

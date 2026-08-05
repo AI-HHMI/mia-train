@@ -5,8 +5,9 @@ import math
 import torch
 import torch.nn as nn
 
+from layers.blocks import TransformerBlock
+
 from .base import BaseModel
-from .blocks import TransformerBlock
 from .registry import ModelRegistry
 
 SPATIAL_RANK = 3

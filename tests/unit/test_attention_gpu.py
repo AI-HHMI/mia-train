@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from models.attention import SelfAttention, flash4_status
+from layers.attention import SelfAttention, flash4_status
 
 pytestmark = [
     pytest.mark.gpu_dist,

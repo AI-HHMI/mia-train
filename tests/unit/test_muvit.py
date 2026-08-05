@@ -7,10 +7,10 @@ from typing import Any
 import pytest
 import torch
 
-from models.blocks import TransformerBlock
+from layers.blocks import TransformerBlock
+from layers.rope import AxialRotaryEmbedding
 from models.muvit import MuViT3D
 from models.registry import ModelRegistry
-from models.rope import AxialRotaryEmbedding
 
 
 def _tiny(**overrides: Any) -> MuViT3D:

@@ -24,7 +24,8 @@ mia-train/
 ├── tests/                 # Unit, multi-process distributed, and sanity tests
 ├── src/
 │   ├── algorithms/        # Training strategy logic (MAE, SimMIM, Supervised, etc.)
-│   ├── models/            # Pure neural network architectures
+│   ├── models/            # Runnable architectures: exactly what `[model].name` can select
+│   ├── layers/            # Reusable building blocks (attention, blocks, position encodings)
 │   ├── data/              # Datasets and loaders (integrating `miao`)
 │   ├── engine/            # Training loop, step orchestration, FSDP/DDP execution
 │   ├── distributed/       # Process groups, 3D parallelism, NCCL/Gloo wrappers
@@ -46,6 +47,16 @@ To allow collaborators and AI agents to add features without modifying the core 
 | :--- | :--- | :--- | :--- |
 | **Algorithm** | `src/algorithms/` | `BaseAlgorithm` | Defines forward pass, custom masking/loss functions, and logged metrics. |
 | **Model** | `src/models/` | `BaseModel` | Pure `nn.Module` definition; exposes parameter counts and FLOP calculators. |
+
+`src/models/` is reserved for architectures a user can actually run: every module in it registers a
+model, so `ls src/models/` is the list of valid `[model].name` values. Reusable pieces that are never
+named in a config — `SelfAttention`, `TransformerBlock`, `AxialRotaryEmbedding` — live in
+`src/layers/`, which never imports from `models/`, `algorithms/`, or `engine/`. Both halves of that
+rule are enforced by `tests/unit/test_package_layout.py` rather than left to convention.
+
+A decoder is not automatically a layer: a pretraining decoder exists only to serve its objective and
+is discarded afterwards, so it belongs to the algorithm that owns it (see `MAE` and `MuViTMAE`). A
+decoder that ships as part of a runnable model belongs in `models/` with it.
 | **Data** | `src/data/` | `BaseDataset` | Wraps data sources (using `miao`) into distributed-aware dataloaders. |
 | **Evaluation** | `src/evals/` | `BaseEvalTask` | Defines downstream zero-shot or fine-tuning evaluation loops. |
 
