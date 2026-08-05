@@ -8,6 +8,8 @@ without touching the surrounding transformer.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -45,8 +47,12 @@ def flash4_status() -> tuple[bool, str]:
     return True, ""
 
 
-class SelfAttention(nn.Module):
-    """Full (unmasked) multi-head self-attention over a token sequence.
+class _AttentionBase(nn.Module):
+    """Kernel selection and dispatch, shared by self- and cross-attention.
+
+    Only the projections differ between the two: self-attention packs q, k and v into one matmul,
+    which cross-attention cannot do because its keys and values come from somewhere else. Picking
+    the kernel, applying it, and explaining why it could not run are identical, so they live here.
 
     `backend` selects the kernel: "auto" prefers FlashAttention-4 whenever it can actually run
     and falls back to `scaled_dot_product_attention`, "flash4" demands it and fails loudly if it
@@ -54,13 +60,7 @@ class SelfAttention(nn.Module):
     that silently used the slower kernel would be easy to misread as a kernel that did not help.
     """
 
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        backend: str = "auto",
-        qkv_bias: bool = True,
-    ) -> None:
+    def __init__(self, dim: int, num_heads: int, backend: str = "auto") -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
@@ -71,9 +71,6 @@ class SelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
         self.backend = backend
-
-        self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
 
         usable, reason = flash4_status()
         if backend == "flash4" and not usable:
@@ -91,28 +88,20 @@ class SelfAttention(nn.Module):
             return "flash4"
         return "sdpa"
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, N, dim) -> (B, N, dim)."""
-        batch, tokens, _ = x.shape
-
-        # (B, N, 3, H, head_dim). FlashAttention-4 reads (batch, seq, heads, dim) and so consumes
-        # this directly; SDPA wants heads ahead of tokens and needs the transpose below.
-        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        query, key, value = qkv.unbind(dim=2)
-
-        if self.selected_backend(query.dtype, x.is_cuda) == "flash4":
-            attended = self._flash4_attention(query, key, value)
-        elif self.backend == "flash4":
+    def _attend(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, on_cuda: bool
+    ) -> torch.Tensor:
+        """(B, N, heads, head_dim) inputs -> (B, N, heads, head_dim) attended output."""
+        if self.selected_backend(query.dtype, on_cuda) == "flash4":
+            return self._flash4_attention(query, key, value)
+        if self.backend == "flash4":
             raise ValueError(
                 f"backend='flash4' cannot run on {query.dtype} inputs on "
-                f"{'cuda' if x.is_cuda else 'cpu'}: its kernels take "
+                f"{'cuda' if on_cuda else 'cpu'}: its kernels take "
                 f"{' or '.join(str(d).removeprefix('torch.') for d in _FLASH4_DTYPES)} on a CUDA "
                 "device. Set precision to bf16, or use the auto backend to fall back to SDPA."
             )
-        else:
-            attended = self._sdpa_attention(query, key, value)
-
-        return self.proj(attended.reshape(batch, tokens, -1))
+        return self._sdpa_attention(query, key, value)
 
     def _flash4_attention(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
@@ -136,3 +125,96 @@ class SelfAttention(nn.Module):
         query, key, value = (t.transpose(1, 2) for t in (query, key, value))
         attended = F.scaled_dot_product_attention(query, key, value, scale=self.scale)
         return attended.transpose(1, 2)
+
+
+class SelfAttention(_AttentionBase):
+    """Full (unmasked) multi-head self-attention over a token sequence."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        backend: str = "auto",
+        qkv_bias: bool = True,
+    ) -> None:
+        super().__init__(dim, num_heads, backend)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """(B, N, dim) -> (B, N, dim).
+
+        `rope` is any callable that rotates a (B, N, heads, head_dim) tensor in place of its
+        position-free self, applied to queries and keys but not values. Typed as a plain callable
+        so this layer stays independent of which position encoding is in use.
+        """
+        batch, tokens, _ = x.shape
+
+        # (B, N, 3, H, head_dim). FlashAttention-4 reads (batch, seq, heads, dim) and so consumes
+        # this directly; SDPA wants heads ahead of tokens and needs the transpose below.
+        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+        query, key, value = qkv.unbind(dim=2)
+
+        if rope is not None:
+            # Values carry content, not position, so they are left alone; rotating them would
+            # make the attention output itself position-dependent rather than the weights.
+            query, key = rope(query), rope(key)
+
+        attended = self._attend(query, key, value, x.is_cuda)
+        return self.proj(attended.reshape(batch, tokens, -1))
+
+
+class CrossAttention(_AttentionBase):
+    """Multi-head attention from one sequence onto another.
+
+    Queries come from `x`, keys and values from `context`, so the two may differ in length. Used by
+    masked autoencoding to let the tokens being reconstructed read from the encoder's visible
+    tokens. Keys and values share one projection because they always come from the same tensor;
+    queries need their own, which is the whole reason this cannot reuse `SelfAttention`.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        backend: str = "auto",
+        qkv_bias: bool = True,
+    ) -> None:
+        super().__init__(dim, num_heads, backend)
+        self.to_q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.to_kv = nn.Linear(dim, 2 * dim, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        rope: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        context_rope: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """(B, N, dim) queries against (B, M, dim) context -> (B, N, dim).
+
+        Both position encodings are applied when given: rotating only the keys would make the
+        logits depend on the keys' absolute positions instead of on the displacement between a
+        query and a key, which is the only thing a rotary encoding is meant to express.
+        """
+        batch, tokens, _ = x.shape
+        context_len = context.shape[1]
+
+        query = self.to_q(x).reshape(batch, tokens, self.num_heads, self.head_dim)
+        kv = self.to_kv(context).reshape(
+            batch, context_len, 2, self.num_heads, self.head_dim
+        )
+        key, value = kv.unbind(dim=2)
+
+        if rope is not None:
+            query = rope(query)
+        if context_rope is not None:
+            key = context_rope(key)
+
+        attended = self._attend(query, key, value, x.is_cuda)
+        return self.proj(attended.reshape(batch, tokens, -1))

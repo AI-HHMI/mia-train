@@ -5,31 +5,11 @@ import math
 import torch
 import torch.nn as nn
 
-from .attention import SelfAttention
 from .base import BaseModel
+from .blocks import TransformerBlock
 from .registry import ModelRegistry
 
-
-class TransformerBlock(nn.Module):
-    """Pre-norm transformer block.
-
-    Public because it is shared: MAE builds its decoder from the same block, so this is part of
-    this module's interface rather than an internal detail.
-    """
-
-    def __init__(
-        self, dim: int, num_heads: int, mlp_ratio: float, attention_backend: str = "auto"
-    ) -> None:
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = SelfAttention(dim, num_heads, backend=attention_backend)
-        self.norm2 = nn.LayerNorm(dim)
-        hidden = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
-        return x + self.mlp(self.norm2(x))
+SPATIAL_RANK = 3
 
 
 @ModelRegistry.register("vit3d")
@@ -40,9 +20,12 @@ class ViT3D(BaseModel):
     discards most of the tokens, then encodes only what remains, so the encoder must accept an
     arbitrary token count rather than a fixed grid.
 
-    Positional embeddings are learned rather than fixed sin-cos. For a 3D grid the sin-cos
-    construction buys little once the encoder also sees a variable token subset, and a learned
-    table keeps the masking bookkeeping to one gather.
+    Position is carried by axial rotary embeddings on patch coordinates, applied inside attention,
+    rather than by a learned table added to the tokens. Two reasons this suits a masked encoder:
+    rotary attention encodes the *displacement* between two patches instead of their absolute slots,
+    which is the relationship a 3D grid actually has; and there is no per-position table to keep
+    aligned when most of the tokens are thrown away, only coordinates that travel with the tokens
+    that survive.
     """
 
     def __init__(
@@ -55,6 +38,7 @@ class ViT3D(BaseModel):
         num_heads: int = 6,
         mlp_ratio: float = 4.0,
         attention_backend: str = "auto",
+        rotary_base: float = 10000.0,
     ) -> None:
         super().__init__()
         img_size = tuple(img_size)  # type: ignore[assignment]
@@ -78,10 +62,11 @@ class ViT3D(BaseModel):
         self.patch_embed = nn.Conv3d(
             in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
         )
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
         self.blocks = nn.ModuleList(
-            TransformerBlock(embed_dim, num_heads, mlp_ratio, attention_backend)
+            TransformerBlock(
+                embed_dim, num_heads, mlp_ratio, attention_backend,
+                spatial_rank=SPATIAL_RANK, rotary_base=rotary_base,
+            )
             for _ in range(depth)
         )
         self.norm = nn.LayerNorm(embed_dim)
@@ -143,25 +128,68 @@ class ViT3D(BaseModel):
             volumes = volumes.unsqueeze(1)
         return volumes
 
-    def embed(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, C, D, H, W) -> (B, num_patches, embed_dim), positional embedding included."""
+    def patch_coords(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Coordinates of every patch on the grid -> (B, num_patches, 3).
+
+        Plain patch indices, one unit per patch, in the same row-major order the patches come out of
+        the convolution. No centring or rescaling: rotary attention sees only the difference between
+        two coordinates, so the origin is arbitrary, and a grid of at most a few dozen per axis is
+        nowhere near the precision limits that make `MuViT3D` recentre its physical coordinates.
+        """
+        axes = [
+            torch.arange(count, dtype=torch.float32, device=device) for count in self.grid_size
+        ]
+        grid = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
+        return grid.reshape(1, -1, SPATIAL_RANK).expand(batch_size, -1, -1)
+
+    def embed(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B, C, D, H, W) -> tokens (B, num_patches, embed_dim) and coordinates (B, N, 3).
+
+        Coordinates come back with the tokens because position now lives in attention rather than in
+        the token values, so anything that reorders or drops tokens has to carry them along in step.
+        Returning them together makes that hard to forget, and matches `MuViT3D.embed`.
+        """
         if x.shape[1:] != (self.in_channels, *self.img_size):
             raise ValueError(
                 f"expected input (B, {self.in_channels}, {', '.join(map(str, self.img_size))}), "
                 f"got {tuple(x.shape)}"
             )
         tokens = self.patch_embed(x).flatten(2).transpose(1, 2)
-        return tokens + self.pos_embed
+        return tokens, self.patch_coords(x.shape[0], x.device)
 
-    def encode(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Run the transformer over any number of tokens -> (B, N, embed_dim)."""
+    def encode(self, tokens: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        """Run the transformer over any number of tokens -> (B, N, embed_dim).
+
+        The token count is free -- masked autoencoding passes a visible subset -- but every token
+        must bring its coordinate, so `coords` is required rather than optional.
+        """
+        if coords.shape[:2] != tokens.shape[:2]:
+            raise ValueError(
+                f"every token needs a coordinate: got {tokens.shape[1]} tokens but "
+                f"{coords.shape[1]} coordinates"
+            )
         for block in self.blocks:
-            tokens = block(tokens)
+            tokens = block(tokens, coords)
         return self.norm(tokens)
+
+    def patchify(self, volumes: torch.Tensor) -> torch.Tensor:
+        """(B, C, D, H, W) -> (B, num_patches, patch_volume), matching the encoder's grid.
+
+        Lives on the model rather than in the algorithm because it has to agree with `embed`'s patch
+        order, which is the model's own layout. `MuViT3D.patchify` has the same signature over its
+        extra level axis, so an algorithm can call it without knowing which encoder it holds.
+        """
+        pd, ph, pw = self.patch_size
+        gd, gh, gw = self.grid_size
+        batch, channels = volumes.shape[0], volumes.shape[1]
+        x = volumes.reshape(batch, channels, gd, pd, gh, ph, gw, pw)
+        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7)
+        return x.reshape(batch, gd * gh * gw, channels * pd * ph * pw)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Mean-pooled volume embedding, for downstream heads."""
-        return self.encode(self.embed(x)).mean(dim=1)
+        tokens, coords = self.embed(x)
+        return self.encode(tokens, coords).mean(dim=1)
 
     def extra_forward_methods(self) -> tuple[str, ...]:
         """`embed` and `encode` are called directly by masked autoencoding, not through forward."""

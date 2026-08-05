@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 
 from data.base import BaseDataset
-from models.vit import TransformerBlock, ViT3D
+from models.blocks import TransformerBlock
+from models.vit import SPATIAL_RANK, ViT3D
 
 from .base import BaseAlgorithm
 from .registry import AlgorithmRegistry
@@ -51,20 +52,19 @@ class MAE(BaseAlgorithm):
 
         self.decoder_embed = nn.Linear(model.embed_dim, decoder_embed_dim)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        self.decoder_pos_embed = nn.Parameter(
-            torch.zeros(1, model.num_patches, decoder_embed_dim)
-        )
         self.decoder_blocks = nn.ModuleList(
-            # Same attention kernel as the encoder, rather than a second knob to keep in sync.
+            # Same attention kernel as the encoder, rather than a second knob to keep in sync. The
+            # decoder is positioned by the same patch coordinates as the encoder, so it needs no
+            # position table of its own.
             TransformerBlock(
-                decoder_embed_dim, decoder_num_heads, 4.0, model.attention_backend
+                decoder_embed_dim, decoder_num_heads, 4.0, model.attention_backend,
+                spatial_rank=SPATIAL_RANK,
             )
             for _ in range(decoder_depth)
         )
         self.decoder_norm = nn.LayerNorm(decoder_embed_dim)
         self.decoder_head = nn.Linear(decoder_embed_dim, model.patch_volume)
         nn.init.trunc_normal_(self.mask_token, std=0.02)
-        nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
 
     @staticmethod
     def _resolve_input_axes(input_axes: str | None, dataset: BaseDataset | None) -> str:
@@ -90,54 +90,65 @@ class MAE(BaseAlgorithm):
         # is left to `model.prepare_input` to accept or reject.
         return resolved
 
-    def _patchify(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, C, D, H, W) -> (B, num_patches, patch_volume), matching the encoder's grid."""
-        pd, ph, pw = self.encoder.patch_size
-        gd, gh, gw = self.encoder.grid_size
-        b, c = x.shape[0], x.shape[1]
-        x = x.reshape(b, c, gd, pd, gh, ph, gw, pw)
-        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7)
-        return x.reshape(b, gd * gh * gw, c * pd * ph * pw)
-
     def _random_masking(
-        self, tokens: torch.Tensor
+        self, batch_size: int, num_tokens: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Keep a random subset of tokens. Returns (visible, mask, restore_indices).
+        """Choose which tokens stay visible. Returns (keep_indices, mask, restore_indices).
 
-        `mask` is 1 for removed patches, which is exactly where the loss is applied.
+        `mask` is 1 for removed patches, which is exactly where the loss is applied. Indices are
+        returned rather than the gathered tokens because the caller has to gather the tokens *and*
+        their coordinates with the same indices, and doing both at the call site keeps that pairing
+        visible instead of splitting it across two functions.
         """
-        b, n, d = tokens.shape
-        keep = max(1, int(round(n * (1.0 - self.mask_ratio))))
-        shuffle = torch.argsort(torch.rand(b, n, device=tokens.device), dim=1)
+        keep = max(1, int(round(num_tokens * (1.0 - self.mask_ratio))))
+        shuffle = torch.argsort(torch.rand(batch_size, num_tokens, device=device), dim=1)
         restore = torch.argsort(shuffle, dim=1)
 
         keep_idx = shuffle[:, :keep]
-        visible = torch.gather(tokens, 1, keep_idx.unsqueeze(-1).expand(-1, -1, d))
-        mask = torch.ones(b, n, device=tokens.device)
+        mask = torch.ones(batch_size, num_tokens, device=device)
         mask.scatter_(1, keep_idx, 0.0)
-        return visible, mask, restore
+        return keep_idx, mask, restore
 
-    def _decode(self, visible: torch.Tensor, restore: torch.Tensor) -> torch.Tensor:
-        """Re-insert mask tokens, decode, and predict every patch -> (B, N, patch_volume)."""
+    def _decode(
+        self, visible: torch.Tensor, restore: torch.Tensor, coords: torch.Tensor
+    ) -> torch.Tensor:
+        """Re-insert mask tokens, decode, and predict every patch -> (B, N, patch_volume).
+
+        `coords` are the full patch grid, in grid order: the decoder sees every position, so unlike
+        the encoder it needs no gathering -- but it is restored to grid order first, so the
+        coordinates line up with the tokens.
+        """
         x = self.decoder_embed(visible)
         b, n = restore.shape
-        pad = self.mask_token.expand(b, n - x.shape[1], -1)
+        pad = self.mask_token.expand(b, n - x.shape[1], -1).to(x.dtype)
         x = torch.cat([x, pad], dim=1)
         x = torch.gather(x, 1, restore.unsqueeze(-1).expand(-1, -1, x.shape[2]))
-        x = x + self.decoder_pos_embed
         for block in self.decoder_blocks:
-            x = block(x)
+            x = block(x, coords)
         return self.decoder_head(self.decoder_norm(x))
 
     def _loss(self, batch: Any) -> dict[str, torch.Tensor]:
         # The encoder decides what a dataset-shaped batch means for it, including how many scale
         # levels it accepts; this algorithm only says which axis order the data came in.
         volumes = self.encoder.prepare_input(batch[self.input_key], self.input_axes)
-        tokens = self.encoder.embed(volumes)
-        visible, mask, restore = self._random_masking(tokens)
-        prediction = self._decode(self.encoder.encode(visible), restore)
+        tokens, coords = self.encoder.embed(volumes)
 
-        target = self._patchify(volumes)
+        keep_idx, mask, restore = self._random_masking(
+            tokens.shape[0], tokens.shape[1], tokens.device
+        )
+        visible = torch.gather(
+            tokens, 1, keep_idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1])
+        )
+        # The same indices for the coordinates: a mismatch here would attach every visible token to
+        # another patch's position and still train.
+        visible_coords = torch.gather(
+            coords, 1, keep_idx.unsqueeze(-1).expand(-1, -1, SPATIAL_RANK)
+        )
+
+        latent = self.encoder.encode(visible, visible_coords)
+        prediction = self._decode(latent, restore, coords)
+
+        target = self.encoder.patchify(volumes)
         if self.norm_pix_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)

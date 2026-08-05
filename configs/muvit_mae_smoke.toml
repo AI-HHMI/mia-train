@@ -1,0 +1,90 @@
+# Short GPU validation run for multi-resolution masked autoencoding on real data.
+#
+# The counterpart of mae_smoke.toml for the multi-scale path: it exercises what the single-scale
+# smoke run cannot — three resolution levels in one token sequence, miao's real world-coordinate
+# boxes, coordinate rotary attention, and per-level decoders with cross-attention.
+#
+#   bsub -P <project> -q gpu_h100 -gpu "num=2" -n 24 -W 0:30 ... \
+#     torchrun --standalone --nproc_per_node=2 src/train.py --config configs/muvit_mae_smoke.toml
+#
+# [parallelism] must multiply to the torchrun world size.
+
+experiment_name = "muvit_mae_smoke"
+
+[model]
+name = "muvit3d"
+# Downsampling factors relative to the finest level, which must match the ratios between the
+# `resolutions` below: 33/33 = 1, 132/33 = 4, 528/33 = 16. They are stated separately because the
+# model sets the physical extent each level covers from them, and miao reports resolutions in
+# nanometres rather than as factors. Ordered finest first, matching miao's fine-to-coarse sort.
+levels = [1, 4, 16]
+img_size = [32, 32, 32]     # must equal [data].patch_size
+patch_size = [8, 8, 8]      # 4^3 = 64 patches per level, so 192 tokens jointly
+in_channels = 1
+embed_dim = 256
+depth = 4
+num_heads = 8
+
+# 192 tokens is well below the ~4k where FlashAttention-4 starts to pay (see deploy/lsf/README.md),
+# but "auto" costs nothing to leave on and a production-size MuViT does clear that bar: three levels
+# of a 128^3 volume at 8^3 patches is 12288 tokens.
+attention_backend = "auto"
+
+[algorithm]
+name = "muvit_mae"
+# Axis order comes from the dataset, so it is not restated here.
+mask_ratio = 0.75
+# Dirichlet concentration over the per-level visible fractions. 0.5 is the paper's value; smaller
+# concentrates each sample's visible budget on fewer levels, larger approaches uniform masking.
+dirichlet_alpha = 0.5
+decoder_embed_dim = 128
+decoder_depth = 2
+decoder_num_heads = 4
+norm_pix_loss = true
+
+[data]
+name = "miao_volumes"
+output_axes = "lcxyz"
+patch_size = [32, 32, 32]
+samples_per_epoch = 1000
+
+# Three levels an octave-and-a-bit apart, giving the encoder a genuine range of scale. 33 nm is
+# h01's finest isotropic scale and the reason the single-scale config uses it too; see
+# configs/mae_smoke.toml for why the exact nanometre matters. Each entry must have a matching
+# `levels` factor above, in the same order.
+resolutions = [[33, 33, 33], [132, 132, 132], [528, 528, 528]]
+
+[[data.volumes]]
+name = "Jiefu Cerebellum FIB-SEM"
+path = "/groups/miaai/miaai/lmd-v0.0.1/jiefu-cerebellum-fibsem_crop.zarr"
+image_key = "raw"
+zarr_version = "zarr3"
+weight = 0.5
+normalize = true
+
+[[data.volumes]]
+name = "H01 Human Cortex"
+path = "/groups/miaai/miaai/lmd-v0.0.1/h01-human-cortex.zarr"
+image_key = "raw"
+zarr_version = "zarr3"
+weight = 0.5
+normalize = true
+
+[trainer]
+max_steps = 30
+batch_size = 2
+lr = 1.0e-4
+warmup_steps = 5
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+log_every = 5
+checkpoint_every = 15
+num_workers = 4
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 2
+tp = 1

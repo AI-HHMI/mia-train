@@ -21,7 +21,7 @@ def _algorithm(**overrides: Any) -> MAE:
     # Annotated because a heterogeneous dict literal infers `dict[str, object]`, which cannot be
     # unpacked into MAE's typed signature.
     kwargs: dict[str, Any] = dict(
-        input_axes="lzyx", decoder_embed_dim=16, decoder_depth=1, decoder_num_heads=4
+        input_axes="lzyx", decoder_embed_dim=16, decoder_depth=1, decoder_num_heads=2
     )
     kwargs.update(overrides)
     return MAE(encoder, **kwargs)
@@ -84,19 +84,21 @@ def test_rejects_an_undeterminable_axis_order():
 @pytest.mark.unit
 def test_masks_the_configured_fraction_of_patches():
     algorithm = _algorithm(mask_ratio=0.75)
-    tokens = torch.randn(4, 8, 32)
-    visible, mask, restore = algorithm._random_masking(tokens)
+    keep_idx, mask, restore = algorithm._random_masking(4, 8, torch.device("cpu"))
 
-    assert visible.shape == (4, 2, 32)  # 8 patches, keep 25%
+    assert keep_idx.shape == (4, 2)  # 8 patches, keep 25%
     assert torch.equal(mask.sum(dim=1), torch.full((4,), 6.0))
     assert restore.shape == (4, 8)
+    # Indices and mask must agree: a kept token is never marked hidden.
+    for row in range(4):
+        assert (mask[row, keep_idx[row]] == 0).all()
 
 
 @pytest.mark.unit
 def test_patchify_round_trips_exactly():
     algorithm = _algorithm()
     volumes = torch.randn(2, 1, 16, 16, 16)
-    patches = algorithm._patchify(volumes)
+    patches = algorithm.encoder.patchify(volumes)
     assert patches.shape == (2, 8, 512)
 
     # Invert the reshape/permute and demand the original back: unlike a sum, this fails if the
@@ -150,11 +152,17 @@ def test_loss_ignores_visible_patches():
     algorithm = _algorithm(mask_ratio=0.5, norm_pix_loss=False)
     volumes = torch.randn(2, 1, 16, 16, 16)
     encoder_input = algorithm.encoder.prepare_input(volumes, algorithm.input_axes)
-    tokens = algorithm.encoder.embed(encoder_input)
-    visible, mask, restore = algorithm._random_masking(tokens)
-    target = algorithm._patchify(encoder_input)
+    tokens, coords = algorithm.encoder.embed(encoder_input)
+    keep_idx, mask, restore = algorithm._random_masking(
+        tokens.shape[0], tokens.shape[1], tokens.device
+    )
+    gather = keep_idx.unsqueeze(-1)
+    visible = torch.gather(tokens, 1, gather.expand(-1, -1, tokens.shape[-1]))
+    visible_coords = torch.gather(coords, 1, gather.expand(-1, -1, 3))
+    target = algorithm.encoder.patchify(encoder_input)
 
-    prediction = algorithm._decode(algorithm.encoder.encode(visible), restore)
+    latent = algorithm.encoder.encode(visible, visible_coords)
+    prediction = algorithm._decode(latent, restore, coords)
     per_patch = (prediction - target).pow(2).mean(dim=-1)
     baseline = (per_patch * mask).sum() / mask.sum()
 
@@ -172,7 +180,7 @@ def _algorithm_with_backend(backend: str) -> MAE:
         embed_dim=32, depth=2, num_heads=4, attention_backend=backend,
     )
     return MAE(
-        encoder, input_axes="lzyx", decoder_embed_dim=16, decoder_depth=2, decoder_num_heads=4
+        encoder, input_axes="lzyx", decoder_embed_dim=16, decoder_depth=2, decoder_num_heads=2
     )
 
 
@@ -193,3 +201,54 @@ def test_no_part_of_the_model_uses_torch_multihead_attention():
     # call goes through our module.
     algorithm = _algorithm_with_backend("sdpa")
     assert not any(isinstance(m, nn.MultiheadAttention) for m in algorithm.modules())
+
+
+@pytest.mark.unit
+def test_visible_coordinates_stay_in_step_with_visible_tokens():
+    # Position now lives in attention, so the encoder is handed coordinates alongside the surviving
+    # tokens. Gathering the two with different indices attaches every visible token to another
+    # patch's position: shapes still line up, the loss still falls, and the geometry is nonsense.
+    algorithm = _algorithm()
+    volumes = torch.randn(1, 1, 16, 16, 16)
+
+    keep_idx = torch.tensor([[3, 6]])
+    mask = torch.ones(1, 8)
+    mask[0, keep_idx[0]] = 0.0
+    restore = torch.arange(8).reshape(1, 8)
+    algorithm._random_masking = lambda *args: (keep_idx, mask, restore)
+
+    seen: dict[str, torch.Tensor] = {}
+    real_encode = algorithm.encoder.encode
+
+    def spy(tokens, coords):
+        seen["tokens"], seen["coords"] = tokens, coords
+        return real_encode(tokens, coords)
+
+    algorithm.encoder.encode = spy
+    algorithm({"img": volumes})
+
+    prepared = algorithm.encoder.prepare_input(volumes, algorithm.input_axes)
+    all_tokens, all_coords = algorithm.encoder.embed(prepared)
+    assert torch.allclose(seen["tokens"], all_tokens[:, keep_idx[0]], atol=1e-5)
+    assert torch.allclose(seen["coords"], all_coords[:, keep_idx[0]], atol=1e-5)
+
+
+@pytest.mark.unit
+def test_decoder_is_positioned_by_the_full_patch_grid():
+    # The decoder sees every position, so it needs no gathering -- but it does need coordinates in
+    # grid order, matching the tokens after they are restored from the shuffle.
+    algorithm = _algorithm()
+    assert not any("decoder_pos_embed" in name for name in dict(algorithm.named_parameters()))
+
+    seen: dict[str, torch.Tensor] = {}
+    real_block = algorithm.decoder_blocks[0].forward
+
+    def spy(x, coords):
+        seen["coords"] = coords
+        return real_block(x, coords)
+
+    algorithm.decoder_blocks[0].forward = spy
+    algorithm({"img": torch.randn(1, 1, 16, 16, 16)})
+
+    expected = algorithm.encoder.patch_coords(1, torch.device("cpu"))
+    assert torch.equal(seen["coords"], expected)
