@@ -1,0 +1,73 @@
+# The same short MAE validation run as configs/mae_smoke.toml, with the dataset described by a
+# miao YAML file instead of inlined. Everything outside [data] is identical, so the two configs
+# are a direct comparison of the two ways to define a dataset.
+#
+#   bsub -P <project> -q gpu_h100 -gpu "num=2" -n 24 -W 0:30 ... \
+#     torchrun --standalone --nproc_per_node=2 src/train.py --config configs/mae_yaml_dataset.toml
+
+experiment_name = "mae_yaml_dataset"
+
+[model]
+name = "vit3d"
+img_size = [64, 64, 64]     # must equal the YAML's patch_size
+patch_size = [16, 16, 16]   # 4^3 = 64 patches per sample
+in_channels = 1
+embed_dim = 384
+depth = 6
+num_heads = 6
+attention_backend = "auto"
+
+[algorithm]
+name = "mae"
+# Axis order comes from the dataset, which reads it from the YAML, so it is not restated here.
+mask_ratio = 0.75
+decoder_embed_dim = 192
+decoder_depth = 2
+decoder_num_heads = 6
+norm_pix_loss = true
+
+[data]
+name = "miao_volumes"
+
+# Point at a miao YAML — the format miao itself uses — rather than restating its schema here.
+# Relative to the repository root, not the working directory, so this resolves the same
+# interactively and under a scheduler that starts the job somewhere else entirely.
+config_path = "configs/data/lmd_33nm.yaml"
+
+# Inline keys still work and take precedence over the file, which is the point of allowing both:
+# one shared dataset definition, adjusted per run. Here the run is a smoke test, so it draws far
+# fewer samples per epoch than the shared file's 1000 without needing a copy of it.
+samples_per_epoch = 200
+
+# What this run gets, after merging:
+#   resolutions       [[33, 33, 33]]    from the YAML
+#   output_axes       "lcxyz"           from the YAML
+#   patch_size        [64, 64, 64]      from the YAML
+#   volumes           jiefu + h01       from the YAML
+#   samples_per_epoch 200               overridden here
+#
+# The reference does not weaken the run record. Before training starts the run expands this
+# section into the settings above — plus the defaults miao itself supplies — and writes them to
+# `resolved_config.json`, so `config_path` does not appear there at all. The referenced file is
+# also copied into the run directory, since a dump of values keeps no comments. Editing the YAML
+# later therefore cannot change what an existing run reports having trained on, which makes
+# referencing and inlining equally reproducible.
+
+[trainer]
+max_steps = 50
+batch_size = 2
+lr = 1.0e-4
+warmup_steps = 5
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+log_every = 5
+checkpoint_every = 25
+num_workers = 4
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 2
+tp = 1

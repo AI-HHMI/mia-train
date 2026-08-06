@@ -108,8 +108,46 @@ def _report_resumed_config(output_dir: Path, resolved: dict[str, Any]) -> None:
     print(f"[resume] continuing {output_dir.name} with changed settings: {detail}", flush=True)
 
 
+def resolved_settings(config: RunConfig) -> dict[str, Any]:
+    """The run's settings with every dataset section expanded to what it actually amounts to.
+
+    A `[data]` section may describe itself by reference — miao's `config_path` points at a YAML —
+    and a record that kept only the reference would stop being true the moment that file was
+    edited. Asking the dataset *class* keeps this generic: no registry entry is constructed, so
+    the record is complete before any data is touched.
+    """
+    resolved = as_plain_dict(config)
+    for section in ("data", "val_data"):
+        component = getattr(config, section)
+        if component is not None:
+            resolved[section]["kwargs"] = DataRegistry.get(component.name).resolve_settings(
+                **component.kwargs
+            )
+    return resolved
+
+
+def referenced_config_files(config: RunConfig) -> tuple[Path, ...]:
+    """Files the config points at, to be copied into the run directory beside it.
+
+    `resolved_settings` already captures every value; these preserve the files themselves, whose
+    comments explain why the values are what they are. Deduplicated, since a train and a
+    validation section commonly name the same dataset file.
+    """
+    seen: dict[Path, None] = {}
+    for section in ("data", "val_data"):
+        component = getattr(config, section)
+        if component is not None:
+            for path in DataRegistry.get(component.name).referenced_files(**component.kwargs):
+                seen[path] = None
+    return tuple(seen)
+
+
 def _prepare_run_dir(
-    output_dir: Path, config_path: Path, resolved: dict[str, Any], rank: int
+    output_dir: Path,
+    config_path: Path,
+    resolved: dict[str, Any],
+    rank: int,
+    referenced: tuple[Path, ...] = (),
 ) -> None:
     """Have rank 0 create the run directory and its artifacts, then let everyone proceed.
 
@@ -124,7 +162,7 @@ def _prepare_run_dir(
         try:
             # While the previous attempt's copy is still on disk, before it is overwritten.
             _report_resumed_config(output_dir, resolved)
-            write_run_artifacts(output_dir, config_path, resolved, _REPO_ROOT)
+            write_run_artifacts(output_dir, config_path, resolved, _REPO_ROOT, referenced)
         except Exception as error:  # forwarded to the other ranks below
             failure[0] = f"{type(error).__name__}: {error}"
 
@@ -193,7 +231,13 @@ def run(config_path: Path, output_root: Path | None = None, resume: str | None =
         )
 
         output_dir = resolve_output_dir(root, config.experiment_name, resume)
-        _prepare_run_dir(output_dir, config_path, as_plain_dict(config), rank)
+        _prepare_run_dir(
+            output_dir,
+            config_path,
+            resolved_settings(config),
+            rank,
+            referenced_config_files(config),
+        )
 
         build_trainer(config, output_dir, mesh=mesh, device=device).train()
     finally:

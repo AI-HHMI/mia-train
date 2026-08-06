@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+from pathlib import Path
 from typing import Any
 
 import torch.utils.data as data
@@ -30,6 +31,30 @@ class BaseDataset(abc.ABC):
         where the two could drift apart. `None` means the source makes no such promise.
         """
         return None
+
+    @classmethod
+    def resolve_settings(cls, **kwargs: Any) -> dict[str, Any]:
+        """What a `[data]` section actually amounts to, for the run record.
+
+        Called on the class, without building anything, so the engine can write a complete
+        `resolved_config.json` before any data is touched. The default is the section as written,
+        which is already complete for a dataset configured entirely inline.
+
+        A dataset that draws settings from somewhere else -- another file, an environment, a
+        service -- overrides this to return what it resolved to. Otherwise the run record would
+        preserve only a reference, and the reference can change afterwards while the record still
+        claims to describe the run.
+        """
+        return dict(kwargs)
+
+    @classmethod
+    def referenced_files(cls, **kwargs: Any) -> tuple[Path, ...]:
+        """Files a `[data]` section points at, to be copied into the run directory.
+
+        `resolve_settings` already captures every value, so this is for the file itself: comments
+        and structure that explain *why* the values are what they are, which no dump preserves.
+        """
+        return ()
 
     def build_dataloader(
         self,

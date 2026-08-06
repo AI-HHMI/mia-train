@@ -1,0 +1,48 @@
+# A miao dataset definition, in miao's own YAML format.
+#
+# Referenced from a mia-train run config with:
+#
+#   [data]
+#   name = "miao_volumes"
+#   config_path = "configs/data/lmd_33nm.yaml"
+#
+# The point of keeping it here rather than inlining it into each run config is that several runs
+# share one dataset: change a volume path or a resolution once and every config that references
+# this file follows. Relative paths resolve against the repository root, so the reference works the
+# same interactively and under `bsub`, whose working directory is wherever the job was submitted.
+#
+# Editing this file does not rewrite the history of runs that already used it. A run expands these
+# settings into its `resolved_config.json` before training starts, and keeps a copy of this file
+# beside it, so its record stays true afterwards. Referencing and inlining are equally
+# reproducible; pick whichever is more convenient.
+
+# 33 nm, not 32, and the single nanometre matters. miao picks the coarsest pyramid level whose
+# voxel is <= the target on every axis. h01's z is 33 nm at every level, so a 32 nm request
+# disqualifies all of them and falls back to the finest (4 nm) level: measured, that reads
+# [512, 512, 63] = 16.5 M voxels per sample instead of [66, 66, 64] = 0.28 M, a ~59x difference for
+# identical output. 33 nm is also the finest isotropic scale h01 actually has.
+#
+# One entry, so this file suits single-scale encoders such as vit3d. A multi-resolution encoder
+# wants several — see configs/muvit_mae_smoke.toml, whose levels are 33/132/528 nm.
+resolutions: [[33, 33, 33]]
+
+# Both volumes are reordered into this layout despite being stored differently on disk
+# (jiefu is zyx, h01 is xyz), which is what output_axes is for.
+output_axes: "lcxyz"
+patch_size: [64, 64, 64]
+samples_per_epoch: 1000
+
+volumes:
+  - name: "Jiefu Cerebellum FIB-SEM"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/jiefu-cerebellum-fibsem_crop.zarr"
+    image_key: "raw"
+    zarr_version: "zarr3"
+    weight: 0.5
+    normalize: true   # uint8 on disk, so this maps to [0, 1] by dtype max
+
+  - name: "H01 Human Cortex"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/h01-human-cortex.zarr"
+    image_key: "raw"
+    zarr_version: "zarr3"
+    weight: 0.5
+    normalize: true

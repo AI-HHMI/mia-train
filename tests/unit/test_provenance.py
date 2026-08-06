@@ -86,3 +86,64 @@ def test_write_run_artifacts_saves_dirty_patch(tmp_path):
 
     assert "(dirty)" in (output_dir / "git_commit.txt").read_text(encoding="utf-8")
     assert "changed" in (output_dir / "dirty.patch").read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_referenced_config_files_are_copied_in(tmp_path):
+    # The resolved JSON holds the values; this keeps the file itself, whose comments explain why
+    # the values are what they are. A dump preserves neither comments nor structure.
+    config = tmp_path / "run.toml"
+    config.write_text('experiment_name = "x"\n', encoding="utf-8")
+    dataset = tmp_path / "shared_dataset.yaml"
+    dataset.write_text("# why 33nm and not 32\npatch_size: [64, 64, 64]\n", encoding="utf-8")
+
+    out = tmp_path / "run"
+    write_run_artifacts(out, config, {"experiment_name": "x"}, tmp_path, (dataset,))
+
+    copied = out / "shared_dataset.yaml"
+    assert copied.is_file()
+    assert "# why 33nm and not 32" in copied.read_text(), "comments must survive the copy"
+
+
+@pytest.mark.unit
+def test_the_copy_is_independent_of_the_original(tmp_path):
+    config = tmp_path / "run.toml"
+    config.write_text('experiment_name = "x"\n', encoding="utf-8")
+    dataset = tmp_path / "shared.yaml"
+    dataset.write_text("samples_per_epoch: 4\n", encoding="utf-8")
+
+    out = tmp_path / "run"
+    write_run_artifacts(out, config, {}, tmp_path, (dataset,))
+    dataset.write_text("samples_per_epoch: 999\n", encoding="utf-8")
+
+    assert "4" in (out / "shared.yaml").read_text()
+
+
+@pytest.mark.unit
+def test_two_different_files_with_one_name_are_refused(tmp_path):
+    # Copying both under the same basename would silently drop one, and this directory's whole
+    # job is to still be true in a year.
+    config = tmp_path / "run.toml"
+    config.write_text('experiment_name = "x"\n', encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "val").mkdir()
+    first = tmp_path / "train" / "data.yaml"
+    second = tmp_path / "val" / "data.yaml"
+    first.write_text("samples_per_epoch: 1\n", encoding="utf-8")
+    second.write_text("samples_per_epoch: 2\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="both named 'data.yaml'"):
+        write_run_artifacts(tmp_path / "run", config, {}, tmp_path, (first, second))
+
+
+@pytest.mark.unit
+def test_the_same_file_referenced_twice_is_fine(tmp_path):
+    # Train and validation sections naming one dataset file is ordinary, not a collision.
+    config = tmp_path / "run.toml"
+    config.write_text('experiment_name = "x"\n', encoding="utf-8")
+    shared = tmp_path / "data.yaml"
+    shared.write_text("samples_per_epoch: 1\n", encoding="utf-8")
+
+    out = tmp_path / "run"
+    write_run_artifacts(out, config, {}, tmp_path, (shared, shared))
+    assert (out / "data.yaml").is_file()

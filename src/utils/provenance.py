@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -42,15 +43,21 @@ def write_run_artifacts(
     config_path: Path,
     resolved_config: dict[str, Any],
     repo_dir: Path,
+    referenced_files: Sequence[Path] = (),
 ) -> None:
     """Record everything needed to reproduce this run: source config, resolved settings, code state.
 
     The source .toml is copied verbatim and the resolved settings are written as JSON, which
     captures defaults the source file left implicit. JSON is used because the standard library
     can read TOML but not write it, and core code must stay free of extra dependencies.
+
+    `referenced_files` are further files the config points at — a miao dataset YAML, say — copied
+    in beside it. The resolved JSON already holds their *values*; the copies preserve the files as
+    written, comments included, and stay correct if the originals are edited later.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(config_path, output_dir / f"config{config_path.suffix}")
+    _copy_referenced(output_dir, config_path, referenced_files)
     (output_dir / "resolved_config.json").write_text(
         json.dumps(resolved_config, indent=2, default=str), encoding="utf-8"
     )
@@ -68,6 +75,24 @@ def write_run_artifacts(
     if metadata["dirty"]:
         (output_dir / "dirty.patch").write_text(metadata["diff"], encoding="utf-8")
     _append_attempt(output_dir, stamp)
+
+
+def _copy_referenced(
+    output_dir: Path, config_path: Path, referenced_files: Sequence[Path]
+) -> None:
+    """Copy each referenced config file into the run directory, under its own name."""
+    taken = {f"config{config_path.suffix}": config_path}
+    for source in referenced_files:
+        destination = taken.get(source.name)
+        if destination is not None and destination.resolve() != source.resolve():
+            # Two different files landing on one name would silently lose one of them, and this
+            # directory's whole job is to still be true in a year.
+            raise ValueError(
+                f"two different config files are both named {source.name!r} "
+                f"({destination} and {source}); rename one so the run directory can keep both"
+            )
+        taken[source.name] = source
+        shutil.copyfile(source, output_dir / source.name)
 
 
 def _append_attempt(output_dir: Path, commit_stamp: str) -> None:
