@@ -28,16 +28,8 @@ norm_pix_loss = true
 
 [data]
 name = "miao_volumes"
-
-# Point at a miao YAML — the format miao itself uses — rather than restating its schema here.
-# Relative to the repository root, not the working directory, so this resolves the same
-# interactively and under a scheduler that starts the job somewhere else entirely.
-config_path = "configs/data/lmd_33nm.yaml"
-
-# Inline keys still work and take precedence over the file, which is the point of allowing both:
-# one shared dataset definition, adjusted per run. Here the run is a smoke test, so it draws far
-# fewer samples per epoch than the shared file's 1000 without needing a copy of it.
-samples_per_epoch = 200
+config_path = "configs/data/lmd_33nm.yaml"  # Point at a miao YAML
+samples_per_epoch = 200                     # Inline keys still work & take precedence over the file
 
 # What this run gets, after merging:
 #   resolutions       [[33, 33, 33]]    from the YAML
@@ -45,13 +37,6 @@ samples_per_epoch = 200
 #   patch_size        [64, 64, 64]      from the YAML
 #   volumes           jiefu + h01       from the YAML
 #   samples_per_epoch 200               overridden here
-#
-# The reference does not weaken the run record. Before training starts the run expands this
-# section into the settings above — plus the defaults miao itself supplies — and writes them to
-# `resolved_config.json`, so `config_path` does not appear there at all. The referenced file is
-# also copied into the run directory, since a dump of values keeps no comments. Editing the YAML
-# later therefore cannot change what an existing run reports having trained on, which makes
-# referencing and inlining equally reproducible.
 
 [trainer]
 max_steps = 50
