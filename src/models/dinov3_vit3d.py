@@ -1,0 +1,454 @@
+"""DINOv3's vision transformer for volumetric inputs.
+
+Ported from a 3D extension of the DINOv3 reference implementation. Structurally identical to
+`models.dinov3_vit.DinoVisionTransformer` -- same blocks, same CLS/storage/mask tokens, same
+optional untied norms -- with the patch grid and rotary embeddings carrying three axes instead of
+two. Written out as its own class rather than parameterised on rank, matching upstream and keeping
+each forward pass readable in terms of the axes it actually has.
+
+The one genuine choice a 3D model has to make is how depth enters the rotary embedding, which
+`pos_embed_rope_type` selects:
+
+  - `"vanilla"` gives depth its own third of the rotary channels, alongside height and width. The
+    natural choice when training from scratch on volumes.
+  - `"superposition"` keeps the 2D channel layout exactly and adds a gated depth angle on top, so
+    a pretrained 2D DINOv3 checkpoint's rotary buffers transfer unchanged and the model starts out
+    numerically identical to its 2D self, learning how much depth to mix in. The natural choice
+    when adapting 2D pretrained weights.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+from typing import Any, Literal
+
+import torch
+import torch.nn as nn
+
+from layers.dinov3.block import SelfAttentionBlock
+from layers.dinov3.config import dtype_dict, ffn_layer_dict, init_weights_vit, norm_layer_dict
+from layers.dinov3.patch_embed import PatchEmbed3D
+from layers.dinov3.rope import RopePositionEmbedding3D, RopePositionEmbedding3DSuperposition
+from utils.module_ops import named_apply
+
+from .base import BaseModel
+from .registry import ModelRegistry
+
+SPATIAL_RANK = 3
+
+ROPE_TYPES = ("vanilla", "superposition")
+
+
+@ModelRegistry.register("dinov3_vit3d")
+class DinoVisionTransformer3D(BaseModel):
+    def __init__(
+        self,
+        *,
+        img_size: int = 224,
+        patch_size: int = 16,
+        in_chans: int = 1,  # NOTE: this is different from the 2D case
+        pos_embed_rope_type: Literal["vanilla", "superposition"] = "vanilla",
+        pos_embed_rope_base: float | None = 100.0,
+        pos_embed_rope_min_period: float | None = None,
+        pos_embed_rope_max_period: float | None = None,
+        pos_embed_rope_normalize_coords: Literal["min", "max", "separate"] = "separate",
+        pos_embed_rope_shift_coords: float | None = None,
+        pos_embed_rope_jitter_coords: float | None = None,
+        pos_embed_rope_rescale_coords: float | None = None,
+        pos_embed_rope_dtype: str = "bf16",
+        embed_dim: int = 768,
+        depth: int = 12,
+        num_heads: int = 12,
+        ffn_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        drop_path_rate: float = 0.0,
+        layerscale_init: float | None = None,
+        norm_layer: str = "layernorm",
+        ffn_layer: str = "mlp",
+        ffn_bias: bool = True,
+        proj_bias: bool = True,
+        n_storage_tokens: int = 0,
+        mask_k_bias: bool = False,
+        use_fa4: bool = False,
+        untie_cls_and_patch_norms: bool = False,
+        untie_global_and_local_cls_norm: bool = False,
+        device: Any | None = None,
+    ):
+        super().__init__()
+
+        # Validated rather than allowed to fail deep inside a dict lookup, because these come
+        # straight from a config file.
+        if norm_layer not in norm_layer_dict:
+            raise ValueError(
+                f"unknown norm_layer {norm_layer!r}; expected one of {sorted(norm_layer_dict)}"
+            )
+        if ffn_layer not in ffn_layer_dict:
+            raise ValueError(
+                f"unknown ffn_layer {ffn_layer!r}; expected one of {sorted(ffn_layer_dict)}"
+            )
+        if pos_embed_rope_dtype not in dtype_dict:
+            raise ValueError(
+                f"unknown pos_embed_rope_dtype {pos_embed_rope_dtype!r}; expected one of "
+                f"{sorted(dtype_dict)}"
+            )
+        # Without this the if/elif below would leave `rope_embed` unset and fail much later with
+        # an AttributeError that says nothing about the config key that caused it.
+        if pos_embed_rope_type not in ROPE_TYPES:
+            raise ValueError(
+                f"unknown pos_embed_rope_type {pos_embed_rope_type!r}; expected one of "
+                f"{list(ROPE_TYPES)}"
+            )
+
+        norm_layer_cls = norm_layer_dict[norm_layer]
+
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency
+        self.n_blocks = depth
+        self.num_heads = num_heads
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.img_size = img_size
+        self.ffn_ratio = ffn_ratio
+
+        self.patch_embed = PatchEmbed3D(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+            flatten_embedding=False,
+        )
+
+        self.cls_token = nn.Parameter(torch.empty(1, 1, embed_dim, device=device))
+        self.n_storage_tokens = n_storage_tokens
+        if self.n_storage_tokens > 0:
+            self.storage_tokens = nn.Parameter(
+                torch.empty(1, n_storage_tokens, embed_dim, device=device)
+            )
+
+        self.rope_embed: RopePositionEmbedding3D | RopePositionEmbedding3DSuperposition
+        if pos_embed_rope_type == "vanilla":
+            self.rope_embed = RopePositionEmbedding3D(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                base=pos_embed_rope_base,
+                min_period=pos_embed_rope_min_period,
+                max_period=pos_embed_rope_max_period,
+                normalize_coords=pos_embed_rope_normalize_coords,
+                shift_coords=pos_embed_rope_shift_coords,
+                jitter_coords=pos_embed_rope_jitter_coords,
+                rescale_coords=pos_embed_rope_rescale_coords,
+                dtype=dtype_dict[pos_embed_rope_dtype],
+                device=device,
+            )
+        else:
+            self.rope_embed = RopePositionEmbedding3DSuperposition(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                base=pos_embed_rope_base,
+                # Depth varies far more slowly than the in-plane axes in anisotropic volumes, so
+                # it gets a longer base period.
+                depth_base=10.0 * pos_embed_rope_base if pos_embed_rope_base is not None else None,
+                min_period=pos_embed_rope_min_period,
+                max_period=pos_embed_rope_max_period,
+                normalize_coords=pos_embed_rope_normalize_coords,
+                shift_coords=pos_embed_rope_shift_coords,
+                jitter_coords=pos_embed_rope_jitter_coords,
+                rescale_coords=pos_embed_rope_rescale_coords,
+                dtype=dtype_dict[pos_embed_rope_dtype],
+                device=device,
+            )
+
+        ffn_layer_cls = ffn_layer_dict[ffn_layer]
+        ffn_ratio_sequence = [ffn_ratio] * depth
+        blocks_list = [
+            SelfAttentionBlock(
+                dim=embed_dim,
+                num_heads=num_heads,
+                ffn_ratio=ffn_ratio_sequence[i],
+                qkv_bias=qkv_bias,
+                proj_bias=proj_bias,
+                ffn_bias=ffn_bias,
+                drop_path=drop_path_rate,
+                norm_layer=norm_layer_cls,
+                act_layer=nn.GELU,
+                ffn_layer=ffn_layer_cls,
+                init_values=layerscale_init,
+                mask_k_bias=mask_k_bias,
+                use_fa4=use_fa4,
+                device=device,
+            )
+            for i in range(depth)
+        ]
+
+        self.chunked_blocks = False
+        self.blocks = nn.ModuleList(blocks_list)
+
+        # This norm is applied to everything, or when untying, to patch and mask tokens.
+        self.norm = norm_layer_cls(embed_dim)
+
+        self.untie_cls_and_patch_norms = untie_cls_and_patch_norms
+        if untie_cls_and_patch_norms:
+            # When untying, this norm is applied to CLS tokens and registers.
+            self.cls_norm: nn.Module | None = norm_layer_cls(embed_dim)
+        else:
+            self.cls_norm = None
+
+        self.untie_global_and_local_cls_norm = untie_global_and_local_cls_norm
+        if untie_global_and_local_cls_norm:
+            # When untying, this norm is applied to local CLS tokens and registers.
+            # This norm is never used during eval.
+            self.local_cls_norm: nn.Module | None = norm_layer_cls(embed_dim)
+        else:
+            self.local_cls_norm = None
+        self.head = nn.Identity()
+        self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
+
+        # Upstream leaves this to the caller -- every DINOv3 entry point runs `init_weights()`
+        # right after constructing the backbone. mia-train has no such hook: `ModelRegistry.build`
+        # is the only production path and it just calls the constructor, so an uninitialised model
+        # would train on whatever `torch.empty` returned. Sibling models (`ViT3D`, `MuViT3D`)
+        # likewise finish initialising inside `__init__`.
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        """Fill every parameter this architecture leaves uninitialised in `__init__`.
+
+        Called from `__init__`; public because it is upstream's API and because re-running it is
+        the way to reset a model in place.
+        """
+        self.rope_embed._init_weights()
+        nn.init.normal_(self.cls_token, std=0.02)
+        if self.n_storage_tokens > 0:
+            nn.init.normal_(self.storage_tokens, std=0.02)
+        nn.init.zeros_(self.mask_token)
+        named_apply(init_weights_vit, self)
+
+    @property
+    def grid_size(self) -> tuple[int, int, int]:
+        side = self.img_size // self.patch_size
+        return (side, side, side)
+
+    @property
+    def num_patches(self) -> int:
+        return int(math.prod(self.grid_size))
+
+    def prepare_tokens_with_masks(
+        self, x: torch.Tensor, masks=None
+    ) -> tuple[torch.Tensor, tuple[int, int, int]]:
+        x = self.patch_embed(x)
+        B, D, H, W, _ = x.shape
+        x = x.flatten(1, 3)  # B D*H*W E
+
+        if masks is not None:
+            x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
+            cls_token: torch.Tensor = self.cls_token
+        else:
+            # Keeps `mask_token` in the autograd graph even when unused, so DDP/FSDP do not trip
+            # over a parameter that receives no gradient on some ranks.
+            cls_token = self.cls_token + 0 * self.mask_token
+        if self.n_storage_tokens > 0:
+            storage_tokens: torch.Tensor = self.storage_tokens
+        else:
+            storage_tokens = torch.empty(
+                1, 0, cls_token.shape[-1], dtype=cls_token.dtype, device=cls_token.device
+            )
+
+        x = torch.cat([cls_token.expand(B, -1, -1), storage_tokens.expand(B, -1, -1), x], dim=1)
+
+        return x, (D, H, W)
+
+    def forward_features_list(
+        self, x_list: list[torch.Tensor], masks_list: list[torch.Tensor | None]
+    ) -> list[dict[str, torch.Tensor]]:
+        tokens_list = []
+        rope = []
+        for t_x, t_masks in zip(x_list, masks_list, strict=True):
+            t2_x, dhw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
+            tokens_list.append(t2_x)
+            rope.append(dhw_tuple)
+        for _, blk in enumerate(self.blocks):
+            if self.rope_embed is not None:
+                rope_sincos = [self.rope_embed(D=D, H=H, W=W) for D, H, W in rope]
+            else:
+                rope_sincos = [None for _ in rope]
+            tokens_list = blk(tokens_list, rope_sincos)
+        all_x = tokens_list
+        output = []
+        for idx, (x, masks) in enumerate(zip(all_x, masks_list, strict=True)):
+            if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:
+                if self.untie_global_and_local_cls_norm and self.training and idx == 1:
+                    # Assume second entry of list corresponds to local crops.
+                    # We only ever apply this during training.
+                    assert self.local_cls_norm is not None  # implied by the flag
+                    x_norm_cls_reg = self.local_cls_norm(x[:, : self.n_storage_tokens + 1])
+                if self.untie_cls_and_patch_norms:
+                    assert self.cls_norm is not None  # implied by the flag
+                    x_norm_cls_reg = self.cls_norm(x[:, : self.n_storage_tokens + 1])
+                else:
+                    x_norm_cls_reg = self.norm(x[:, : self.n_storage_tokens + 1])
+                x_norm_patch = self.norm(x[:, self.n_storage_tokens + 1 :])
+            else:
+                x_norm = self.norm(x)
+                x_norm_cls_reg = x_norm[:, : self.n_storage_tokens + 1]
+                x_norm_patch = x_norm[:, self.n_storage_tokens + 1 :]
+            output.append(
+                {
+                    "x_norm_clstoken": x_norm_cls_reg[:, 0],
+                    "x_storage_tokens": x_norm_cls_reg[:, 1:],
+                    "x_norm_patchtokens": x_norm_patch,
+                    "x_prenorm": x,
+                    "masks": masks,
+                }
+            )
+        return output
+
+    def forward_features(
+        self,
+        x: torch.Tensor | list[torch.Tensor],
+        masks: torch.Tensor | list[torch.Tensor | None] | None = None,
+    ) -> dict[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
+        if isinstance(x, torch.Tensor):
+            assert not isinstance(masks, list), "a single input takes a single mask, not a list"
+            return self.forward_features_list([x], [masks])[0]
+        assert isinstance(masks, list), "a list of crops needs a matching list of masks"
+        return self.forward_features_list(x, masks)
+
+    def _get_intermediate_layers_not_chunked(
+        self, x: torch.Tensor, n: int | Sequence[int] = 1
+    ) -> list[torch.Tensor]:
+        x, (D, H, W) = self.prepare_tokens_with_masks(x)
+        # If n is an int, take the n last blocks. If it's a list, take them
+        output, total_block_len = [], len(self.blocks)
+        blocks_to_take = (
+            range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        )
+        for i, blk in enumerate(self.blocks):
+            if self.rope_embed is not None:
+                rope_sincos = self.rope_embed(D=D, H=H, W=W)
+            else:
+                rope_sincos = None
+            x = blk(x, rope_sincos)
+            if i in blocks_to_take:
+                output.append(x)
+        assert len(output) == len(blocks_to_take), (
+            f"only {len(output)} / {len(blocks_to_take)} blocks found"
+        )
+        return output
+
+    def get_intermediate_layers(
+        self,
+        x: torch.Tensor,
+        *,
+        n: int | Sequence[int] = 1,  # Layers or n last layers to take
+        reshape: bool = False,
+        return_class_token: bool = False,
+        return_extra_tokens: bool = False,
+        norm: bool = True,
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, ...], ...]:
+        outputs = self._get_intermediate_layers_not_chunked(x, n)
+        if norm:
+            outputs_normed = []
+            for out in outputs:
+                if self.untie_cls_and_patch_norms:
+                    assert self.cls_norm is not None  # implied by the flag
+                    x_norm_cls_reg = self.cls_norm(out[:, : self.n_storage_tokens + 1])
+                    x_norm_patch = self.norm(out[:, self.n_storage_tokens + 1 :])
+                    outputs_normed.append(torch.cat((x_norm_cls_reg, x_norm_patch), dim=1))
+                else:
+                    outputs_normed.append(self.norm(out))
+            outputs = outputs_normed
+        class_tokens = [out[:, 0] for out in outputs]
+        extra_tokens = [out[:, 1 : self.n_storage_tokens + 1] for out in outputs]
+        outputs = [out[:, self.n_storage_tokens + 1 :] for out in outputs]
+        if reshape:
+            B, _, d, h, w = x.shape
+            outputs = [
+                out.reshape(
+                    B,
+                    d // self.patch_size,
+                    h // self.patch_size,
+                    w // self.patch_size,
+                    -1,
+                )
+                .permute(0, 4, 1, 2, 3)
+                .contiguous()
+                for out in outputs
+            ]
+        if not return_class_token and not return_extra_tokens:
+            return tuple(outputs)
+        elif return_class_token and not return_extra_tokens:
+            return tuple(zip(outputs, class_tokens, strict=True))
+        elif not return_class_token and return_extra_tokens:
+            return tuple(zip(outputs, extra_tokens, strict=True))
+        else:
+            return tuple(zip(outputs, class_tokens, extra_tokens, strict=True))
+
+    def forward(self, *args, is_training: bool = False, **kwargs):
+        ret = self.forward_features(*args, **kwargs)
+        if is_training:
+            return ret
+        # The list form is only ever used during training, where `is_training` is set.
+        assert isinstance(ret, dict), "forward() over a list of crops requires is_training=True"
+        return self.head(ret["x_norm_clstoken"])
+
+    def prepare_input(self, batch: torch.Tensor, axes: str) -> torch.Tensor:
+        """(B, *axes) -> (B, C, D, H, W). Single-scale: exactly one level per sample.
+
+        Same contract as `ViT3D.prepare_input`: miao's scale levels share a centre but cover
+        different physical extents, so they are neither pixel-aligned (they cannot be channels) nor
+        interchangeable with independent samples (folding them into the batch would quietly
+        redefine `batch_size`). This requires a single level and says how to configure it.
+        """
+        if "l" not in axes:
+            raise ValueError(f"axis order must contain 'l' (scale level), got {axes!r}")
+
+        remainder = axes.replace("l", "", 1)
+        if not (
+            len(remainder) == SPATIAL_RANK
+            or (len(remainder) == SPATIAL_RANK + 1 and remainder[0] == "c")
+        ):
+            raise ValueError(
+                f"axis order {axes!r} is not usable by a 3D encoder: after the level axis it "
+                'must be three spatial axes, optionally preceded by \'c\' (e.g. "lzyx" or '
+                f'"lcxyz"), got {remainder!r}'
+            )
+
+        expected_dims = len(axes) + 1
+        if batch.dim() != expected_dims:
+            raise ValueError(
+                f"axis order {axes!r} implies a {expected_dims}-D batch (batch + {len(axes)} "
+                f"axes), got {tuple(batch.shape)}; it must match the dataset's output_axes"
+            )
+
+        level_dim = axes.index("l") + 1
+        levels = batch.shape[level_dim]
+        if levels != 1:
+            raise ValueError(
+                f"{type(self).__name__} is single-scale, but this batch carries {levels} scale "
+                f"levels on axis 'l' (shape {tuple(batch.shape)}). Configure the dataset for one "
+                "level per sample: give `resolutions` a single entry, or use "
+                "`resolution_sampling` with `n_scales = 1`, which still varies the resolution but "
+                "draws it independently per sample."
+            )
+
+        volumes = batch.squeeze(level_dim)
+        if volumes.dim() == SPATIAL_RANK + 1:  # axis order declared no channel; add a singleton
+            volumes = volumes.unsqueeze(1)
+        return volumes
+
+    def extra_forward_methods(self) -> tuple[str, ...]:
+        """Both are entry points in their own right: SSL training drives `forward_features`
+        directly, and linear-probe evaluation drives `get_intermediate_layers`, so FSDP2 has to
+        all-gather around them as well as around `forward`."""
+        return ("forward_features", "get_intermediate_layers")
+
+    def flops(self, input_shape: tuple[int, ...]) -> int:
+        """Rough forward FLOPs for one sample: patch embedding, attention, and MLPs."""
+        n = self.num_patches + 1 + self.n_storage_tokens
+        d = self.embed_dim
+        depth = len(self.blocks)
+        patch_volume = self.patch_size**SPATIAL_RANK * self.in_chans
+        hidden = int(d * self.ffn_ratio)
+        patch_proj = 2 * self.num_patches * patch_volume * d
+        per_block = 2 * (4 * n * d * d) + 2 * (2 * n * n * d) + 2 * (2 * n * d * hidden)
+        return int(patch_proj + depth * per_block)

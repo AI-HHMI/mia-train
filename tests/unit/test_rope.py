@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from layers.rope import AxialRotaryEmbedding, RotaryTables, split_rope_dims
+from layers.common.rope import AxialRotaryEmbedding, RotaryTables, split_rope_dims
 
 
 def _attention_logits(

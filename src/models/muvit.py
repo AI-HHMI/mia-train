@@ -36,7 +36,7 @@ import math
 import torch
 import torch.nn as nn
 
-from layers.blocks import TransformerBlock
+from layers.common.blocks import TransformerBlock
 
 from .base import BaseModel
 from .registry import ModelRegistry

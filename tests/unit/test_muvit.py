@@ -7,8 +7,8 @@ from typing import Any
 import pytest
 import torch
 
-from layers.blocks import TransformerBlock
-from layers.rope import AxialRotaryEmbedding
+from layers.common.blocks import TransformerBlock
+from layers.common.rope import AxialRotaryEmbedding
 from models.muvit import MuViT3D
 from models.registry import ModelRegistry
 

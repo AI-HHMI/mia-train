@@ -29,11 +29,22 @@ MODEL_CONTRACT = {"base.py", "registry.py"}
 
 
 def _modules_in(package: str) -> list[pathlib.Path]:
+    """Every module in a package, including nested subpackages.
+
+    Recursive because `layers/` is grouped into subpackages -- `common/` for blocks shared across
+    architectures, `dinov3/` for one architecture's own -- and a non-recursive glob would quietly
+    stop enforcing the boundary rules below on exactly the files most likely to break them.
+    """
     return sorted(
         path
-        for path in (SRC / package).glob("*.py")
+        for path in (SRC / package).rglob("*.py")
         if path.name != "__init__.py"
     )
+
+
+def _module_name(path: pathlib.Path) -> str:
+    """`src/layers/dinov3/block.py` -> `layers.dinov3.block`."""
+    return ".".join(path.relative_to(SRC).with_suffix("").parts)
 
 
 def _imported_names(path: pathlib.Path) -> set[str]:
@@ -58,7 +69,7 @@ def test_every_model_module_registers_a_runnable_model():
     for path in _modules_in("models"):
         if path.name in MODEL_CONTRACT:
             continue
-        module = importlib.import_module(f"models.{path.stem}")
+        module = importlib.import_module(_module_name(path))
         found = [
             name
             for name in ModelRegistry.available()
@@ -85,7 +96,7 @@ def test_layers_do_not_depend_on_models():
     # packages are really one, and the split would stop carrying information.
     for path in _modules_in("layers"):
         assert "models" not in _imported_names(path), (
-            f"src/layers/{path.name} imports from models/; layers must not depend on models"
+            f"src/{path.relative_to(SRC)} imports from models/; layers must not depend on models"
         )
 
 
@@ -96,9 +107,10 @@ def test_layers_do_not_depend_on_algorithms_or_the_engine():
     forbidden = {"algorithms", "engine", "data", "evals"}
     for path in _modules_in("layers"):
         leaked = forbidden & _imported_names(path)
-        assert not leaked, f"src/layers/{path.name} imports {sorted(leaked)}"
+        assert not leaked, f"src/{path.relative_to(SRC)} imports {sorted(leaked)}"
 
 
 # No test that layers/ is non-empty. It was tried and removed: a layer going missing already fails
-# loudly at import (`ModuleNotFoundError: No module named 'layers.rope'` takes the whole suite down
-# at collection), so such a test guards nothing while hardcoding filenames a rename would break.
+# loudly at import (`ModuleNotFoundError: No module named 'layers.common.rope'` takes the whole
+# suite down at collection), so such a test guards nothing while hardcoding filenames a rename
+# would break.

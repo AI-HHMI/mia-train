@@ -180,7 +180,7 @@ def test_attention_backend_defaults_to_auto():
 
 @pytest.mark.unit
 def test_blocks_hold_our_own_attention_module():
-    from layers.attention import SelfAttention
+    from layers.common.attention import SelfAttention
 
     assert all(isinstance(block.attn, SelfAttention) for block in _tiny().blocks)
 

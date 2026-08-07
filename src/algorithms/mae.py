@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from data.base import BaseDataset
-from layers.blocks import TransformerBlock
+from layers.common.blocks import TransformerBlock
 from models.vit import SPATIAL_RANK, ViT3D
 
 from .base import BaseAlgorithm
