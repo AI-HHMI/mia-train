@@ -1,13 +1,20 @@
-"""Enforces the split between `models/` and `layers/`.
+"""Enforces the layout of `models/`, `layers/` and `algorithms/`.
 
-The rule: **`src/models/` holds what a user can name in a config**, i.e. what is registered in
-`ModelRegistry`, plus the two files that define the model contract. Everything reusable that is
-never named in a config -- attention, transformer blocks, position encodings -- lives in
-`src/layers/`.
+Two rules, both about being able to answer a question by listing a directory.
+
+**`ls src/models/`** answers "what can I train?" -- every file there registers something a config
+can name, plus the two that define the contract. Reusable pieces that no config ever names --
+attention, transformer blocks, position encodings -- live in `src/layers/` instead.
+
+**`ls src/algorithms/*.py`** answers "how can I train it?" -- likewise every top-level file there
+registers a strategy. A strategy's own supporting code goes in a subpackage named after it
+(`algorithms/dinov3/`, `algorithms/affinity/`), which keeps the top level a menu rather than a
+pile. Note the subpackage cannot share a name with the module that registers the strategy, since
+one would shadow the other -- hence `affinity_seg.py` beside `affinity/`.
 
 Checked rather than merely documented because a boundary like this decays quietly. Nothing fails
-when a block is dropped into `models/`; the package simply drifts back to a bag of modules over a
-few months, and `ls src/models/` stops answering "what can I train?".
+when a helper is dropped into `models/` or `algorithms/`; the package simply drifts back to a bag
+of modules over a few months.
 """
 
 from __future__ import annotations
@@ -19,12 +26,13 @@ import pathlib
 import pytest
 
 import components  # noqa: F401  (populates the registries as a real run would)
+from algorithms.registry import AlgorithmRegistry
 from models.registry import ModelRegistry
 
 SRC = pathlib.Path(__file__).resolve().parents[2] / "src"
 
-# base.py defines BaseModel and registry.py the registry itself: the contract every registrable
-# model implements, not models and not reusable layers.
+# base.py defines the ABC and registry.py the registry itself: the contract every registrable
+# implementation satisfies, which is neither an implementation nor a reusable part.
 MODEL_CONTRACT = {"base.py", "registry.py"}
 
 
@@ -78,6 +86,44 @@ def test_every_model_module_registers_a_runnable_model():
         assert found, (
             f"src/models/{path.name} registers no model. If it is a reusable building block "
             "rather than something a user names in a config, it belongs in src/layers/."
+        )
+
+
+@pytest.mark.unit
+def test_every_top_level_algorithm_module_registers_a_strategy():
+    """The payoff of the split: `ls src/algorithms/*.py` is the menu of `[algorithm].name` values.
+
+    Only the top level -- a subpackage like `algorithms/dinov3/` holds that strategy's supporting
+    code, which is exactly what should not appear in the menu.
+    """
+    assert AlgorithmRegistry.available(), (
+        "no algorithms registered; components.py may have stopped importing them"
+    )
+
+    for path in sorted((SRC / "algorithms").glob("*.py")):
+        if path.name in MODEL_CONTRACT or path.name == "__init__.py":
+            continue
+        module = importlib.import_module(_module_name(path))
+        found = [
+            name
+            for name in AlgorithmRegistry.available()
+            if AlgorithmRegistry.get(name).__module__ == module.__name__
+        ]
+        assert found, (
+            f"src/algorithms/{path.name} registers no algorithm. If it is supporting code for one "
+            "strategy, move it into that strategy's subpackage (e.g. algorithms/dinov3/)."
+        )
+
+
+@pytest.mark.unit
+def test_algorithm_subpackages_hold_only_supporting_code():
+    """The other direction: a strategy inside a subpackage would be invisible in the menu."""
+    for name in AlgorithmRegistry.available():
+        module = AlgorithmRegistry.get(name).__module__
+        depth = len(module.split("."))
+        assert depth == 2, (
+            f"algorithm {name!r} is registered in {module}, which is nested; registrable "
+            "strategies belong directly in src/algorithms/"
         )
 
 

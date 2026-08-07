@@ -173,6 +173,15 @@ class ViT3D(BaseModel):
             tokens = block(tokens, coords)
         return self.norm(tokens)
 
+    def patch_features(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
+        """(B, C, D, H, W) -> every patch's encoded feature (B, num_patches, embed_dim).
+
+        The whole grid, unlike the masked path `embed`/`encode` serve: a dense head needs a
+        feature for every patch, so nothing is dropped here.
+        """
+        tokens, coords = self.embed(x)
+        return self.encode(tokens, coords), self.grid_size
+
     def patchify(self, volumes: torch.Tensor) -> torch.Tensor:
         """(B, C, D, H, W) -> (B, num_patches, patch_volume), matching the encoder's grid.
 

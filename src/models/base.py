@@ -36,6 +36,24 @@ class BaseModel(nn.Module, abc.ABC):
             "by an algorithm that passes dataset-shaped batches through the model"
         )
 
+    def patch_features(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
+        """Encode one input into per-patch features -> (B, N, C) tokens and their patch grid.
+
+        The entry point dense downstream tasks need. Encoders here disagree about how to produce
+        tokens -- `ViT3D` splits `embed`/`encode` so masked autoencoding can drop tokens in
+        between, while the DINOv3 models expose `forward_features` and return a dict -- and a
+        segmentation head should not have to know which it was handed. Tokens come back in grid
+        (row-major) order together with the grid they fill, because a head has to fold them back
+        into a volume and the token count alone does not say what shape that was.
+
+        Not every architecture has a single answer: a multi-scale encoder's sequence spans several
+        grids at once, so it declines here rather than inventing one.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement patch_features, so it cannot drive a "
+            "dense prediction head"
+        )
+
     def extra_forward_methods(self) -> tuple[str, ...]:
         """Methods besides `forward` through which this model's parameters get used.
 

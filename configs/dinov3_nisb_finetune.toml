@@ -1,0 +1,116 @@
+# Stage 3 of the DINOv3 -> 3D SSL -> NISB pipeline: supervised affinity training on NISB,
+# starting from an already-pretrained 3D encoder.
+#
+#   bsub -P <project> -q gpu_h100 -gpu "num=2" -n 24 -W 4:00 ... \
+#     torchrun --standalone --nproc_per_node=2 src/train.py --config configs/dinov3_nisb_finetune.toml
+#
+# The three stages, and which config runs each:
+#
+#   1. Meta's released 2D DINOv3 weights           -- a .pth you supply (licence gated; get the
+#                                                     URL from Meta's model form, or point at a
+#                                                     local copy)
+#   2. Optional further SSL on 3D microscopy       -- configs/mae_pretrain.toml with an [init]
+#                                                     section like the one below, which writes a
+#                                                     checkpoint under its run directory
+#   3. Supervised NISB affinities                  -- this file
+#
+# Each stage is an ordinary run; [init] is the only thing that chains them. Turning the affinities
+# this produces into instances, and scoring them against the benchmark's skeletons, happens in the
+# benchmark's own tooling -- see configs/nisb_affinity_smoke.toml for why.
+
+experiment_name = "dinov3_nisb_finetune"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 64
+patch_size = 16          # must match the checkpoint's: the in-plane kernel is transferred as is,
+                         # only the new depth axis is synthesised
+in_chans = 1             # microscopy is single-channel; the RGB kernel is averaged down
+embed_dim = 768          # ViT-B/16
+depth = 12
+num_heads = 12
+n_storage_tokens = 4
+pos_embed_rope_dtype = "fp32"
+
+# "superposition" keeps the 2D rotary channel layout and adds a zero-gated depth angle, so the
+# model starts out behaving exactly like its 2D self and learns how much depth to mix in.
+# "vanilla" also loads fine -- the rotary buffers are derived from `base` rather than learned, so
+# neither type transfers them -- but it gives depth its own third of the channels from the start,
+# which is the better choice when training from scratch rather than adapting.
+pos_embed_rope_type = "superposition"
+
+[init]
+# Stage 1: point this at Meta's released checkpoint. For stage 3 after your own SSL run, point it
+# at that run's checkpoint directory instead and set prefix = "model." (a run checkpoints the
+# whole algorithm, so the encoder sits under `model.` beside the SSL objective's decoder).
+path = "/path/to/dinov3_vitb16_pretrain_lvd1689m.pth"
+
+# The 2D patch embedding is a (768, 3, 16, 16) kernel; this model wants (768, 1, 16, 16, 16).
+# The kernel is averaged over RGB and spread over the new depth axis, divided by its length so a
+# z-constant volume reproduces the 2D response exactly.
+inflate_2d_to_3d = true
+
+# `rope_embed` buffers are recomputed from `base` in the model's own init_weights and carry no
+# learned information; 2D and 3D split their channels differently, so their lengths disagree.
+# Skipping them loses nothing and avoids a spurious shape mismatch.
+skip = ["rope_embed."]
+
+# Every remaining tensor must fit. Loading nothing, or silently dropping a block, would train a
+# from-scratch model that looks entirely normal on a loss curve.
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder_hidden_dim = 64
+split_disconnected = true
+
+[data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [64, 64, 64]
+samples_per_epoch = 1000
+
+[val_data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [64, 64, 64]
+samples_per_epoch = 64
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/val/seed100.zarr"
+image_key = "img"
+label_key = "labels/seg"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+max_steps = 20000
+batch_size = 2
+lr = 1.0e-4             # lower than a from-scratch run: the encoder arrives already trained
+warmup_steps = 500
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+
+# Fine-tuning a pretrained backbone: hold the early layers back so the general features near the
+# input survive while the layers nearest the objective adapt. DINOv3's own values.
+layerwise_lr_decay = 0.9
+# The patch embedding has the most to re-learn (an inflated 2D kernel meeting a new modality) yet
+# sits deepest in the layerwise schedule, so it is scaled separately.
+patch_embed_lr_mult = 0.2
+precision = "bf16"
+log_every = 50
+val_every = 500
+checkpoint_every = 2000
+num_workers = 8
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 2
+tp = 1

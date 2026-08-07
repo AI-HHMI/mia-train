@@ -6,6 +6,32 @@ PRECISIONS = ("fp32", "bf16")
 
 
 @dataclass(frozen=True)
+class InitConfig:
+    """Where a run's *model* weights start, when not from scratch.
+
+    Separate from resuming, which `[trainer]` and the checkpoint manager handle: resuming
+    continues one run and restores the optimizer and step too, while this begins a new run from
+    weights trained elsewhere -- an earlier pretraining run, or a released checkpoint -- and takes
+    nothing but the model.
+    """
+
+    path: str = ""
+    prefix: str = ""
+    inflate_2d_to_3d: bool = False
+    skip: tuple[str, ...] = ()
+    strict: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.path and (self.prefix or self.inflate_2d_to_3d or self.skip):
+            raise ValueError(
+                "[init] sets loading options but no 'path', so nothing would be loaded and the "
+                "run would silently start from scratch"
+            )
+        # TOML gives arrays as lists; freeze so the config stays hashable and immutable.
+        object.__setattr__(self, "skip", tuple(self.skip))
+
+
+@dataclass(frozen=True)
 class TrainerConfig:
     """Hyperparameters for one training run, normally populated from a .toml config."""
 
@@ -18,6 +44,30 @@ class TrainerConfig:
     warmup_steps: int = 0
     min_lr_ratio: float = 0.0
     grad_clip_norm: float | None = 1.0
+
+    # Per-parameter learning-rate shaping. The two lr knobs default to "off"; the weight-decay
+    # exemption below does not -- see its own note.
+    #
+    # `layerwise_lr_decay` scales the learning rate by `decay ** (depth_from_the_top)`, so early
+    # blocks move less than late ones. That is what makes fine-tuning a pretrained backbone
+    # stable: the general features near the input are worth preserving, while the layers nearest
+    # the objective have the most to unlearn. 1.0 disables it.
+    layerwise_lr_decay: float = 1.0
+    # The patch embedding is the one layer that has to re-learn a new input statistic (a different
+    # modality, or an inflated 2D kernel), yet it also sits deepest in the layerwise schedule.
+    # This scales it separately; upstream DINOv3 uses 0.2.
+    patch_embed_lr_mult: float = 1.0
+    # Weight decay is scheduled like the learning rate, from `weight_decay` to this. None holds it
+    # constant. DINOv3 *raises* it over training (0.04 -> 0.4), tightening the representation as
+    # the teacher stops moving.
+    final_weight_decay: float | None = None
+    # Weight decay shrinks a weight toward zero, which regularizes a matrix whose norm controls
+    # how much signal it passes. A normalization gain and a bias have no such reading: decaying a
+    # LayerNorm gain just pulls the layer's output toward zero and works against the normalization
+    # the layer exists to provide. Exempting them is what essentially every transformer recipe
+    # does, DINOv3's included, which is why it is the default here rather than an opt-in.
+    zero_weight_decay_on_norm_and_bias: bool = True
+
     precision: str = "fp32"
     log_every: int = 10
     checkpoint_every: int = 0
@@ -46,3 +96,18 @@ class TrainerConfig:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {self.precision!r}")
         if self.log_every < 1:
             raise ValueError(f"log_every must be >= 1, got {self.log_every}")
+        if not 0.0 < self.layerwise_lr_decay <= 1.0:
+            raise ValueError(
+                f"layerwise_lr_decay must be in (0, 1], got {self.layerwise_lr_decay}; it is a "
+                "per-layer multiplier, and a value above 1 would give the earliest layers the "
+                "largest learning rate"
+            )
+        if self.patch_embed_lr_mult <= 0.0:
+            raise ValueError(
+                f"patch_embed_lr_mult must be > 0, got {self.patch_embed_lr_mult}; use a small "
+                "value to slow the patch embedding, not zero to freeze it"
+            )
+        if self.final_weight_decay is not None and self.final_weight_decay < 0.0:
+            raise ValueError(
+                f"final_weight_decay must be >= 0 or None, got {self.final_weight_decay}"
+            )

@@ -15,6 +15,7 @@ from distributed.setup import destroy_distributed, device_type, init_distributed
 from models.registry import ModelRegistry
 from utils.cluster import checkpoint_dir
 from utils.config import RunConfig, as_plain_dict, diff_resolved, load_run_config
+from utils.pretrained import load_pretrained
 from utils.provenance import write_run_artifacts
 
 from .trainer import Trainer
@@ -194,6 +195,18 @@ def build_trainer(
         else None
     )
     model = ModelRegistry.build(config.model.name, **config.model.kwargs)
+    if config.init.path:
+        # Before the algorithm wraps it and before any parallelism is applied, so the load sees
+        # plain unsharded tensors and a strategy's own parameters (a decoder, say) keep the
+        # initialisation they were built with.
+        load_pretrained(
+            model,
+            config.init.path,
+            prefix=config.init.prefix,
+            inflate=config.init.inflate_2d_to_3d,
+            skip=config.init.skip,
+            strict=config.init.strict,
+        )
     algorithm = AlgorithmRegistry.build(
         config.algorithm.name, model, train_dataset, **config.algorithm.kwargs
     )

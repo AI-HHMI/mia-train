@@ -1,0 +1,81 @@
+# Short supervised run on NISB "base": affinity prediction for neuron instance segmentation.
+#
+#   bsub -P <project> -q gpu_h100 -gpu "num=2" -n 24 -W 0:30 ... \
+#     torchrun --standalone --nproc_per_node=2 src/train.py --config configs/nisb_affinity_smoke.toml
+#
+# This trains the encoder and an affinity head. Turning the predicted affinities into instances,
+# and scoring them against the benchmark's skeletons, happens outside this repo: both need a
+# connected-components pass over a whole 12-gigavoxel cube and the dependencies that implies
+# (numba, funlib.evaluate), which mia-train deliberately does not carry. Use the benchmark's own
+# tooling for that, and this run's `val` metrics to watch training.
+#
+# [parallelism] must multiply to the torchrun world size.
+
+experiment_name = "nisb_affinity_smoke"
+
+[model]
+name = "vit3d"
+img_size = [64, 64, 64]
+patch_size = [8, 8, 8]   # 8^3 = 512 patches; finer than the MAE configs, since the head has to
+                         # resolve boundaries between touching neurons rather than reconstruct
+                         # texture
+in_channels = 1
+embed_dim = 384
+depth = 6
+num_heads = 6
+attention_backend = "auto"
+
+[algorithm]
+name = "affinity_seg"
+# Axis order comes from the dataset, so it is not restated here -- and the algorithm rejects
+# anything whose spatial order is not x,y,z, because the affinity channels are defined against
+# the benchmark's indexing.
+long_range = 10          # the benchmark's second offset block, in voxels
+decoder_hidden_dim = 64
+split_disconnected = true
+
+[data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [64, 64, 64]
+samples_per_epoch = 1000
+
+# The validation cube. Held out from training by the benchmark's rules, and the only cube that may
+# be used to choose hyperparameters and post-processing thresholds; seed101 (test) is never read
+# during training.
+[val_data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [64, 64, 64]
+samples_per_epoch = 64
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/val/seed100.zarr"
+image_key = "img"
+label_key = "labels/seg"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+max_steps = 50
+batch_size = 2
+lr = 1.0e-4
+warmup_steps = 5
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+log_every = 5
+val_every = 25
+checkpoint_every = 25
+num_workers = 4
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 2
+tp = 1

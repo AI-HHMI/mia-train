@@ -391,6 +391,19 @@ class DinoVisionTransformer3D(BaseModel):
         assert isinstance(ret, dict), "forward() over a list of crops requires is_training=True"
         return self.head(ret["x_norm_clstoken"])
 
+    def patch_features(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
+        """(B, C, D, H, W) -> normalised patch tokens (B, N, embed_dim) and their grid.
+
+        CLS and storage tokens are dropped: they carry no position on the grid, so a dense head
+        has nowhere to put them. The grid is read off the patch embedding rather than taken from
+        `grid_size`, so a crop at a resolution other than the configured `img_size` still folds
+        back correctly.
+        """
+        out = self.forward_features(x)
+        assert isinstance(out, dict)  # a single tensor in gives the dict form back
+        grid = tuple(s // self.patch_size for s in x.shape[-SPATIAL_RANK:])
+        return out["x_norm_patchtokens"], grid  # type: ignore[return-value]
+
     def prepare_input(self, batch: torch.Tensor, axes: str) -> torch.Tensor:
         """(B, *axes) -> (B, C, D, H, W). Single-scale: exactly one level per sample.
 

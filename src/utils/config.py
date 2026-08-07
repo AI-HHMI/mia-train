@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from distributed.parallel_dims import ParallelDims
-from engine.config import TrainerConfig
+from engine.config import InitConfig, TrainerConfig
 
 _COMPONENT_SECTIONS = ("model", "algorithm", "data")
 
@@ -31,6 +31,7 @@ class RunConfig:
     trainer: TrainerConfig
     parallelism: ParallelDims = field(default_factory=ParallelDims)
     val_data: ComponentConfig | None = None
+    init: InitConfig = field(default_factory=InitConfig)
 
 
 def _component(raw: dict[str, Any], section: str) -> ComponentConfig:
@@ -73,6 +74,7 @@ def load_run_config(path: Path) -> RunConfig:
             ParallelDims, dict(raw.get("parallelism", {})), "parallelism"
         ),
         val_data=_component(raw, "val_data") if "val_data" in raw else None,
+        init=_dataclass_from_section(InitConfig, dict(raw.get("init", {})), "init"),
     )
 
 

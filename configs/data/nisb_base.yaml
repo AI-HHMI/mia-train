@@ -1,0 +1,74 @@
+# NISB "base" setting: the 5-cube training split of the Neuron Instance Segmentation Benchmark.
+#
+# Referenced from a run config with:
+#
+#   [data]
+#   name = "miao_volumes"
+#   config_path = "configs/data/nisb_base.yaml"
+#
+# This is the first *supervised* dataset in the repo: `label_key` makes miao return an instance
+# segmentation crop alongside the image, co-registered voxel for voxel. See
+# configs/data/lmd_33nm.yaml for the conventions this follows.
+#
+# Benchmark rules: only the training cubes may be trained on. The val cube (seed100) selects
+# hyperparameters and post-processing thresholds; the test cube (seed101) is scored once. Neither
+# appears here -- val belongs in a [val_data] section, and test is never read during training.
+
+# 9x9x20 nm is the native resolution of the s0 level, and the data is anisotropic: z voxels are
+# a little over twice as long as x and y. Asking for exactly the stored size keeps miao on level 0
+# with no resampling. A coarser isotropic request would silently drop to a downsampled level and
+# change what a patch covers.
+resolutions: [[9, 9, 20]]
+
+# NISB is stored x,y,z -- the skeleton's `index_position` indexes the volume in that order, and
+# the benchmark's affinity channels are defined against it. Reordering here would transpose the
+# affinity targets relative to the published channel convention with no other symptom, so the
+# affinity algorithm asserts this order rather than trusting it.
+output_axes: "lcxyz"
+
+# Isotropic in voxels, not in nanometres: 128 voxels of z covers ~2.2x the physical depth that
+# 128 voxels of x covers. That is what the reference baseline does too -- it crops a cube in
+# index space and lets the anisotropy be part of what the network learns.
+patch_size: [128, 128, 128]
+samples_per_epoch: 1000
+
+volumes:
+  - name: "NISB base seed0"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/train/seed0.zarr"
+    image_key: "img"
+    label_key: "labels/seg"
+    zarr_version: "zarr3"
+    weight: 0.2
+    normalize: true   # uint8 on disk, so this maps to [0, 1] by dtype max
+
+  - name: "NISB base seed1"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/train/seed1.zarr"
+    image_key: "img"
+    label_key: "labels/seg"
+    zarr_version: "zarr3"
+    weight: 0.2
+    normalize: true
+
+  - name: "NISB base seed2"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/train/seed2.zarr"
+    image_key: "img"
+    label_key: "labels/seg"
+    zarr_version: "zarr3"
+    weight: 0.2
+    normalize: true
+
+  - name: "NISB base seed3"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/train/seed3.zarr"
+    image_key: "img"
+    label_key: "labels/seg"
+    zarr_version: "zarr3"
+    weight: 0.2
+    normalize: true
+
+  - name: "NISB base seed4"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/train/seed4.zarr"
+    image_key: "img"
+    label_key: "labels/seg"
+    zarr_version: "zarr3"
+    weight: 0.2
+    normalize: true
