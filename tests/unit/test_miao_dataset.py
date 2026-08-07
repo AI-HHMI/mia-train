@@ -210,3 +210,62 @@ def test_referenced_files_names_the_yaml_for_copying(ome_zarr_volume, tmp_path):
     path = _write_yaml(tmp_path, ome_zarr_volume)
     assert MiaoVolumeDataset.referenced_files(config_path=str(path)) == (path,)
     assert MiaoVolumeDataset.referenced_files(**_config(ome_zarr_volume)) == ()
+
+
+@pytest.mark.unit
+def test_miao_supplies_the_bounding_box_contract_muvit_positions_tokens_from(ome_zarr_volume):
+    """Pin the miao behaviour `MuViT3D` depends on, since nothing downstream can detect its loss.
+
+    MuViT places every token at a world coordinate derived from these boxes, and wrong coordinates
+    are still perfectly well-shaped: the model trains, the loss falls, and the cross-scale geometry
+    is quietly meaningless. `pyproject.toml` therefore floors miao-io rather than capping it, and
+    relies on this test to fail loudly if a future release changes the contract.
+    """
+    dataset = MiaoVolumeDataset(**_config(ome_zarr_volume))
+    sample = dataset.dataset[0]
+
+    # 1. A box per level, as [low, high] corners over the spatial axes.
+    assert "bbox" in sample
+    assert tuple(sample["bbox"].shape) == (2, 2, 3), "expected (levels, [low, high], spatial)"
+
+    low, high = sample["bbox"][:, 0, :], sample["bbox"][:, 1, :]
+    extents = high - low
+
+    # 2. Physical units, not voxel counts: the fixture's levels have voxel sizes 1 and 2, and the
+    #    patch is 8 voxels, so a level's extent is its voxel size times the patch.
+    assert torch.allclose(extents[0], torch.full((3,), 8.0))
+    assert torch.allclose(extents[1], torch.full((3,), 16.0))
+
+    # 3. The ratio between levels tracks the resolution ratio. This is what makes a coarse level
+    #    cover proportionally more scene, which is the whole premise of multi-resolution encoding.
+    assert torch.allclose(extents[1] / extents[0], torch.full((3,), 2.0))
+
+    # 4. The levels overlap rather than sitting in unrelated places.
+    assert ((low[1] <= low[0] + 1e-6) & (high[1] >= high[0] - 1e-6)).all(), (
+        "the coarse level should contain the fine one"
+    )
+
+
+@pytest.mark.unit
+def test_a_miao_bbox_drops_straight_into_muvit(ome_zarr_volume):
+    # The integration the contract exists for: miao's box, collated, is exactly what the encoder's
+    # coordinate machinery accepts -- no reshaping, reordering or unit conversion in between.
+    from models.muvit import MuViT3D
+
+    dataset = MiaoVolumeDataset(**_config(ome_zarr_volume))
+    loader = dataset.build_dataloader(batch_size=2, rank=0, world_size=1, shuffle=False)
+    batch = next(iter(loader))
+
+    model = MuViT3D(
+        levels=(1, 2), img_size=(8, 8, 8), patch_size=(4, 4, 4), in_channels=1,
+        embed_dim=32, depth=1, num_heads=2, attention_backend="sdpa",
+    )
+    coords = model.world_coords(batch["bbox"])
+    assert coords.shape == (2, model.num_patches, 3)
+
+    # Coarse-level patches spread over twice the span of fine-level ones, carried through from
+    # miao's extents rather than from the model's own concentric fallback.
+    per_level = coords.reshape(2, 2, model.patches_per_level, 3)
+    fine_span = per_level[0, 0].max(0).values - per_level[0, 0].min(0).values
+    coarse_span = per_level[0, 1].max(0).values - per_level[0, 1].min(0).values
+    assert torch.allclose(coarse_span / fine_span, torch.full((3,), 2.0), atol=1e-4)

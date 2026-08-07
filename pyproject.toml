@@ -9,10 +9,7 @@ requires-python = ">=3.11"
 dependencies = [
     "torch>=2.0",
     "tensorboard>=2.0",
-    # miao (distribution name: miao-io) supplies the OME-NGFF volume dataset that
-    # src/data/miao_dataset.py wraps. It is not published on PyPI, so it is documented
-    # here rather than pinned: install it from the AI-HHMI/miao repository, e.g.
-    #   pip install -e /path/to/miao
+    "miao-io>=0.1.3",
 ]
 
 [project.optional-dependencies]
