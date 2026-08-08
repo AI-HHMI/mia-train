@@ -2,9 +2,6 @@
 name = "mia-train"
 version = "0.1.0"
 description = "PyTorch-native distributed training framework"
-# 3.11 is the real floor: src/utils/config.py reads .toml with stdlib `tomllib`, which was
-# added in 3.11. DESIGN.md makes TOML the config format and core code must stay dependency-free,
-# so there is no 3.10-compatible reader to fall back on.
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.0",
@@ -54,10 +51,6 @@ ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 
-# zarr ships `py.typed`, so mypy parses its installed source — which uses PEP 695 `type`
-# statements (3.12+) that mypy rejects under our 3.11 target, aborting the whole run. We only
-# touch zarr in test scaffolding (tests/conftest.py writes an OME-NGFF fixture), so treat it as
-# untyped like miao and pydantic rather than lowering `python_version` below the 3.11 floor.
 [[tool.mypy.overrides]]
 module = ["zarr.*"]
 follow_imports = "skip"

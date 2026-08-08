@@ -206,6 +206,7 @@ def build_trainer(
             inflate=config.init.inflate_2d_to_3d,
             skip=config.init.skip,
             strict=config.init.strict,
+            allow_unused=config.init.allow_unused,
         )
     algorithm = AlgorithmRegistry.build(
         config.algorithm.name, model, train_dataset, **config.algorithm.kwargs

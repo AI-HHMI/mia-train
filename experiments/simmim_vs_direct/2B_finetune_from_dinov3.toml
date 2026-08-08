@@ -1,0 +1,78 @@
+# simmim_vs_direct__B_finetune_from_dinov3
+
+experiment_name = "simmim_vs_direct__B_finetune_from_dinov3"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 128            # 8^3 = 512 tokens at patch 16
+patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
+in_chans = 1
+embed_dim = 1024          # ViT-L/16, 303M parameters
+depth = 24
+num_heads = 16
+n_storage_tokens = 4      # the released ViTs carry 4 registers
+layerscale_init = 1.0e-05 # NOT optional -- the released weights were trained with LayerScale
+mask_k_bias = true        # ditto: the checkpoint carries a masked key bias per block
+pos_embed_rope_dtype = "fp32"
+# Keeps the 2D rotary channel layout and adds a zero-gated depth angle, so the inflated model
+# starts out identical to its 2D self.
+pos_embed_rope_type = "superposition"
+
+[init]
+# Arm B: straight from Meta's 2D release, with no intervening SSL. This is the control.
+path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+inflate_2d_to_3d = true
+skip = ["rope_embed."]
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder_hidden_dim = 64
+split_disconnected = true
+
+[data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [128, 128, 128]
+samples_per_epoch = 1000
+
+# seed100 is the benchmark's validation cube. Never trained on, in either stage.
+[val_data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [128, 128, 128]
+samples_per_epoch = 32
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/val/seed100.zarr"
+image_key = "img"
+label_key = "labels/seg"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+max_steps = 6000
+batch_size = 1
+lr = 1.0e-4
+warmup_steps = 300
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 0.9
+patch_embed_lr_mult = 0.2
+precision = "bf16"
+log_every = 50
+val_every = 250
+checkpoint_every = 1000
+num_workers = 8
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 2
+tp = 1

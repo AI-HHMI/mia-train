@@ -242,3 +242,47 @@ def test_reads_back_a_distributed_checkpoint_directory(tmp_path):
     assert all(not k.startswith("decoder") for k in report.copied)
     for name, tensor in fresh.state_dict().items():
         assert torch.equal(tensor, encoder.state_dict()[name]), name
+
+
+@pytest.mark.unit
+def test_leftover_checkpoint_tensors_are_an_error_by_default(tmp_path):
+    """The silent failure this exists for.
+
+    A released DINOv3 ViT has LayerScale and a masked key bias. A model configured without them
+    loads every tensor it recognises, reports nothing wrong, and computes a different function
+    from the one that was trained.
+    """
+    path, _ = _released_checkpoint(tmp_path, layerscale_init=1e-5, mask_k_bias=True)
+    plain = DinoVisionTransformer(in_chans=3, **DINO)  # no layerscale, no masked bias
+
+    with pytest.raises(ValueError, match="no home in this model"):
+        load_pretrained(plain, path)
+
+
+@pytest.mark.unit
+def test_the_leftovers_name_the_setting_that_would_consume_them(tmp_path):
+    path, _ = _released_checkpoint(tmp_path, layerscale_init=1e-5, mask_k_bias=True)
+    plain = DinoVisionTransformer(in_chans=3, **DINO)
+
+    with pytest.raises(ValueError, match="layerscale_init"):
+        load_pretrained(plain, path)
+
+
+@pytest.mark.unit
+def test_a_correctly_configured_model_consumes_the_whole_checkpoint(tmp_path):
+    path, _ = _released_checkpoint(tmp_path, layerscale_init=1e-5, mask_k_bias=True)
+    matching = DinoVisionTransformer(
+        in_chans=3, layerscale_init=1e-5, mask_k_bias=True, **DINO
+    )
+    report = load_pretrained(matching, path)
+    assert not report.unused and not report.kept_initial and not report.mismatched
+
+
+@pytest.mark.unit
+def test_allow_unused_permits_a_checkpoint_that_holds_more(tmp_path):
+    """Legitimate when the checkpoint really does carry more than this model wants."""
+    path, _ = _released_checkpoint(tmp_path, layerscale_init=1e-5, mask_k_bias=True)
+    plain = DinoVisionTransformer(in_chans=3, **DINO)
+
+    report = load_pretrained(plain, path, allow_unused=True)
+    assert report.unused and report.copied

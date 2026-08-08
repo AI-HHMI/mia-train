@@ -157,6 +157,7 @@ def load_pretrained(
     inflate: bool = False,
     skip: Sequence[str] = (),
     strict: bool = True,
+    allow_unused: bool = False,
 ) -> LoadReport:
     """Copy what fits from the checkpoint at `path` into `model`, in place.
 
@@ -167,6 +168,13 @@ def load_pretrained(
 
     `inflate` allows a 2D patch embedding to be reshaped into a 3D one. Nothing else is reshaped,
     so a transformer block whose width disagrees is reported rather than quietly truncated.
+
+    `allow_unused` permits the checkpoint to carry tensors this model has no home for. Left off,
+    that is an error, because the usual cause is an architecture that disagrees: a released DINOv3
+    ViT has LayerScale and a masked key bias, and a model configured without them loads perfectly,
+    reports nothing wrong, and computes a different function from the one that was trained. Turn
+    it on when the checkpoint genuinely holds more than you want -- a full algorithm when you only
+    need its encoder.
 
     `skip` names key prefixes the model should keep its own values for. The case this exists for
     is a buffer the model *derives* rather than learns: DINOv3's `rope_embed.periods` is computed
@@ -227,6 +235,8 @@ def load_pretrained(
             f"{len(report.mismatched)} tensor(s) in {path} do not fit this model:\n{details}\n"
             f"{_mismatch_hint(report)}"
         )
+    # Checked before the leftovers: if *nothing* matched, every checkpoint key is unused, and
+    # "36 tensors have no home" would bury the real problem, which is that none of them do.
     if not report.copied and not report.inflated:
         raise ValueError(
             f"nothing in {path} matched this model's parameters, so it would have trained from "
@@ -234,7 +244,30 @@ def load_pretrained(
             f"{sorted(destinations)[:5]}. Set `prefix` if the checkpoint stores the encoder under "
             "one."
         )
+    if report.unused and not allow_unused:
+        raise ValueError(
+            f"{len(report.unused)} tensor(s) in {path} have no home in this model, so it is "
+            f"configured differently from the one that was trained: {report.unused[:6]}"
+            f"{' ...' if len(report.unused) > 6 else ''}\n{_unused_hint(report)}"
+        )
     return report
+
+
+def _unused_hint(report: LoadReport) -> str:
+    """Name the setting that would consume the leftovers, when it is one we recognise."""
+    missing = []
+    if any("ls1.gamma" in key or "ls2.gamma" in key for key in report.unused):
+        missing.append("layerscale_init (the released DINOv3 ViTs use 1.0e-05)")
+    if any("bias_mask" in key for key in report.unused):
+        missing.append("mask_k_bias = true")
+    if any("storage_tokens" in key for key in report.unused):
+        missing.append("n_storage_tokens (the released DINOv3 ViTs use 4)")
+    if missing:
+        return "The model appears to be missing: " + "; ".join(missing) + "."
+    return (
+        "Set allow_unused = true if the checkpoint is expected to hold more than this model "
+        "needs, or `prefix` to select the part you want."
+    )
 
 
 def _mismatch_hint(report: LoadReport) -> str:

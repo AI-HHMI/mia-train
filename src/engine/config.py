@@ -20,9 +20,12 @@ class InitConfig:
     inflate_2d_to_3d: bool = False
     skip: tuple[str, ...] = ()
     strict: bool = True
+    allow_unused: bool = False
 
     def __post_init__(self) -> None:
-        if not self.path and (self.prefix or self.inflate_2d_to_3d or self.skip):
+        if not self.path and (
+            self.prefix or self.inflate_2d_to_3d or self.skip or self.allow_unused
+        ):
             raise ValueError(
                 "[init] sets loading options but no 'path', so nothing would be loaded and the "
                 "run would silently start from scratch"

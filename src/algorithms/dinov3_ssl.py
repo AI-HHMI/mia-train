@@ -145,9 +145,8 @@ class DINOv3(BaseAlgorithm):
             {"backbone": model, "dino_head": dino_head, "ibot_head": ibot_head}
         )
 
-        # The teacher is a copy, not a second random init: it has to start where the student is or
-        # the first steps distil noise. It is never optimized -- `update_teacher` is its only
-        # writer -- so its parameters are detached from autograd entirely.
+        # The teacher starts where the student is or the first steps just distil noise. 
+        # `update_teacher` is its only writer, its parameters are detached from autograd entirely.
         self.teacher = copy.deepcopy(self.student)
         for parameter in self.teacher.parameters():
             parameter.requires_grad_(False)
