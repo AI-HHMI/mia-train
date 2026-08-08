@@ -1,30 +1,35 @@
 # Does SSL pretraining on NISB help downstream instance segmentation?
 
-One controlled comparison, two arms, differing **only** in where the encoder's weights come from.
+One controlled comparison, three arms, differing **only** in where the encoder's weights come from.
 
 ```
                                         ┌─ arm A ─ 1_simmim_pretrain ─┐
 Meta DINOv3 ViT-L/16 (2D, LVD-1689M) ───┤                             ├─ affinity_seg on NISB
-                                        └─ arm B ─────────────────────┘
+                                        └─ arm B ─────────────────────┤
+random initialisation ───── arm C ───────────────────────────────────-┘
 ```
 
-| | arm A | arm B |
-|---|---|---|
-| stage 1 | SimMIM on the NISB training cubes | — |
-| stage 2 | `affinity_seg`, init from stage 1 | `affinity_seg`, init from the Meta checkpoint |
+| | arm A | arm B | arm C |
+|---|---|---|---|
+| stage 1 | SimMIM on the NISB training cubes | — | — |
+| stage 2 | `affinity_seg`, init from stage 1 | `affinity_seg`, init from the Meta checkpoint | `affinity_seg`, no init at all |
 
-Everything else in stage 2 is identical between arms — same seed, steps, schedule, crop size, data.
-The only difference is the `[init]` section, which is the point.
+Everything else is identical across arms — same seed, steps, schedule, crop size, data, and
+architecture. The only difference is the `[init]` section, which is the point.
+
+**Arm C is what makes the other two readable.** A and B alone answer "does *more* pretraining
+help", and a small gap between them could mean either that SSL adds little or that the whole
+pretraining question is unimportant here. Arm C sets the scale: it is the floor that says how much
+of the final number is attributable to pretraining at all.
 
 ## Running it
 
 ```bash
-# arm A stage 1 (SSL), then both fine-tunes
 bash experiments/simmim_vs_direct/submit.sh
 ```
 
-`submit.sh` makes arm A's fine-tune depend on its pretraining with `bsub -w`, so the three jobs can
-be submitted at once.
+Four jobs go in at once; `bsub -w` makes arm A's fine-tune wait on its pretraining. B and C start
+immediately.
 
 ## Reading the result
 
@@ -34,6 +39,38 @@ and scored against the skeletons, which happens in `~/projects/banis` and needs 
 repo deliberately does not carry. Use the val curves to compare the arms during training, then run
 the benchmark's own tooling on the final predictions for a number worth quoting.
 
+## Scale, and what it costs
+
+Crop **512³** at global batch **8** — 512x the voxels per step of the first version of this
+experiment (128³ at batch 2). At patch 16 that is a **32³ = 32768-token** sequence, and a
+transformer's activation memory is linear in sequence length while the dense head's is linear in
+voxels. Measured on one H200, ViT-L, batch 1:
+
+| | 128³ | 256³ | 512³ | 512³ + activation checkpointing |
+|---|---|---|---|---|
+| `simmim` | 5.9 GiB | 10.4 GiB | 54.7 GiB | **11.1 GiB**, 1.5 s/step |
+| `affinity_seg` | 6.5 GiB | 22.3 GiB | OOM (>140 GiB) | **112.7 GiB**, 6.1 s/step |
+
+So `[trainer].activation_checkpointing = true` is what makes this run exist, and `gpu_h200` is
+required — 112.7 GiB does not fit an 80 GiB H100.
+
+Where `affinity_seg`'s memory goes, and why the head is shaped the way it is:
+
+- The **encoder** costs only 4.8 GiB once checkpointed. It is not the problem.
+- The **dense head** is. Its tensors are `decoder_hidden_dim x crop³`: 16 GiB each at 512³.
+  Checkpointing `decoder_out` alone left 121.6 GiB, because a checkpointed region stores its own
+  *inputs* and the upsampled tensor was one. Folding the interpolation into the module (`VoxelHead`)
+  moved that boundary back to the patch grid and dropped retained memory from 50 GiB to 18 GiB.
+- Autocast runs `F.interpolate` in **fp32**, which doubles every tensor in the head. Forcing it to
+  bf16 would save ~40 GiB and let this fit on an H100. It was measured and **rejected**: bf16
+  accumulation over eight neighbours is 1.4x less accurate than accumulating in fp32 and rounding
+  once, with worst-case deviations of several percent of the feature scale. A bigger GPU is the
+  cheaper thing to spend.
+
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (set in `submit.sh`) is also load-bearing: the
+head allocates and frees 16 GiB tensors every step, and the default caching allocator strands
+enough between segments to OOM a run whose live set fits.
+
 ## Choices worth knowing
 
 - **ViT-L/16**, 303 M parameters. `layerscale_init = 1.0e-05` and `mask_k_bias = true` are *not*
@@ -41,8 +78,29 @@ the benchmark's own tooling on the final predictions for a number worth quoting.
   computes a different function. The loader rejects that now rather than letting it through.
 - **`pos_embed_rope_type = "superposition"`**, so the inflated 3D model starts out behaving
   exactly like its 2D self (`depth_scale` initialises at 0) and learns how much depth to mix in.
-- **Crop 128³ at patch 16** gives an 8×8×8 token grid. Coarse for dense prediction — the affinity
-  head upsamples 16× — but the patch size is fixed by the checkpoint, and both arms share the
-  limitation, so the *comparison* is unaffected even though the absolute numbers suffer.
-- **Only the NISB training cubes are ever read**, in both stages. The benchmark's rules forbid
-  training on val or test, and that includes self-supervised pretraining.
+  Arm C keeps it too — not because random weights need it, but because varying the architecture
+  and the initialisation together would make the comparison unreadable.
+- **Local batch size stays 1**; the global batch of 8 comes from 8 GPUs. One 512-cube per GPU is
+  what fits, so the batch grows with devices rather than with samples per device.
+- **The token grid is still 32³ against a 512³ output**, so the head upsamples 16x. A larger crop
+  buys the transformer more *context*, not finer output granularity — the patch size is fixed by
+  the checkpoint. All arms share the limitation, so the comparison is unaffected.
+- **`max_steps` is unchanged from the 128³ version** (8000 SSL / 6000 fine-tune) even though each
+  step now sees 512x the voxels — roughly 105 passes over the training cubes rather than 0.4.
+  Kept deliberately so the arms remain comparable to each other; worth revisiting once the first
+  curves are in.
+- **Only the NISB training cubes are ever read**, in every arm and both stages. The benchmark's
+  rules forbid training on val or test, and that includes self-supervised pretraining.
+
+## Previous result (128³, global batch 2)
+
+The first version of this experiment finished with the two arms indistinguishable:
+
+| | arm A (SimMIM → fine-tune) | arm B (direct) |
+|---|---|---|
+| val `affinity_accuracy` | 0.8318 | 0.8296 |
+| val `loss` | 0.3585 | 0.3605 |
+
+A 0.002 gap on one seed is noise. That null result is part of why this version runs at a scale
+where the encoder has enough context to be worth pretraining, and adds arm C so the axis has a
+zero point.

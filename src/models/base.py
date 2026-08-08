@@ -64,6 +64,19 @@ class BaseModel(nn.Module, abc.ABC):
         """
         return ()
 
+    def checkpointable_modules(self) -> tuple[nn.Module, ...]:
+        """Submodules worth recomputing in backward when activation checkpointing is on.
+
+        A transformer's answer is its blocks: they are repeated, each holds activations
+        proportional to the sequence length, and each is cheap to rerun relative to what it
+        stores. The engine decides *whether* to checkpoint; what constitutes a worthwhile region
+        is a property of the architecture, so it is answered here.
+
+        Empty by default, which makes `[trainer].activation_checkpointing` an error rather than a
+        silent no-op on an architecture that has not declared one.
+        """
+        return ()
+
     def num_parameters(self, trainable_only: bool = False) -> int:
         return sum(p.numel() for p in self.parameters() if not trainable_only or p.requires_grad)
 

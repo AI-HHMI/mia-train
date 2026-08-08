@@ -36,6 +36,33 @@ from .registry import AlgorithmRegistry
 SPATIAL_RANK = 3
 
 
+class VoxelHead(nn.Sequential):
+    """The voxel-resolution end of a dense head: upsample to `size`, then apply the layers.
+
+    A plain `nn.Sequential` with the interpolation folded in, so the resolution change and the
+    layers that run at that resolution are one module. That matters for activation checkpointing,
+    which stores whatever crosses a module's boundary: with the upsampling inside, the boundary is
+    the patch grid and nothing full-resolution is retained.
+
+    `size` is an argument rather than a constructor value because the head is meant to serve
+    whatever crop it is given -- `nn.Upsample(size=...)` would fix the output shape at build time
+    and quietly mis-scale a run that validates at a different crop from the one it trains on.
+    """
+
+    def forward(self, x: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:  # type: ignore[override]
+        # Left to autocast, which runs this in fp32. That is the most expensive tensor in the
+        # algorithm -- upsampling multiplies it by the cube of the patch size, so fp32 costs 32
+        # GiB rather than 16 at a 512-cube -- and forcing it to bf16 was measured and rejected:
+        # accumulating eight neighbours in bf16 is 1.4x less accurate than accumulating in fp32
+        # and rounding once, with worst-case deviations of several percent of the feature scale.
+        # Memory is bought with a bigger GPU, not with the one number the head is built to
+        # produce.
+        x = F.interpolate(x, size=size, mode="trilinear", align_corners=False)
+        for layer in self:
+            x = layer(x)
+        return x
+
+
 @AlgorithmRegistry.register("affinity_seg")
 class AffinitySegmentation(BaseAlgorithm):
     """Predict short- and long-range affinities from an encoder's patch features.
@@ -85,11 +112,25 @@ class AffinitySegmentation(BaseAlgorithm):
             nn.Conv3d(embed_dim, decoder_hidden_dim, kernel_size=1),
             nn.GELU(),
         )
-        self.decoder_out = nn.Sequential(
+        self.decoder_out = VoxelHead(
             nn.Conv3d(decoder_hidden_dim, decoder_hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv3d(decoder_hidden_dim, len(self.offsets), kernel_size=1),
         )
+
+    def checkpointable_modules(self) -> tuple[nn.Module, ...]:
+        """The full-resolution half of the head, which is where this algorithm's memory goes.
+
+        `decoder` runs on the patch grid and costs nothing; everything inside `decoder_out` runs
+        at voxel resolution, so each of its tensors is `decoder_hidden_dim` times the size of the
+        crop -- 16 GiB apiece at a 512-cube. Recomputing them is cheap beside holding them.
+
+        The upsampling is deliberately part of `decoder_out` rather than done by the caller: a
+        checkpointed region stores its own inputs, so an interpolation performed outside would
+        leave its full-resolution result held for the whole backward pass and give back only half
+        of what checkpointing is worth here.
+        """
+        return (self.decoder_out,)
 
     @staticmethod
     def _resolve_input_axes(input_axes: str | None, dataset: BaseDataset | None) -> str:
@@ -169,8 +210,7 @@ class AffinitySegmentation(BaseAlgorithm):
         # encoders' patch embeddings produce and what `patch_features` promises.
         x = tokens.transpose(1, 2).reshape(batch, channels, *grid)
         x = self.decoder(x)
-        x = F.interpolate(x, size=tuple(size), mode="trilinear", align_corners=False)
-        return self.decoder_out(x)
+        return self.decoder_out(x, tuple(size))
 
     def _targets(self, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """(B, X, Y, Z) instance ids -> (affinity target, loss mask), both float/bool."""

@@ -66,6 +66,10 @@ class MAE(BaseAlgorithm):
         self.decoder_head = nn.Linear(decoder_embed_dim, model.patch_volume)
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
+    def checkpointable_modules(self) -> tuple[nn.Module, ...]:
+        """The decoder's transformer blocks, for the same reason the encoder's qualify."""
+        return tuple(self.decoder_blocks)
+
     @staticmethod
     def _resolve_input_axes(input_axes: str | None, dataset: BaseDataset | None) -> str:
         """Settle on the sample axis order, preferring the dataset's own answer.

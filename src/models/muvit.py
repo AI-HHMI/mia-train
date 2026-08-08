@@ -149,6 +149,10 @@ class MuViT3D(BaseModel):
         """Number of values in one patch, i.e. the width of a per-patch reconstruction."""
         return int(math.prod(self.patch_size)) * self.in_channels
 
+    def checkpointable_modules(self) -> tuple[nn.Module, ...]:
+        """The transformer blocks: repeated, sequence-length-sized, and cheap to rerun."""
+        return tuple(self.blocks)
+
     def prepare_input(self, batch: torch.Tensor, axes: str) -> torch.Tensor:
         """(B, *axes) -> (B, L, C, D, H, W). Multi-scale: the level axis is consumed here.
 

@@ -370,6 +370,10 @@ class DinoVisionTransformer(BaseModel):
         grid = tuple(s // self.patch_size for s in x.shape[-SPATIAL_RANK:])
         return out["x_norm_patchtokens"], grid  # type: ignore[return-value]
 
+    def checkpointable_modules(self) -> tuple[nn.Module, ...]:
+        """The transformer blocks: repeated, sequence-length-sized, and cheap to rerun."""
+        return tuple(self.blocks)
+
     def prepare_input(self, batch: torch.Tensor, axes: str) -> torch.Tensor:
         """(B, *axes) -> (B, C, H, W). Single-scale, single-plane.
 

@@ -71,6 +71,14 @@ class TrainerConfig:
     # does, DINOv3's included, which is why it is the default here rather than an opt-in.
     zero_weight_decay_on_norm_and_bias: bool = True
 
+    # Recompute the model's and algorithm's declared regions during backward instead of storing
+    # their activations: roughly 30% more compute for most of the activation memory back. What
+    # gets recomputed is each architecture's own answer (`checkpointable_modules`); this only
+    # says whether to honour it. Off by default, since it is a cost with no benefit until memory
+    # is actually the binding constraint -- which for volumetric crops it becomes abruptly, as
+    # activation memory grows with the cube of the crop size.
+    activation_checkpointing: bool = False
+
     precision: str = "fp32"
     log_every: int = 10
     checkpoint_every: int = 0

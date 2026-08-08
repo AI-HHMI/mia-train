@@ -31,6 +31,15 @@ class BaseAlgorithm(nn.Module, abc.ABC):
     def validation_step(self, batch: Any) -> dict[str, torch.Tensor]:
         """Run one validation iteration; returns logged metrics for this batch."""
 
+    def checkpointable_modules(self) -> tuple[nn.Module, ...]:
+        """Submodules of the *strategy* worth recomputing in backward, beside the model's own.
+
+        A strategy that owns a decoder answers with it: a dense head running at input resolution
+        can hold more than the encoder that feeds it. The model's blocks are collected separately
+        from `BaseModel.checkpointable_modules`, so this covers only what the algorithm adds.
+        """
+        return ()
+
     def forward(self, batch: Any) -> dict[str, torch.Tensor]:
         """Alias for `training_step`, so the engine can drive training through `__call__`.
 

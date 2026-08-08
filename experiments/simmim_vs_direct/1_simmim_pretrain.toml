@@ -5,7 +5,7 @@ experiment_name = "simmim_vs_direct__A1_simmim_pretrain"
 
 [model]
 name = "dinov3_vit3d"
-img_size = 128            # 8^3 = 512 tokens at patch 16
+img_size = 512            # 32^3 = 32768 tokens at patch 16
 patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
 in_chans = 1
 embed_dim = 1024          # ViT-L/16, 303M parameters
@@ -34,14 +34,14 @@ norm_pix_loss = false
 [data]
 name = "miao_volumes"
 config_path = "configs/data/nisb_base.yaml"
-patch_size = [128, 128, 128]
+patch_size = [512, 512, 512]
 samples_per_epoch = 1000
 
 # seed100 is the benchmark's validation cube. Never trained on, in either stage.
 [val_data]
 name = "miao_volumes"
 config_path = "configs/data/nisb_base.yaml"
-patch_size = [128, 128, 128]
+patch_size = [512, 512, 512]
 samples_per_epoch = 32
 resolutions = [[9, 9, 20]]
 output_axes = "lcxyz"
@@ -57,6 +57,8 @@ normalize = true
 
 [trainer]
 max_steps = 8000
+# Per rank. Eight ranks make the global batch 8; one 512-cube per GPU is what fits, and the
+# batch is grown with GPUs rather than with samples per GPU for that reason.
 batch_size = 1
 lr = 1.0e-4
 warmup_steps = 400
@@ -66,14 +68,17 @@ grad_clip_norm = 1.0
 # The encoder arrives pretrained, so hold the early layers back.
 layerwise_lr_decay = 0.9
 patch_embed_lr_mult = 0.2
+# 32768 tokens per sample. Without this the encoder alone holds 53 GiB of activations; with it,
+# 4.8 GiB. Measured, not estimated -- see the README.
+activation_checkpointing = true
 precision = "bf16"
 log_every = 50
 val_every = 500
 checkpoint_every = 1000
-num_workers = 8
+num_workers = 6
 seed = 0
 
 [parallelism]
 dp_replicate = 1
-dp_shard = 2
+dp_shard = 8
 tp = 1

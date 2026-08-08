@@ -1,6 +1,6 @@
-# Arm A stage 2: fine-tune the SimMIM-pretrained encoder on NISB instance segmentation.
+# Arm C (floor): the same architecture trained on NISB from a random initialisation.
 
-experiment_name = "simmim_vs_direct__A2_finetune_from_simmim"
+experiment_name = "simmim_vs_direct__C_finetune_from_scratch"
 
 [model]
 name = "dinov3_vit3d"
@@ -18,13 +18,15 @@ pos_embed_rope_dtype = "fp32"
 # starts out identical to its 2D self.
 pos_embed_rope_type = "superposition"
 
-[init]
-# Arm A: the encoder that SimMIM just pretrained. A run checkpoints the whole algorithm, so the
-# backbone sits under `model.` beside SimMIM's linear head, which this task has no use for.
-# submit.sh rewrites this path once stage 1's timestamped run directory exists.
-path = "/nrs/scicompsoft/orhane/mia-train-runs/simmim_vs_direct__A1_simmim_pretrain/checkpoints/step_8000"
-prefix = "model."
-strict = true
+# No [init] section, and that absence is the whole arm: the encoder keeps the random weights
+# `init_weights()` gave it. This is the floor the other two arms are measured against -- without
+# it, "pretraining helps" has no scale, because A and B differ only in *which* pretraining.
+#
+# Everything else, including `pos_embed_rope_type = "superposition"`, is left exactly as the
+# other arms have it. Superposition was chosen so an inflated 2D checkpoint starts out behaving
+# like its 2D self, a rationale that does not apply to random weights -- but changing it here
+# would vary the architecture and the initialisation at once, and the comparison is about the
+# initialisation.
 
 [algorithm]
 name = "affinity_seg"

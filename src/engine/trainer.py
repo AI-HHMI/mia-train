@@ -17,6 +17,7 @@ from distributed.parallelize import parallelize_algorithm
 from utils.device import move_to_device
 from utils.metrics import MetricLogger, reduce_metrics
 
+from .activation_checkpoint import apply_activation_checkpointing
 from .checkpoint import CheckpointManager
 from .config import TrainerConfig
 from .optimizer import build_lr_scheduler, build_optimizer
@@ -49,6 +50,12 @@ class Trainer:
         self.device = device or torch.device("cpu")
 
         torch.manual_seed(config.seed)
+
+        if config.activation_checkpointing:
+            # Before sharding, and independent of it: FSDP2 hooks a module's forward to gather
+            # its parameters, so wrapping afterwards would put the recomputation outside the
+            # gather. Memory pressure is per-GPU and exists on one device as much as on eight.
+            apply_activation_checkpointing(algorithm)
 
         if mesh is not None:
             # The algorithm, not just its model: an algorithm's own parameters (MAE's decoder)
