@@ -4,6 +4,11 @@ from dataclasses import dataclass
 
 PRECISIONS = ("fp32", "bf16")
 
+# How the learning rate falls from its post-warmup peak to `min_lr_ratio`. Both reach the same
+# endpoints at the same steps and differ only in the path between them: cosine spends longer near
+# the peak and decays fastest in the middle, linear spends more of the run at a lower rate.
+LR_SCHEDULES = ("linear", "cosine")
+
 
 @dataclass(frozen=True)
 class InitConfig:
@@ -47,6 +52,13 @@ class TrainerConfig:
     warmup_steps: int = 0
     min_lr_ratio: float = 0.0
     grad_clip_norm: float | None = 1.0
+    # Shape of the post-warmup decay; see LR_SCHEDULES. Governs the *learning rate* only --
+    # `final_weight_decay` interpolates on its own curve, since the two schedules answer different
+    # questions and coupling them would silently change one when the other is set.
+    #
+    # Runs recorded before this setting existed used cosine, which was then the only option; their
+    # `resolved_config.json` therefore has no `lr_schedule` key at all rather than saying "cosine".
+    lr_schedule: str = "linear"
 
     # Per-parameter learning-rate shaping. The two lr knobs default to "off"; the weight-decay
     # exemption below does not -- see its own note.
@@ -105,6 +117,10 @@ class TrainerConfig:
             raise ValueError(f"grad_clip_norm must be > 0 or None, got {self.grad_clip_norm}")
         if self.precision not in PRECISIONS:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {self.precision!r}")
+        if self.lr_schedule not in LR_SCHEDULES:
+            raise ValueError(
+                f"lr_schedule must be one of {LR_SCHEDULES}, got {self.lr_schedule!r}"
+            )
         if self.log_every < 1:
             raise ValueError(f"log_every must be >= 1, got {self.log_every}")
         if not 0.0 < self.layerwise_lr_decay <= 1.0:

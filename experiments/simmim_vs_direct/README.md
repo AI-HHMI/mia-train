@@ -153,3 +153,36 @@ The first version of this experiment finished with the two arms indistinguishabl
 A 0.002 gap on one seed is noise. That null result is part of why this version runs at a scale
 where the encoder has enough context to be worth pretraining, and adds arm C so the axis has a
 zero point.
+
+## Scaling up: the other NISB variants
+
+`nisb_ngff_sidecar.py` (in this folder) unlocks the NISB variants downloaded in August, which
+`miao` could not read. It turned out **not** to be a bad download: NISB publishes each cube as a
+plain zarr v2 group -- `data.zarr` holding flat `img`/`seg` arrays, exactly what the benchmark's
+own BANIS code reads -- while miao needs OME-NGFF multiscale metadata. `base` and `liconn` are the
+exceptions, converted to OME-NGFF by a colleague back in June.
+
+The pixel data was always fine, so the script writes only the missing metadata and symlinks the
+level `s0` at the published arrays: **~600 KB of JSON for 2.7 TB of data**, nothing copied,
+nothing under the source tree modified.
+
+| variant | cubes | now readable at |
+|---|---|---|
+| `train_100` | 100 train + val + test | `train_100-ngff/` |
+| `multichannel` | 5 + val + test (**8 channels**) | `multichannel-ngff/` |
+| `neg_guidance`, `pos_guidance`, `no_touch_thick`, `slice_perturbed`, `touching_thin` | 5 + val + test each | `<variant>-ngff/` |
+
+`configs/data/nisb_train_100.yaml` is ready to use in place of `nisb_base.yaml` — **20x the
+training data**, same crop size and conventions. Verified before use:
+
+- `train_100/seed0` is byte-identical to `base/seed0`, which pins both the axis order the arrays
+  are stored in (`x,y,z,c` for images, channel *trailing*, unlike `base`) and the 9x9x20 nm voxel
+  size the published cubes never state.
+- miao's `lcxyz` output at a given coordinate is bit-identical to a raw x,y,z read, so nothing is
+  transposed — the failure mode that would otherwise train perfectly and score as nonsense.
+- `train_100`'s val cube is byte-identical to `base`'s, so numbers stay directly comparable, and
+  its train split (seeds 0-99) does not overlap val (100) or test (101).
+
+Caveat: the published cubes carry no resolution pyramid, so only `resolutions: [[9, 9, 20]]`
+works; a coarser request fails rather than silently downsampling. `multichannel` needs
+`in_chans = 8`.

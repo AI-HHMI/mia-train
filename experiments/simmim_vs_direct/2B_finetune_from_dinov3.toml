@@ -57,6 +57,7 @@ batch_size = 1  # local batch size
 lr = 1.0e-4
 warmup_steps = 300
 min_lr_ratio = 0.1
+lr_schedule = "cosine"
 weight_decay = 0.05
 grad_clip_norm = 1.0
 layerwise_lr_decay = 0.9

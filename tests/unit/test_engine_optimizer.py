@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from engine.config import TrainerConfig
+from engine.config import LR_SCHEDULES, TrainerConfig
 from engine.optimizer import build_lr_scheduler, build_optimizer, lr_multiplier
 
 
@@ -31,17 +31,63 @@ def test_warmup_ramps_linearly_to_one():
 
 
 @pytest.mark.unit
-def test_cosine_decays_from_one_to_min_lr_ratio():
-    config = TrainerConfig(max_steps=100, batch_size=1, warmup_steps=10, min_lr_ratio=0.1)
+@pytest.mark.parametrize("schedule", LR_SCHEDULES)
+def test_every_schedule_decays_from_one_to_min_lr_ratio(schedule):
+    # The endpoints are the contract; only the path between them is the schedule's business.
+    config = TrainerConfig(
+        max_steps=100, batch_size=1, warmup_steps=10, min_lr_ratio=0.1, lr_schedule=schedule
+    )
     assert lr_multiplier(10, config) == pytest.approx(1.0)
     assert lr_multiplier(100, config) == pytest.approx(0.1)
-    midpoint = lr_multiplier(55, config)
-    assert 0.1 < midpoint < 1.0
+    assert 0.1 < lr_multiplier(55, config) < 1.0
 
 
 @pytest.mark.unit
-def test_schedule_is_monotonically_non_increasing_after_warmup():
-    config = TrainerConfig(max_steps=50, batch_size=1, warmup_steps=5)
+def test_linear_is_the_default():
+    # Changing this changes every config that does not name a schedule, so it is pinned.
+    assert TrainerConfig(max_steps=10, batch_size=1).lr_schedule == "linear"
+
+
+@pytest.mark.unit
+def test_linear_decays_by_equal_amounts_over_equal_intervals():
+    config = TrainerConfig(
+        max_steps=100, batch_size=1, warmup_steps=0, min_lr_ratio=0.0, lr_schedule="linear"
+    )
+    steps = [0, 25, 50, 75, 100]
+    values = [lr_multiplier(s, config) for s in steps]
+    assert values == pytest.approx([1.0, 0.75, 0.5, 0.25, 0.0])
+
+
+@pytest.mark.unit
+def test_cosine_holds_a_higher_rate_than_linear_early_and_a_lower_one_late():
+    # The reason to prefer one over the other, and the only way they differ.
+    common = dict(max_steps=100, batch_size=1, warmup_steps=0, min_lr_ratio=0.0)
+    cosine = TrainerConfig(**common, lr_schedule="cosine")
+    linear = TrainerConfig(**common, lr_schedule="linear")
+    assert lr_multiplier(25, cosine) > lr_multiplier(25, linear)
+    assert lr_multiplier(75, cosine) < lr_multiplier(75, linear)
+    assert lr_multiplier(50, cosine) == pytest.approx(lr_multiplier(50, linear))
+
+
+@pytest.mark.unit
+def test_an_unknown_schedule_is_rejected_by_the_config():
+    with pytest.raises(ValueError, match="lr_schedule must be one of"):
+        TrainerConfig(max_steps=10, batch_size=1, lr_schedule="exponential")
+
+
+@pytest.mark.unit
+def test_the_weight_decay_schedule_does_not_follow_lr_schedule():
+    # They answer different questions; coupling them would move one when the other is set.
+    common = dict(max_steps=100, batch_size=1, weight_decay=0.04, final_weight_decay=0.4)
+    cosine = TrainerConfig(**common, lr_schedule="cosine")
+    linear = TrainerConfig(**common, lr_schedule="linear")
+    assert weight_decay_at(50, cosine) == pytest.approx(weight_decay_at(50, linear))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("schedule", LR_SCHEDULES)
+def test_schedule_is_monotonically_non_increasing_after_warmup(schedule):
+    config = TrainerConfig(max_steps=50, batch_size=1, warmup_steps=5, lr_schedule=schedule)
     values = [lr_multiplier(step, config) for step in range(5, 51)]
     pairs = zip(values, values[1:], strict=False)  # values[1:] is one shorter by construction
     assert all(later <= earlier + 1e-12 for earlier, later in pairs)

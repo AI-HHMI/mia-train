@@ -46,7 +46,7 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.11"
 mypy_path = "src"
-files = ["src", "tests"]
+files = ["src", "tests", "experiments"]
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true

@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
-from .config import TrainerConfig
+from .config import LR_SCHEDULES, TrainerConfig
 
 # Every model here names its transformer stack `blocks`, so a parameter's depth can be read off
 # its name. `tests/unit/test_engine_optimizer.py` pins that convention across the registry rather
@@ -142,18 +142,34 @@ def build_optimizer(model: nn.Module, config: TrainerConfig) -> Optimizer:
     )
 
 
+def decay_fraction(progress: float, schedule: str) -> float:
+    """How much of the peak learning rate survives, 1.0 at `progress` 0 and 0.0 at 1.0.
+
+    Only the path between those endpoints differs. Cosine leaves the rate near its peak for the
+    first part of the run and does most of its decay in the middle; linear starts falling
+    immediately, so a run spends more of its length at a lower rate. Which is better is a property
+    of the run, not of the repo -- hence a setting rather than a fixed choice.
+    """
+    if schedule == "cosine":
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    if schedule == "linear":
+        return 1.0 - progress
+    raise ValueError(f"unknown lr_schedule {schedule!r}; expected one of {list(LR_SCHEDULES)}")
+
+
 def lr_multiplier(step: int, config: TrainerConfig) -> float:
-    """Linear warmup then cosine decay to `min_lr_ratio`, as a multiple of the base LR.
+    """Linear warmup then `config.lr_schedule` decay to `min_lr_ratio`, as a multiple of base LR.
 
     `step` is 0-based, matching LambdaLR's `last_epoch`. Returns 1.0 at the end of warmup and
-    exactly `min_lr_ratio` at `max_steps`.
+    exactly `min_lr_ratio` at `max_steps`, whichever decay shape is in use -- the shapes differ
+    only in between.
     """
     if config.warmup_steps > 0 and step < config.warmup_steps:
         return (step + 1) / config.warmup_steps
     decay_steps = max(1, config.max_steps - config.warmup_steps)
     progress = min(1.0, max(0.0, (step - config.warmup_steps) / decay_steps))
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return config.min_lr_ratio + (1.0 - config.min_lr_ratio) * cosine
+    remaining = decay_fraction(progress, config.lr_schedule)
+    return config.min_lr_ratio + (1.0 - config.min_lr_ratio) * remaining
 
 
 def weight_decay_at(step: int, config: TrainerConfig) -> float:
@@ -161,6 +177,10 @@ def weight_decay_at(step: int, config: TrainerConfig) -> float:
 
     No warmup, unlike the learning rate: there is nothing to stabilise, and the endpoints are what
     the schedule is stated in.
+
+    Deliberately *not* governed by `lr_schedule`. This interpolates between two stated endpoints
+    because DINOv3 raises weight decay as the teacher settles; the learning-rate shape answers an
+    unrelated question, and tying them would mean changing one setting silently moved the other.
     """
     if config.final_weight_decay is None:
         return config.weight_decay
@@ -169,8 +189,8 @@ def weight_decay_at(step: int, config: TrainerConfig) -> float:
     return config.weight_decay + span * (1.0 - math.cos(math.pi * progress)) / 2
 
 
-class WarmupCosineSchedule(LambdaLR):
-    """Drives the learning rate and, when configured, the weight decay.
+class WarmupDecaySchedule(LambdaLR):
+    """Drives the learning rate -- warmup then `config.lr_schedule` decay -- and the weight decay.
 
     `LambdaLR` alone only moves the learning rate. Weight decay is not a scalar it knows about, so
     it is written here -- on the same `step()` the trainer already calls, rather than as a second
@@ -193,4 +213,4 @@ class WarmupCosineSchedule(LambdaLR):
 
 
 def build_lr_scheduler(optimizer: Optimizer, config: TrainerConfig) -> LambdaLR:
-    return WarmupCosineSchedule(optimizer, config)
+    return WarmupDecaySchedule(optimizer, config)
