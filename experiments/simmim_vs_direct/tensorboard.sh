@@ -36,6 +36,7 @@ link A1_simmim     "$RUNS/simmim_vs_direct__A1_simmim_pretrain_*/"
 link A2_from_simmim "$RUNS/simmim_vs_direct__A2_finetune_from_simmim_*/"
 link B_dinov3      "$RUNS/simmim_vs_direct__B_finetune_from_dinov3_*/"
 link C_scratch     "$RUNS/simmim_vs_direct__C_finetune_from_scratch_*/"
+link D_batch16     "$RUNS/simmim_vs_direct__D_finetune_dinov3_batch16_*/"
 
 echo
 echo "http://localhost:$PORT"

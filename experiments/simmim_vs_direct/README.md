@@ -1,6 +1,7 @@
 # Does SSL pretraining on NISB help downstream instance segmentation?
 
-One controlled comparison, three arms, differing **only** in where the encoder's weights come from.
+One controlled comparison. Three arms differ **only** in where the encoder's weights come from; a
+fourth revisits the winner at twice the batch.
 
 ```
                                         ┌─ arm A ─ 1_simmim_pretrain ─┐
@@ -9,10 +10,11 @@ Meta DINOv3 ViT-L/16 (2D, LVD-1689M) ───┤                             �
 random initialisation ───── arm C ───────────────────────────────────-┘
 ```
 
-| | arm A | arm B | arm C |
-|---|---|---|---|
-| stage 1 | SimMIM on the NISB training cubes | — | — |
-| stage 2 | `affinity_seg`, init from stage 1 | `affinity_seg`, init from the Meta checkpoint | `affinity_seg`, no init at all |
+| | arm A | arm B | arm C | arm D |
+|---|---|---|---|---|
+| stage 1 | SimMIM on the NISB training cubes | — | — | — |
+| stage 2 | `affinity_seg`, init from stage 1 | `affinity_seg`, init from the Meta checkpoint | `affinity_seg`, no init at all | arm B at global batch 16 |
+| GPUs | 8 (1 node) | 8 (1 node) | 8 (1 node) | **16 (2 nodes)** |
 
 Everything else is identical across arms — same seed, steps, schedule, crop size, data, and
 architecture. The only difference is the `[init]` section, which is the point.
@@ -25,11 +27,17 @@ of the final number is attributable to pretraining at all.
 ## Running it
 
 ```bash
-bash experiments/simmim_vs_direct/submit.sh
+bash experiments/simmim_vs_direct/submit.sh          # every arm
+bash experiments/simmim_vs_direct/submit.sh D        # just one, once the others have run
 ```
 
-Four jobs go in at once; `bsub -w` makes arm A's fine-tune wait on its pretraining. B and C start
-immediately.
+`bsub -w` makes arm A's fine-tune wait on its pretraining; the rest start immediately.
+
+To watch them together — including arms that started later:
+
+```bash
+bash experiments/simmim_vs_direct/tensorboard.sh     # then open localhost:6006
+```
 
 ## Reading the result
 
@@ -91,6 +99,47 @@ enough between segments to OOM a run whose live set fits.
   curves are in.
 - **Only the NISB training cubes are ever read**, in every arm and both stages. The benchmark's
   rules forbid training on val or test, and that includes self-supervised pretraining.
+
+## Result at 512³, global batch 8
+
+| arm | val `affinity_accuracy` | val `loss` |
+|---|---|---|
+| **B** — Meta DINOv3 → fine-tune | **0.8713** | **0.2840** |
+| A — SimMIM on NISB → fine-tune | 0.8648 | 0.2959 |
+| C — from scratch | 0.7584 | 0.4832 |
+
+Arm C is what makes this readable. A trivial predictor that answers "same object" everywhere scores
+**~0.72** (the classes are that unbalanced — see `target_positive_rate`, logged beside the
+accuracy). From-scratch reaches 0.758, barely above that floor. Pretraining is worth **+11 points**;
+SimMIM on top of it cost a little rather than adding.
+
+Two readings, and this experiment cannot separate them: NISB's five training cubes may be too
+little data for SSL to add anything Meta's LVD-1689M pretraining has not already given, or 8000
+SimMIM steps is too short. Arm D tests neither — it asks a different question.
+
+## Arm D: is arm B batch-limited?
+
+Arm B was the strongest, so arm D runs it again at global batch 16 (16 GPUs across 2 nodes, still
+one 512-cube per GPU). It is also this repo's **first multi-node run**.
+
+Read it with two caveats, both deliberate and both in the config:
+
+- **The learning rate is not scaled.** Doubling the batch halves the gradient noise and the usual
+  recipes raise the LR to compensate. Left alone so exactly one thing differs from arm B. If D
+  loses, an unscaled LR is the first thing to try before concluding the batch size did not help.
+- **`max_steps` is still 6000**, so D sees twice the samples of B, not the same samples in half
+  the steps. "Same optimizer steps" was chosen to match every other arm.
+
+Parallelism is **HSDP** (`dp_replicate = 2, dp_shard = 8`): sharding stays inside each node's
+NVLink and only the gradient all-reduce crosses InfiniBand. Measured 8.02 s/step, against 8.05 for
+flat FSDP over all 16 ranks and 7.1 for arm B on one node — so twice the samples for 1.13x the wall
+clock, and the two multi-node shapes are indistinguishable at 306M parameters because the step is
+compute-bound. NCCL uses InfiniBand with GDRDMA between nodes.
+
+Getting here needed one real fix: DCP scatters its save plan as a pickled *object*, which over NCCL
+crosses IB and faulted the queue pair, killing the first 16-rank run at its first checkpoint after
+every training step had succeeded. `CheckpointManager` now routes plan coordination over a Gloo
+group. See `deploy/lsf/README.md`.
 
 ## Previous result (128³, global batch 2)
 

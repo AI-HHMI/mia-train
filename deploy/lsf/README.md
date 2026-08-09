@@ -172,14 +172,18 @@ Notes:
 
 ## Multi-node training
 
-> **Untested in this repo so far.** The recipe below follows cluster policy and the standard
-> `torchrun` rendezvous pattern, but it has not yet been validated end-to-end here. Validate on a
-> 2-node job before relying on it.
+> **Validated** on 2 x 8 H200 (16 ranks): rendezvous, FSDP training, validation, and DCP
+> checkpoint save/load. NCCL selects `NET/IB` with GDRDMA, so the InfiniBand fabric is used rather
+> than falling back to Ethernet.
 
 Multi-node GPU work goes to the `*_parallel` queues, which allocate **whole nodes** — never submit
 a partial-node request there (it disables CPU fencing and wastes the rest of the node). LSF gives
-you the host list in `$LSB_MCPU_HOSTS`; one `torchrun` must be launched per node (via `blaunch`),
-each with a distinct `--node_rank` and a shared `--master_addr`/`--master_port`.
+you the host list in `$LSB_MCPU_HOSTS`; one `torchrun` must be launched per node, via `blaunch`.
+
+[`launch_multinode.sh`](launch_multinode.sh) does this. It uses **c10d rendezvous**, so every node
+runs the identical command and the backend assigns ranks — there is no `--node_rank` to compute
+per host. That matters because getting it wrong is silent: two nodes both claiming rank 0 simply
+hang in `init_process_group` until the wall clock kills the job.
 
 Interconnect constraint that matters here: **H100 and H200 sit on separate InfiniBand fabrics with
 no IB path between them.** A multi-node job must stay within one GPU generation — i.e. one queue,
@@ -194,12 +198,33 @@ bsub -P $PROJECT -q gpu_h100_parallel -app parallel-96 -gpu "num=8:mode=shared" 
   -cwd $JOBS \
   -o $JOBS/train_mn_%J.log \
   -e $JOBS/train_mn_%J.err \
-  $JOBS/launch_multinode.sh
+  "MIA_TRAIN=$MIA_TRAIN VENV=$VENV \
+   $MIA_TRAIN/deploy/lsf/launch_multinode.sh 8 experiments/<your>.toml"
 ```
 
-Where `launch_multinode.sh` derives the rendezvous endpoint from LSF's host list and uses
-`blaunch` to start one `torchrun` per node. Keep this logic in `deploy/lsf/` — `src/` must stay
-scheduler-agnostic (DESIGN.md §6).
+Set `NCCL_DEBUG=INFO` in the environment to confirm the transport; look for `NET/IB` (good) rather
+than `NET/Socket` (Ethernet fallback — check you are on one generation's queue).
+
+Keep launch logic in `deploy/lsf/` — `src/` must stay scheduler-agnostic (DESIGN.md §6); it learns
+the topology only from the environment `torchrun` sets.
+
+### Checkpointing across nodes needs a Gloo group
+
+Found the hard way, and already fixed in `engine/checkpoint.py` — recorded here because the
+symptom points nowhere near the cause. DCP agrees on *what* each rank will write by scattering a
+pickled save plan. That is an **object** collective; over NCCL it is staged through a GPU buffer,
+and once a job spans hosts that buffer crosses InfiniBand, where a ~400 KB plan faulted outright:
+
+```
+NET/IB : mlx5_5:1 async fatal event on QP: local access violation work queue error
+ncclRemoteError: A call failed possibly due to a network error ...
+```
+
+The run had trained and validated correctly for every step before it and died at its first
+`checkpoint_every`. `CheckpointManager` now builds a Gloo group and passes it to `dcp.save`/
+`dcp.load`. Only plan metadata goes through it — each rank still writes its own shards straight to
+storage — so there is no measurable cost. If you add another code path that saves state across
+ranks, route its coordination the same way.
 
 ## Mapping `ParallelDims` to an allocation
 

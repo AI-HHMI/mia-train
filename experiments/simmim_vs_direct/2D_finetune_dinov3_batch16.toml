@@ -1,0 +1,97 @@
+# Arm D: arm B again at twice the global batch -- 16 GPUs across 2 nodes instead of 8 on one.
+#
+# Arm B was the strongest of the first three, so this asks whether it was batch-limited. It is
+# also this repo's first multi-node run: 16 ranks spanning two hosts, sharded with FSDP across
+# the InfiniBand fabric rather than within one node's NVLink.
+
+experiment_name = "simmim_vs_direct__D_finetune_dinov3_batch16"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 512            # 32^3 = 32768 tokens at patch 16
+patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
+in_chans = 1
+embed_dim = 1024          # ViT-L/16, 303M parameters
+depth = 24
+num_heads = 16
+n_storage_tokens = 4      # the released ViTs carry 4 registers
+layerscale_init = 1.0e-05 # NOT optional -- the released weights were trained with LayerScale
+mask_k_bias = true        # ditto: the checkpoint carries a masked key bias per block
+pos_embed_rope_dtype = "fp32"
+pos_embed_rope_type = "superposition"
+
+[init]
+path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+inflate_2d_to_3d = true
+skip = ["rope_embed."]
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder_hidden_dim = 64
+split_disconnected = true
+
+[data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [512, 512, 512]
+samples_per_epoch = 1000
+
+[val_data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [512, 512, 512]
+samples_per_epoch = 32
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/val/seed100.zarr"
+image_key = "img"
+label_key = "labels/seg"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+max_steps = 6000
+batch_size = 1  # local batch size
+# Deliberately NOT scaled with the batch. Doubling the batch halves the gradient noise, and the
+# usual recipes would raise the learning rate to compensate (linearly, or by sqrt(2)). Left alone
+# so this arm varies exactly one thing against B. If D beats B, the batch size is why; if it
+# loses, an unscaled learning rate is the first thing to try before concluding anything.
+lr = 1.0e-4
+warmup_steps = 300
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 0.9
+patch_embed_lr_mult = 0.2
+activation_checkpointing = true
+precision = "bf16"
+log_every = 50
+val_every = 250
+checkpoint_every = 1000
+num_workers = 6
+seed = 0
+
+[parallelism]
+# HSDP: shard within a node, replicate across nodes. The data-parallel width is
+# dp_replicate * dp_shard = 16, so with batch_size = 1 the global batch is 16 -- exactly twice
+# arm B's, which is the point of this arm.
+#
+# The split matters on two nodes. Sharding is chatty: every forward all-gathers each layer's
+# parameters and backward reduce-scatters its gradients. Confining `dp_shard` to the 8 GPUs
+# inside one host keeps all of that on NVLink, and only the gradient all-reduce across the
+# `dp_replicate` dimension crosses InfiniBand -- once per step rather than twice per layer.
+#
+# At *this* size the two are indistinguishable: measured 8.02 s/step against 8.05 s/step for flat
+# FSDP over all 16 ranks. A 306M-parameter model on a 6-second step is compute-bound, so there is
+# no cross-node traffic to save yet. HSDP is chosen because it is the shape that keeps working as
+# node counts grow, not because it bought anything here. Either way the step costs 1.13x arm B's
+# 7.1 s for twice the samples.
+dp_replicate = 2
+dp_shard = 8
+tp = 1

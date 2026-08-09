@@ -16,11 +16,14 @@ from typing import Any
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 import torch.utils.data as data
 
 from algorithms.base import BaseAlgorithm
 from data.base import BaseDataset
+from engine.checkpoint import CheckpointManager, coordination_group
 from engine.config import TrainerConfig
 from engine.trainer import Trainer
 from models.base import BaseModel
@@ -141,3 +144,75 @@ def test_resuming_continues_and_saves_the_new_final_step(tmp_path):
     _trainer(tmp_path).train()
     assert _trainer(tmp_path, max_steps=12).train() == 12
     assert _saved_steps(tmp_path) == [5, 7, 10, 12]
+
+
+# ------------------------------------------------------- DCP plan coordination (multi-node)
+
+
+@pytest.mark.unit
+def test_no_coordination_group_outside_a_process_group():
+    # Single-process runs have nothing to coordinate; DCP takes its own non-distributed path.
+    assert coordination_group() is None
+
+
+@pytest.mark.unit
+def test_no_coordination_group_when_the_default_backend_is_already_gloo(monkeypatch):
+    # Nothing to route around, and building a second Gloo group would be a pointless collective.
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_backend", lambda: "gloo")
+    created = False
+
+    def _new_group(**kwargs):
+        nonlocal created
+        created = True
+
+    monkeypatch.setattr(dist, "new_group", _new_group)
+
+    assert coordination_group() is None
+    assert not created
+
+
+@pytest.mark.unit
+def test_a_gloo_group_is_built_when_the_default_backend_is_nccl(monkeypatch):
+    # The regression this guards: DCP scatters its save plan as a pickled *object*, which over
+    # NCCL is staged through a GPU buffer. On a job spanning hosts that buffer crosses InfiniBand
+    # and faults the queue pair, killing a 16-rank run at its first checkpoint while every
+    # training collective before it succeeded. Intra-node it never shows, so only a multi-node
+    # run finds it -- hence a test on the decision rather than on the symptom.
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_backend", lambda: "nccl")
+    requested: dict[str, object] = {}
+
+    def _new_group(**kwargs):
+        requested.update(kwargs)
+        return "the-gloo-group"
+
+    monkeypatch.setattr(dist, "new_group", _new_group)
+
+    assert coordination_group() == "the-gloo-group"
+    assert requested == {"backend": "gloo"}
+
+
+@pytest.mark.unit
+def test_save_and_load_pass_the_coordination_group_to_dcp(tmp_path, monkeypatch):
+    # A group that is built but not handed to dcp.save would fix nothing.
+    model = torch.nn.Linear(4, 4)
+    optimizer = torch.optim.AdamW(model.parameters())
+    manager = CheckpointManager(model, optimizer, tmp_path)
+    monkeypatch.setattr(manager, "_process_group", "the-gloo-group")
+
+    seen = {}
+    monkeypatch.setattr(
+        dcp, "save", lambda state, **kw: seen.update(save=kw.get("process_group")) or None
+    )
+    monkeypatch.setattr(
+        dcp, "load", lambda state, **kw: seen.update(load=kw.get("process_group")) or None
+    )
+
+    manager.save(step=1)
+    (tmp_path / "step_1").mkdir(exist_ok=True)
+    manager.load_latest()
+
+    assert seen == {"save": "the-gloo-group", "load": "the-gloo-group"}
