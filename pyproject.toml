@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The CellMap datasets are published on the HuggingFace Hub as parquet and read through
+# `datasets`, which memory-maps them as Arrow shards. Kept optional so the core install stays
+# torch + tensorboard + miao-io; `data/cellmap.py` imports it lazily and says so if it is absent.
+cellmap = [
+    "datasets>=2.0",
+    "pillow>=9.0",
+]
 dev = [
     "pytest>=7.0",
     "ruff>=0.4",
