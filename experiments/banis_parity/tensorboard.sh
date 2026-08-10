@@ -5,11 +5,7 @@
 #
 # Rebuilds the symlink tree each time it runs, so arms that started later -- A2 waits on A1 --
 # appear as soon as they exist. Re-run it once A2 has started to pick that arm up.
-#
-# Why a symlink tree and not `--logdir_spec name=path,name=path`: that flag is broken in
-# TensorBoard 2.21 (the runs endpoint comes back empty, and the UI reports "No dashboards are
-# active" with the whole spec string shown as the log directory). A plain `--logdir` over a
-# directory of symlinked runs works, and gives the same per-arm names in the legend.
+
 set -euo pipefail
 
 PORT=${1:-6006}

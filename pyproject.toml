@@ -3,6 +3,8 @@ name = "mia-train"
 version = "0.1.0"
 description = "PyTorch-native distributed training framework"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "torch>=2.0",
     "tensorboard>=2.0",
@@ -10,9 +12,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The CellMap datasets are published on the HuggingFace Hub as parquet and read through
-# `datasets`, which memory-maps them as Arrow shards. Kept optional so the core install stays
-# torch + tensorboard + miao-io; `data/cellmap.py` imports it lazily and says so if it is absent.
 cellmap = [
     "datasets>=2.0",
     "pillow>=9.0",
@@ -24,7 +23,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

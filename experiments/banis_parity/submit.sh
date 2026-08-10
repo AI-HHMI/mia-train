@@ -10,8 +10,6 @@ RUNS=/nrs/scicompsoft/orhane/mia-train-runs
 LOGS="$RUNS/jobs"
 mkdir -p "$LOGS"
 
-# gpu_h100, not h200: at 256^3 activations are ~22 GiB, so 80 GiB is ample and H100 is $0.50/hr
-# against H200's $0.80. The 512^3 arms needed H200 only because they peaked at 112 GiB.
 QUEUE=gpu_h100
 GPUS=8
 SLOTS=96

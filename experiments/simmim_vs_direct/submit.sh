@@ -10,18 +10,13 @@ PROJECT=miaai
 RUNS=/nrs/scicompsoft/orhane/mia-train-runs
 LOGS="$RUNS/jobs"
 
-# H200, not H100. A 512-cube at patch 16 peaks at 112.7 GiB per GPU even with activation
-# checkpointing on, which does not fit an 80 GiB H100 -- and the obvious way to make it fit,
-# running the head's upsampling in bf16, was measured to cost 1.4x the interpolation accuracy and
-# rejected. 8 GPUs is a whole node (8 per node, 12 slots each), so the batch grows with GPUs.
 QUEUE=gpu_h200
 GPUS=8
 SLOTS=96
 mkdir -p "$LOGS"
 
-# With no arguments every arm is submitted, which is how the experiment reproduces from scratch.
-# Named arms submit only those -- `bash submit.sh D` adds one arm without relaunching the rest,
-# which is what you want once some have already finished.
+# With no arguments every arm is submitted. Named arms submit only those: e.g. `bash submit.sh D` 
+# adds one arm without relaunching the rest.
 WANTED=("$@")
 wanted () {
   [[ ${#WANTED[@]} -eq 0 ]] && return 0
@@ -43,20 +38,15 @@ launch () {          # launch <name> <config> <hours> [dependency]
         $VENV/bin/torchrun --standalone --nproc_per_node=$GPUS src/train.py --config $config"
 }
 
-# `expandable_segments` above is not optional at this size: the head allocates 16 GiB tensors and
-# frees them every step, and the default caching allocator strands enough between segments to OOM
-# a run whose live set fits comfortably.
-
 if wanted A1; then
 echo "arm A stage 1 -- SimMIM pretraining"
 launch simmim_A1 "$HERE/1_simmim_pretrain.toml" 12
 fi
 
 # Run directories are timestamped, so arm A stage 2's [init] path is not knowable at submission
-# time -- stage 1's directory does not exist until stage 1 starts. It is resolved inside A2's own
-# job instead, which `-w ended(simmim_A1)` guarantees runs only after stage 1 has finished. The
-# resolved config is written beside the run rather than edited in place, so the file in git keeps
-# saying what the arm means and two launches cannot race on it.
+# time. It is resolved inside A2's own job instead, which `-w ended(simmim_A1)` guarantees runs 
+# only after stage 1 has finished. Resolved config is written beside the run rather than edited
+# in place, so the file in git keeps saying what the arm means and two launches cannot race on it
 if wanted A2; then
 echo "arm A stage 2 -- fine-tune from the SSL checkpoint (waits on A1)"
 A1_STEPS=$(grep -oP 'max_steps = \K\d+' "$HERE/1_simmim_pretrain.toml")
