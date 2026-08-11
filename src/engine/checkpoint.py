@@ -107,6 +107,25 @@ class CheckpointManager:
         path = self.latest_checkpoint()
         if path is None:
             return 0
+        return self._load(path)
+
+    def load_step(self, step: int) -> int:
+        """Restore one specific checkpoint in place. Returns its step.
+
+        Resuming always wants the newest, but evaluation often wants a named one -- comparing two
+        points of the same run says whether it is still improving, which the newest alone cannot.
+        """
+        path = self._dir / f"{_STEP_PREFIX}{step}"
+        if not path.is_dir():
+            available = sorted(
+                int(p.name[len(_STEP_PREFIX) :])
+                for p in self._dir.iterdir()
+                if p.name.startswith(_STEP_PREFIX)
+            ) if self._dir.is_dir() else []
+            raise ValueError(f"no checkpoint at step {step} in {self._dir}; have {available}")
+        return self._load(path)
+
+    def _load(self, path: Path) -> int:
         train_state = TrainState()
         state_dict = self._state_dict(train_state)
         dcp.load(state_dict, checkpoint_id=str(path), process_group=self._process_group)

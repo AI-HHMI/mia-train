@@ -90,21 +90,53 @@ target, so a field that predicts 0.7 everywhere scores well and is useless to co
 Use the real metrics:
 
 ```bash
-# 1. affinities over the whole val cube (mia-train's env, 1 GPU)
-python ~/projects/banis/mia_predict.py <run_dir> \
-    --cube /groups/miaai/miaai/lmd-v0.0.1/nisb/train_100/val/seed100 \
-    --out <out>/aff.zarr
-# 2. instances + nERL/VOI (banisvenv, CPU, ~200 GB)
-~/banisvenv/bin/python ~/projects/banis/mia_score.py <out>/aff.zarr \
-    --skeleton .../val/seed100/skeleton.pkl --out <out>/scores.json
+bash experiments/banis_parity/score_checkpoint.sh 160000
 ```
 
-## What the result will mean
+That submits three chained jobs — affinities over the whole val cube (1 H100, ~35 min), then
+nERL/VOI and a predicted-vs-ground-truth figure in parallel behind it. The two halves run in
+different environments so that mia-train never acquires `funlib.evaluate`/`numba` and BANIS is
+never imported next to a GPU; `--dry-run` prints the `bsub` lines without submitting.
 
-- **nERL climbs toward 24%** → the gap was the recipe, and the ViT is competitive.
-- **nERL stays near 3%** → the recipe was not the binding constraint and the architecture is. Then
-  the fix is a sub-pixel decoder (token → 16³ learned readout, as our MAE/SimMIM decoders already
-  do) rather than one trilinear upsample from a 64-channel bottleneck, and/or mutex watershed over
-  the long-range channels we currently discard at inference.
+```bash
+score_checkpoint.sh 160000 --reuse                # re-score existing affinities, no GPU
+score_checkpoint.sh 160000 --reuse --no-score \
+    --origin "512 512 300"                        # just another figure, ~5 s
+score_checkpoint.sh 200000 --logits "5 6 7"       # narrower threshold sweep
+```
 
-Either way it is decidable, which the previous round was not.
+The underlying two stages are `~/projects/banis/mia_predict.py` and `mia_score.py`, callable
+directly if a one-off needs an option the wrapper does not pass through.
+
+## What happened
+
+The gap was mostly the recipe. nERL on the full val cube, sweeping the threshold on val only:
+
+| step | nERL | best VOI | vs previous |
+|---|---|---|---|
+| 20k | 0.1293 | | |
+| 50k | 0.2329 | | +80% |
+| 110k | 0.2815 | | +21% |
+| 160k | **0.3045** (logit +6) | 3.702 (logit +5) | +8.2% |
+
+For reference, the arm this replaced scored **0.0259**, and the published BANIS-S baseline on the
+same `base` condition is 0.244. So the recipe fix — unfrozen stem, `layerwise_lr_decay = 1.0`,
+256³ instead of 512³, and long training — was worth ~11× on its own, and the ViT is now above the
+small baseline but still well short of the best published 0.596.
+
+Two follow-ups were then measured rather than assumed, and both corrected an earlier guess:
+
+- **Mutex watershed over the long-range channels is much worse here, not better** — 0.0141 against
+  thresholded connected components' 0.4192 on an identical 512³ block, producing 173k segments. The
+  argument for it was that the long-range channels separate better on average (+0.40 to +0.46 vs
+  +0.35), but MWS uses repulsion as a *hard* constraint, and one false repulsive edge forbids a
+  merge permanently. Average separation is not per-edge reliability. Kept as a diagnostic in
+  `banis/mia_score_mws.py` (with a 6-case self-test), not wired into the routine path.
+- **The trilinear head limits localization, not contrast.** Boundary contrast improved ~4× over the
+  earlier arm at every ground-truth boundary thickness, and the output now spans [0.006, 0.999]
+  rather than [0.044, 0.978] — so the "the head cannot express a boundary" reading was wrong. But
+  the figures show predicted boundaries as 8–16 voxel bands where ground truth is 1–2 voxels, which
+  is what one trilinear upsample from a 64-channel bottleneck would give, and it matches the
+  measured 10:1 split-to-merge error ratio: wide cuts erode thin processes into fragments. A
+  sub-pixel decoder (token → 16³ learned readout, as the MAE/SimMIM decoders already do) is
+  therefore still the leading architectural change, on sharpness grounds.
