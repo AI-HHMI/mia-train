@@ -1,0 +1,97 @@
+# Identical to banis_parity/finetune_256_long.toml except for the decoder and the warm start.
+# That is the point: it is an ablation of one architectural choice against a scored control, so
+# every other knob is held at the value the control ran with.
+experiment_name = "subpixel_decoder__subpixel_256"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256
+patch_size = 16
+in_chans = 1
+embed_dim = 1024
+depth = 24
+num_heads = 16
+n_storage_tokens = 4
+layerscale_init = 1.0e-05
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+pos_embed_rope_type = "superposition"
+
+[init]
+# The control's own encoder at 200k steps, not the released DINOv3 weights. The question here is
+# whether the *head* limits sharpness, so the encoder starts where the control left it and only
+# the decoder is new -- which also makes this run tens of thousands of steps rather than 300k.
+#
+# `prefix` is "model." and not "encoder.": `BaseAlgorithm` registers the backbone as `model`, and
+# `self.encoder` is the same object, so torch stores it once under the name it saw first. The
+# checkpoint's own `decoder.*`/`decoder_out.*` keys do not start with the prefix and are dropped
+# before the unused-key check, which is what leaves the new head at its initialisation.
+path = "/nrs/scicompsoft/orhane/mia-train-runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000"
+prefix = "model."
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder = "subpixel"
+# Width on the patch grid, where positions are 4096x cheaper than voxels -- so this can be wide.
+decoder_hidden_dim = 256
+# Width at voxel resolution. This is the number that costs: every tensor after the expansion is
+# this many channels over the whole crop, so it sets both the refinement convolutions' arithmetic
+# and what activation checkpointing would have to recompute.
+decoder_readout_dim = 16
+# Two 3x3x3 convolutions -> a 5-voxel receptive field across the seam between two tokens' blocks,
+# which are otherwise decoded independently.
+decoder_refine_depth = 2
+split_disconnected = true
+
+[data]
+name = "miao_volumes"
+config_path = "experiments/subpixel_decoder/nisb_base_256_aug.yaml"
+samples_per_epoch = 1000
+
+[val_data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [256, 256, 256]
+samples_per_epoch = 32
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/val/seed100.zarr"
+image_key = "img"
+label_key = "labels/seg"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+# 100k rather than the control's 300k: the encoder is already trained, and `max_steps` sets the
+# shape of the cosine, so quoting a horizon the run will not reach would leave the LR near its
+# peak for the whole run -- the mistake that made the control's early checkpoints hard to read.
+max_steps = 100000
+batch_size = 1            # per rank; 8 ranks -> global batch 8, matching the control exactly
+lr = 3.0e-4
+warmup_steps = 2000
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 1.0
+patch_embed_lr_mult = 1.0
+lr_schedule = "cosine"
+# Off, as in the control. The sub-pixel head holds roughly a quarter of the interpolating head's
+# activations, so this has more headroom than the control did, not less.
+activation_checkpointing = false
+precision = "bf16"
+log_every = 100
+val_every = 5000
+checkpoint_every = 5000   # denser than the control's 10k: the early steps are the informative ones
+num_workers = 6
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1

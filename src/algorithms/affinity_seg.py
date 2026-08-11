@@ -15,13 +15,14 @@ exists to serve one objective and is not what you keep afterwards.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from data.base import BaseDataset
+from layers.common.dense_heads import SubPixelHead, VoxelHead
 from models.base import BaseModel
 
 from .affinity.targets import (
@@ -34,33 +35,7 @@ from .base import BaseAlgorithm
 from .registry import AlgorithmRegistry
 
 SPATIAL_RANK = 3
-
-
-class VoxelHead(nn.Sequential):
-    """The voxel-resolution end of a dense head: upsample to `size`, then apply the layers.
-
-    A plain `nn.Sequential` with the interpolation folded in, so the resolution change and the
-    layers that run at that resolution are one module. That matters for activation checkpointing,
-    which stores whatever crosses a module's boundary: with the upsampling inside, the boundary is
-    the patch grid and nothing full-resolution is retained.
-
-    `size` is an argument rather than a constructor value because the head is meant to serve
-    whatever crop it is given -- `nn.Upsample(size=...)` would fix the output shape at build time
-    and quietly mis-scale a run that validates at a different crop from the one it trains on.
-    """
-
-    def forward(self, x: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:  # type: ignore[override]
-        # Left to autocast, which runs this in fp32. That is the most expensive tensor in the
-        # algorithm -- upsampling multiplies it by the cube of the patch size, so fp32 costs 32
-        # GiB rather than 16 at a 512-cube -- and forcing it to bf16 was measured and rejected:
-        # accumulating eight neighbours in bf16 is 1.4x less accurate than accumulating in fp32
-        # and rounding once, with worst-case deviations of several percent of the feature scale.
-        # Memory is bought with a bigger GPU, not with the one number the head is built to
-        # produce.
-        x = F.interpolate(x, size=size, mode="trilinear", align_corners=False)
-        for layer in self:
-            x = layer(x)
-        return x
+DECODERS = ("interpolate", "subpixel")
 
 
 @AlgorithmRegistry.register("affinity_seg")
@@ -85,13 +60,18 @@ class AffinitySegmentation(BaseAlgorithm):
         input_key: str = "img",
         label_key: str = "label",
         long_range: int = LONG_RANGE,
+        decoder: str = "interpolate",
         decoder_hidden_dim: int = 64,
+        decoder_readout_dim: int = 16,
+        decoder_refine_depth: int = 2,
         ignore_index: int = -1,
         split_disconnected: bool = True,
     ) -> None:
         super().__init__(model, dataset)
         if long_range < 1:
             raise ValueError(f"long_range must be at least 1 voxel, got {long_range}")
+        if decoder not in DECODERS:
+            raise ValueError(f"decoder must be one of {DECODERS}, got {decoder!r}")
 
         self.input_axes = self._resolve_input_axes(input_axes, dataset)
         self.input_key = input_key
@@ -99,36 +79,66 @@ class AffinitySegmentation(BaseAlgorithm):
         self.ignore_index = ignore_index
         self.split_disconnected = split_disconnected
         self.offsets = affinity_offsets(SPATIAL_RANK, long_range)
+        self.decoder_kind = decoder
         self.encoder = model
 
-        # Patch tokens -> voxel-resolution affinity logits. Upsampling is by interpolation to
-        # whatever spatial size the input had, rather than a transposed convolution with the
-        # patch size baked in, so the same head serves encoders whose patch sizes differ (and
-        # `ViT3D`'s tuple patch size as readily as the DINOv3 models' scalar one).
+        # Patch tokens -> voxel-resolution affinity logits, by one of two routes.
+        #
+        # `"interpolate"` upsamples to whatever spatial size the input had and then convolves at
+        # that resolution, so the same head serves encoders whose patch sizes differ (and
+        # `ViT3D`'s tuple patch size as readily as the DINOv3 models' scalar one) and crops that
+        # are not a whole number of patches. It is the default because every checkpoint this repo
+        # has trained on this task carries it.
+        #
+        # `"subpixel"` gives each token a learned readout of its own patch block instead. It is
+        # both sharper in principle -- detail comes from weights rather than from interpolating a
+        # coarse field -- and considerably cheaper, because the wide arithmetic stays on the patch
+        # grid: measured against this same head at 256^3, roughly a sixth of the multiply-adds and
+        # a quarter of the activation memory. It needs the encoder's patch size, and crops
+        # divisible by it.
+        #
         # `embed_dim` is an int attribute, but reading it off an nn.Module widens its static
         # type, so it is narrowed once here rather than at each use.
         embed_dim: int = model.embed_dim  # type: ignore[assignment]
-        self.decoder = nn.Sequential(
-            nn.Conv3d(embed_dim, decoder_hidden_dim, kernel_size=1),
-            nn.GELU(),
-        )
-        self.decoder_out = VoxelHead(
-            nn.Conv3d(decoder_hidden_dim, decoder_hidden_dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv3d(decoder_hidden_dim, len(self.offsets), kernel_size=1),
-        )
+        if decoder == "subpixel":
+            # Scalar on the DINOv3 models, a tuple on `ViT3D`; normalised as `simmim` does it.
+            patch = cast(Any, model).patch_size
+            patch_size: tuple[int, ...] = (
+                (patch,) * SPATIAL_RANK if isinstance(patch, int) else tuple(patch)
+            )
+            # `_decode` is unchanged by the choice: `SubPixelHead` takes its own projection, so the
+            # patch-grid stage is a no-op and both heads share the `(x, size)` call.
+            self.decoder: nn.Module = nn.Identity()
+            self.decoder_out: nn.Module = SubPixelHead(
+                embed_dim, patch_size, len(self.offsets),
+                hidden=decoder_hidden_dim, readout=decoder_readout_dim,
+                refine_depth=decoder_refine_depth,
+            )
+        else:
+            self.decoder = nn.Sequential(
+                nn.Conv3d(embed_dim, decoder_hidden_dim, kernel_size=1),
+                nn.GELU(),
+            )
+            self.decoder_out = VoxelHead(
+                nn.Conv3d(decoder_hidden_dim, decoder_hidden_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv3d(decoder_hidden_dim, len(self.offsets), kernel_size=1),
+                mode="trilinear",
+            )
 
     def checkpointable_modules(self) -> tuple[nn.Module, ...]:
         """The full-resolution half of the head, which is where this algorithm's memory goes.
 
         `decoder` runs on the patch grid and costs nothing; everything inside `decoder_out` runs
-        at voxel resolution, so each of its tensors is `decoder_hidden_dim` times the size of the
-        crop -- 16 GiB apiece at a 512-cube. Recomputing them is cheap beside holding them.
+        at voxel resolution, so each of its tensors is a decoder width times the size of the crop
+        -- 16 GiB apiece at a 512-cube. Recomputing them is cheap beside holding them.
 
-        The upsampling is deliberately part of `decoder_out` rather than done by the caller: a
-        checkpointed region stores its own inputs, so an interpolation performed outside would
-        leave its full-resolution result held for the whole backward pass and give back only half
-        of what checkpointing is worth here.
+        The resolution change is deliberately part of `decoder_out` rather than done by the
+        caller, under either decoder: a checkpointed region stores its own inputs, so an
+        upsampling performed outside would leave its full-resolution result held for the whole
+        backward pass and give back only half of what checkpointing is worth here. Both heads
+        therefore present a boundary at the patch grid, where a tensor is thousands of times
+        smaller than at voxel resolution.
         """
         return (self.decoder_out,)
 
@@ -252,9 +262,19 @@ class AffinitySegmentation(BaseAlgorithm):
             correct = ((logits > 0) == (target > 0.5)) & mask
             accuracy = correct.sum() / denominator
             positive_rate = (target * mask).sum() / denominator
+            # Accuracy restricted to the voxel/offset pairs that a boundary separates. Pooled
+            # accuracy is a poor guide on this task -- the target is ~83% positive, so predicting
+            # "same object" everywhere already scores 0.83 and says nothing -- and it is precisely
+            # the negatives that decide whether objects come apart, since a missed cut merges two
+            # objects and a spurious one fragments one. Reported separately so that a head getting
+            # sharper is visible as a number rather than only in a figure.
+            cut = mask & (target <= 0.5)
+            cut_total = cut.sum().clamp_min(1.0)
+            cut_accuracy = (correct & cut).sum() / cut_total
         return {
             "loss": loss,
             "affinity_accuracy": accuracy,
+            "boundary_accuracy": cut_accuracy,
             "target_positive_rate": positive_rate,
             "masked_fraction": mask.float().mean(),
         }

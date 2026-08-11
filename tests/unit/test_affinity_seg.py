@@ -9,6 +9,7 @@ import torch
 
 from algorithms.affinity_seg import AffinitySegmentation
 from algorithms.registry import AlgorithmRegistry
+from layers.common.dense_heads import VoxelHead
 from models.dinov3_vit3d import DinoVisionTransformer3D
 from models.muvit import MuViT3D
 from models.vit import ViT3D
@@ -95,9 +96,13 @@ def test_requires_an_axis_order_from_somewhere():
 @pytest.mark.unit
 def test_training_step_reports_loss_and_diagnostics():
     out = _algorithm().training_step(_batch())
-    assert set(out) == {"loss", "affinity_accuracy", "target_positive_rate", "masked_fraction"}
+    assert set(out) == {
+        "loss", "affinity_accuracy", "boundary_accuracy", "target_positive_rate",
+        "masked_fraction",
+    }
     assert out["loss"].ndim == 0 and torch.isfinite(out["loss"])
     assert 0.0 <= out["affinity_accuracy"] <= 1.0
+    assert 0.0 <= out["boundary_accuracy"] <= 1.0
 
 
 @pytest.mark.unit
@@ -226,3 +231,44 @@ def test_logits_come_back_at_voxel_resolution_with_one_channel_per_offset():
     tokens, grid = algorithm.encoder.patch_features(torch.randn(2, 1, CROP, CROP, CROP))
     logits = algorithm._decode(tokens, grid, torch.Size((CROP, CROP, CROP)))
     assert logits.shape == (2, 6, CROP, CROP, CROP)
+
+
+# ---------------------------------------------------------------- decoder choice
+
+
+@pytest.mark.unit
+def test_subpixel_decoder_produces_the_same_shaped_logits():
+    """Swapping the decoder must be invisible to everything downstream of the head."""
+    interpolate = _algorithm().training_step(_batch())
+    subpixel = _algorithm(decoder="subpixel", decoder_readout_dim=4).training_step(_batch())
+    assert set(interpolate) == set(subpixel)
+    assert torch.isfinite(subpixel["loss"])
+
+
+@pytest.mark.unit
+def test_subpixel_decoder_starts_from_the_trivial_constant():
+    """Zero-initialised output: every logit identical, so a warm encoder sees no random gradient."""
+    algorithm = _algorithm(decoder="subpixel", decoder_readout_dim=4)
+    volumes = algorithm.encoder.prepare_input(_batch()["img"], "lcxyz")
+    with torch.no_grad():
+        tokens, grid = algorithm.encoder.patch_features(volumes)
+        logits = algorithm._decode(tokens, grid, volumes.shape[2:])
+    assert torch.equal(logits, torch.zeros_like(logits))
+
+
+@pytest.mark.unit
+def test_subpixel_decoder_is_the_checkpointable_region():
+    algorithm = _algorithm(decoder="subpixel", decoder_readout_dim=4)
+    assert algorithm.checkpointable_modules() == (algorithm.decoder_out,)
+
+
+@pytest.mark.unit
+def test_interpolate_stays_the_default():
+    """Every checkpoint trained on this task so far carries the interpolating head."""
+    assert isinstance(_algorithm().decoder_out, VoxelHead)
+
+
+@pytest.mark.unit
+def test_unknown_decoder_is_rejected():
+    with pytest.raises(ValueError, match="decoder must be one of"):
+        _algorithm(decoder="transposed")

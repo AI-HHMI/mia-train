@@ -20,31 +20,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from data.base import BaseDataset
+from layers.common.dense_heads import CONV, INTERPOLATION, VoxelHead
 from models.base import BaseModel
 
 from .base import BaseAlgorithm
 from .registry import AlgorithmRegistry
-
-# Rank -> (convolution, interpolation mode). Trilinear/bilinear rather than nearest because the
-# head's output is a class *score*, which is continuous and legitimately interpolable, unlike a
-# class index.
-_CONV = {2: nn.Conv2d, 3: nn.Conv3d}
-_INTERPOLATION = {2: "bilinear", 3: "trilinear"}
-
-
-class VoxelHead(nn.Sequential):
-    """The full-resolution end of the head: upsample to `size`, then classify.
-
-    A plain `nn.Sequential` with the interpolation folded in, so the resolution change and the
-    layers that follow it are one module. That is what lets activation checkpointing store only
-    the patch-grid input rather than the upsampled tensor -- see `checkpointable_modules`.
-    """
-
-    def forward(self, x: torch.Tensor, size: tuple[int, ...], mode: str) -> torch.Tensor:  # type: ignore[override]
-        x = F.interpolate(x, size=size, mode=mode, align_corners=False)
-        for layer in self:
-            x = layer(x)
-        return x
 
 
 @AlgorithmRegistry.register("semantic_seg")
@@ -92,12 +72,12 @@ class SemanticSegmentation(BaseAlgorithm):
         self.encoder = model
 
         self.spatial_rank = len([axis for axis in self.input_axes if axis not in "lc"])
-        if self.spatial_rank not in _CONV:
+        if self.spatial_rank not in CONV:
             raise ValueError(
                 f"axis order {self.input_axes!r} implies {self.spatial_rank} spatial axes; this "
                 "algorithm supports 2 or 3"
             )
-        conv = _CONV[self.spatial_rank]
+        conv = CONV[self.spatial_rank]
 
         embed_dim: int = model.embed_dim  # type: ignore[assignment]
         self.decoder = nn.Sequential(conv(embed_dim, decoder_hidden_dim, kernel_size=1), nn.GELU())
@@ -105,6 +85,7 @@ class SemanticSegmentation(BaseAlgorithm):
             conv(decoder_hidden_dim, decoder_hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
             conv(decoder_hidden_dim, num_classes, kernel_size=1),
+            mode=INTERPOLATION[self.spatial_rank],
         )
 
         weights = None if class_weights is None else torch.tensor(list(class_weights)).float()
@@ -186,12 +167,11 @@ class SemanticSegmentation(BaseAlgorithm):
         x = tokens.transpose(1, 2).reshape(batch, channels, *grid)
         x = self.decoder(x)
         size = tuple(volumes.shape[2:])
-        mode = _INTERPOLATION[self.spatial_rank]
         if self.checkpoint_decoder:
             from utils.checkpointing import checkpointed
 
-            return checkpointed(self.decoder_out, x, size, mode)
-        return self.decoder_out(x, size, mode)
+            return checkpointed(self.decoder_out, x, size)
+        return self.decoder_out(x, size)
 
     def _step(self, batch: Any) -> dict[str, torch.Tensor]:
         if self.label_key not in batch:
