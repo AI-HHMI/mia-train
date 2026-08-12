@@ -13,6 +13,15 @@ RUNS=/nrs/scicompsoft/orhane/mia-train-runs
 VIEW=$RUNS/tb_simmim_vs_direct
 VENV=/groups/scicompsoft/home/orhane/myvenv
 
+# TensorBoard fails outright on a taken port, which is the normal case here: the arms of a
+# comparison are usually watched at the same time, and every one of these scripts defaults to 6006.
+# Step to the next free port instead and print it, so two of these can run side by side.
+port_busy () { ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1$"; }
+while port_busy "$PORT"; do
+  echo "port $PORT is in use, trying $((PORT + 1))"
+  PORT=$((PORT + 1))
+done
+
 rm -rf "$VIEW"
 mkdir -p "$VIEW"
 

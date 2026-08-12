@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
 from algorithms.registry import AlgorithmRegistry
+from data.augment import VolumeAugmentation
 from data.registry import DataRegistry
 from distributed.setup import destroy_distributed, device_type, init_distributed
 from models.registry import ModelRegistry
@@ -189,6 +191,13 @@ def build_trainer(
     (see `BaseAlgorithm`).
     """
     train_dataset = DataRegistry.build(config.data.name, **config.data.kwargs)
+    if config.augment.enabled():
+        # The training set only. `val_data` is deliberately never wrapped: validation has to
+        # measure the model on the data as it is, and there is no config key that can change that.
+        train_dataset.attach_transform(
+            VolumeAugmentation(**dataclasses.asdict(config.augment))
+        )
+        print(f"[augment] training data: {config.augment}", flush=True)
     val_dataset = (
         DataRegistry.build(config.val_data.name, **config.val_data.kwargs)
         if config.val_data is not None

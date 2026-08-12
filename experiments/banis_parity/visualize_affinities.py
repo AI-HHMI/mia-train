@@ -146,7 +146,8 @@ def main() -> None:
         pred = np.asarray(
             store[:, off[0]:off[0] + n, off[1]:off[1] + n, off[2]:off[2] + n]
         ).astype(np.float32)
-        title = f"{store.attrs.get('run', args.affinities.name)} @ step {store.attrs.get('step')}"
+        step = store.attrs.get("step")
+        title = f"{store.attrs.get('run', args.affinities.name)} @ step {step}"
         out_dir = args.out or args.affinities.parent
 
     seg_all = zarr.open(str(args.cube / "data.zarr"), mode="r")["seg"]
@@ -182,8 +183,11 @@ def main() -> None:
             ("|error|", affinity_rgb(err, False)),
         ])
 
+    # The step belongs in the filename, not only in the header. Without it every checkpoint of a
+    # run writes to the same path, so scoring a second one silently replaces the first -- which
+    # happened, and left a figure whose header and filename disagreed about which step it showed.
     stem = title.split()[0].replace("/", "_")
-    name = f"affinities_{stem}_{n}_{'-'.join(map(str, origin))}.png"
+    name = f"affinities_{stem}_step{step}_{n}_{'-'.join(map(str, origin))}.png"
     compose(panels, header, Path(out_dir) / name)
     print(header, flush=True)
 

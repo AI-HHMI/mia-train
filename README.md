@@ -54,6 +54,7 @@ experiment_name = "my_run"
 [data]         # name = a registered dataset; or config_path = a shared data config
 [val_data]     # optional: same shape as [data]
 [trainer]      # steps, batch size, lr, schedule, precision, checkpointing cadence
+[augment]      # optional: training-data augmentation (never applied to [val_data])
 [parallelism]  # dp_replicate, dp_shard, tp; must multiply to the torchrun world size
 ```
 
@@ -106,6 +107,9 @@ registries never change.
   `deploy/lsf/launch_multinode.sh`.
 - **Activation checkpointing:** `[trainer].activation_checkpointing = true`. Models and
   algorithms declare which regions are worth recomputing.
+- **Augmentation:** `[augment]` adds volumetric EM augmentations -- dropped and shifted sections,
+  intensity jitter, noise -- to the training data. Applied to the training dataset only; the engine
+  never wraps `[val_data]`, so no setting can silently change what a validation number means.
 - **Pretrained weights:** `[init]` loads a released or earlier-run checkpoint, reports what was
   copied, inflated, skipped or unused, and refuses silently-wrong loads.
 - **Optimizer:** AdamW with layerwise LR decay, a separate patch-embedding multiplier, weight-decay
@@ -123,6 +127,11 @@ a README each explaining what the experiment tested and what it found, e.g.:
   across two nodes.
 - [`banis_parity/`](experiments/banis_parity/): closing the gap to the published NISB baselines,
   and the measurements that identified which knobs mattered.
+- [`subpixel_decoder/`](experiments/subpixel_decoder/): a learned per-token readout in place of
+  trilinear upsampling, which is both sharper and cheaper. Includes the scoring pipeline the NISB
+  experiments share.
+- [`init_comparison/`](experiments/init_comparison/): does pretraining help, and do EM
+  augmentations? Four arms differing only in initialisation.
 
 These may be a good starting point for a new run: simply copy what you need from here and edit it.
 

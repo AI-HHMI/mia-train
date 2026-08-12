@@ -98,14 +98,18 @@ class SubPixelHead(nn.Module):
     principled fix is an overlapping kernel (`kernel_size = 2 * patch_size`, the support trilinear
     interpolation itself uses), at 8x the expansion parameters.
 
-    The last convolution is zero-initialised, so at construction the head emits its bias
-    everywhere. Fed a bias of `logit(positive rate)` that is the trivial constant predictor, which
-    is a deliberate starting point when the encoder is warm: a randomly-initialised dense head
-    would otherwise push meaningless gradients into weights that already solve the task. A
-    consequence worth knowing: with that weight at zero the gradient reaching everything before it
-    is also zero, so on the very first step only `out` learns. It unsticks itself immediately --
-    `out.weight` does receive gradient, and once it is non-zero the rest of the head follows -- but
-    under a long warmup the head stays quiet for longer than the step count alone suggests.
+    `zero_init_output` zeroes the last convolution, so at construction the head emits its bias
+    everywhere -- the trivial constant predictor. That protects an encoder that already solves the
+    task from a randomly-initialised head's meaningless gradients, and it is the right choice when
+    **warm-starting a trained encoder**.
+
+    **Turn it off when the encoder also has to learn.** With that weight at zero, the gradient
+    reaching everything before it is zero too, so the encoder trains on nothing until `out` grows
+    -- which under a long warmup takes on the order of a thousand steps. Measured: a cold ViT-B
+    from DINOv3 weights sat at a loss of exactly `ln 2` at step 100 and still had zero boundary
+    accuracy at step 1000, against a comparable trilinear-head run already at 0.494 by step 100
+    with 7x the gradient norm. On a warm encoder the same initialisation costs nothing, because the
+    features are already right the moment the head opens.
     """
 
     def __init__(
@@ -116,6 +120,7 @@ class SubPixelHead(nn.Module):
         hidden: int = 256,
         readout: int = 16,
         refine_depth: int = 2,
+        zero_init_output: bool = True,
     ) -> None:
         super().__init__()
         rank = len(patch_size)
@@ -139,7 +144,8 @@ class SubPixelHead(nn.Module):
         self.refine = nn.Sequential(*refine)
         self.out = conv(readout, out_channels, kernel_size=1)
 
-        nn.init.zeros_(self.out.weight)
+        if zero_init_output:
+            nn.init.zeros_(self.out.weight)
         nn.init.zeros_(cast(torch.Tensor, self.out.bias))
 
     def set_output_bias(self, bias: float) -> None:

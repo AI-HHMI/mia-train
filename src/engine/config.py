@@ -40,6 +40,37 @@ class InitConfig:
 
 
 @dataclass(frozen=True)
+class AugmentConfig:
+    """Training-data augmentation. Empty by default, so a run augments only when it says so.
+
+    Applied to the training dataset alone -- the engine never wraps `[val_data]`. Validation has
+    to measure the model on the data as it is, and an augmented validation set silently changes
+    what every number in the run means, which is not something a config key should be able to do
+    by accident.
+
+    Defaults are off rather than the reference recipe's values: turning augmentation on is a
+    decision about the experiment, and a run that inherited it from a default would be hard to
+    tell apart from one that asked for it.
+    """
+
+    drop_slice_prob: float = 0.0
+    shift_slice_prob: float = 0.0
+    shift_magnitude: int = 10
+    intensity: bool = False
+    mul_intensity: float = 0.1
+    add_intensity: float = 0.1
+    noise_scale: float = 0.0
+
+    def enabled(self) -> bool:
+        return bool(
+            self.drop_slice_prob > 0.0
+            or (self.shift_slice_prob > 0.0 and self.shift_magnitude > 0)
+            or self.intensity
+            or self.noise_scale > 0.0
+        )
+
+
+@dataclass(frozen=True)
 class TrainerConfig:
     """Hyperparameters for one training run, normally populated from a .toml config."""
 

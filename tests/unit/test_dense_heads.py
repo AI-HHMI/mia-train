@@ -163,3 +163,28 @@ def test_subpixel_head_serves_two_dimensional_data():
 def test_voxel_head_uses_the_mode_it_was_built_with():
     head = VoxelHead(torch.nn.Conv2d(IN_DIM, OUT, kernel_size=1), mode="bilinear")
     assert head(torch.randn(1, IN_DIM, 3, 5), (12, 20)).shape == (1, OUT, 12, 20)
+
+
+@pytest.mark.unit
+def test_output_can_start_non_zero_so_a_cold_encoder_gets_gradient() -> None:
+    """The zero init closes the head, which stalls an encoder that still has to learn.
+
+    With `out.weight` at zero the gradient reaching everything upstream is zero as well, so a
+    cold encoder trains on nothing until the head opens. Measured on real runs as ~1-2k wasted
+    steps, so the choice has to be available per run.
+    """
+    x = torch.randn(1, IN_DIM, *GRID, requires_grad=False)
+
+    closed = _head(refine_depth=1)                      # zero_init_output defaults to True
+    closed(x, _size()).sum().backward()
+    assert closed.project.weight.grad is not None
+    assert torch.equal(closed.project.weight.grad, torch.zeros_like(closed.project.weight.grad)), (
+        "with a zeroed output convolution nothing upstream should receive gradient"
+    )
+
+    open_head = _head(refine_depth=1, zero_init_output=False)
+    open_head(x, _size()).sum().backward()
+    assert open_head.project.weight.grad.abs().sum() > 0, (
+        "with zero_init_output=False the encoder-facing projection must receive gradient on the "
+        "first step"
+    )

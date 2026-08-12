@@ -1,0 +1,93 @@
+# Arm 4 phase 1: arm 2 plus BANIS-style augmentation, interpolating head.
+#
+# Part of `init_comparison`. Every arm trains in two phases: the interpolating head first, then the
+# sub-pixel head warm-started from it. See README.md.
+
+experiment_name = "init__4a_dinov3_aug_interp"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256
+patch_size = 16
+in_chans = 1
+embed_dim = 1024          # ViT-L/16
+depth = 24
+num_heads = 16            # head_dim 64; 64 % 6 = 4, so axial 3D RoPE leaves 4 channels unrotated
+n_storage_tokens = 4
+layerscale_init = 1.0e-05 # NOT optional: the released weights were trained with LayerScale
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+pos_embed_rope_type = "superposition"
+
+[init]
+path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+inflate_2d_to_3d = true
+skip = ["rope_embed."]    # a 2D checkpoint says nothing about a third axis
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+# Phase 1 uses the interpolating head: it is the configuration that demonstrably trains from a cold
+# encoder (banis_parity reached 0.3691 nERL from these same released weights), which the sub-pixel
+# head has not managed to do.
+decoder = "interpolate"
+decoder_hidden_dim = 64
+split_disconnected = true
+
+[data]
+name = "miao_volumes"
+config_path = "experiments/init_comparison/nisb_base_256_aug.yaml"
+samples_per_epoch = 1000
+
+[val_data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [256, 256, 256]
+samples_per_epoch = 32
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/val/seed100.zarr"
+image_key = "img"
+label_key = "labels/seg"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+max_steps = 150000
+batch_size = 1            # per rank; 8 ranks -> global batch 8, matching BANIS and every prior run
+lr = 3.0e-4
+warmup_steps = 2000
+min_lr_ratio = 0.01
+lr_schedule = "linear"
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 1.0  # the whole model trains at one rate
+patch_embed_lr_mult = 1.0
+activation_checkpointing = false
+precision = "bf16"
+log_every = 100
+val_every = 5000
+checkpoint_every = 5000
+num_workers = 6
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1
+
+[augment]
+# BANIS' own defaults, on images presented in [0, 1] as theirs are. Training set only -- the engine
+# never wraps [val_data].
+drop_slice_prob = 0.05    # a lost section: the image goes blank, the labels do not
+shift_slice_prob = 0.05   # imperfect section alignment
+shift_magnitude = 10      # voxels; image and labels shift together, unlike the reference
+intensity = true
+mul_intensity = 0.1
+add_intensity = 0.1
+noise_scale = 0.5         # severe by design: std up to half the dynamic range, on half of samples

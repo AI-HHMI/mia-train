@@ -64,6 +64,7 @@ class AffinitySegmentation(BaseAlgorithm):
         decoder_hidden_dim: int = 64,
         decoder_readout_dim: int = 16,
         decoder_refine_depth: int = 2,
+        decoder_zero_init_output: bool = True,
         ignore_index: int = -1,
         split_disconnected: bool = True,
     ) -> None:
@@ -113,6 +114,7 @@ class AffinitySegmentation(BaseAlgorithm):
                 embed_dim, patch_size, len(self.offsets),
                 hidden=decoder_hidden_dim, readout=decoder_readout_dim,
                 refine_depth=decoder_refine_depth,
+                zero_init_output=decoder_zero_init_output,
             )
         else:
             self.decoder = nn.Sequential(

@@ -6,12 +6,30 @@ from typing import Any
 
 import torch.utils.data as data
 
+from .augment import AugmentedDataset
+
 
 class BaseDataset(abc.ABC):
     """Wraps a data source (e.g. a miao VolumeDataset) into a rank-aware DataLoader."""
 
     def __init__(self) -> None:
         self._dataset: data.Dataset | None = None
+        self._transform: Any = None
+
+    def attach_transform(self, transform: Any) -> None:
+        """Apply `transform` to every sample this dataset yields.
+
+        Lives here rather than in each dataset's constructor so augmentation is available to any
+        data source without each one plumbing it through, and so the engine can attach it to the
+        training set alone. Must be called before the dataloader is built; a dataset already
+        materialised would otherwise keep handing out untransformed samples.
+        """
+        if self._dataset is not None:
+            raise RuntimeError(
+                "attach_transform was called after the dataset was built, so the samples already "
+                "being served would not go through it"
+            )
+        self._transform = transform
 
     @abc.abstractmethod
     def build_dataset(self) -> data.Dataset:
@@ -20,7 +38,10 @@ class BaseDataset(abc.ABC):
     @property
     def dataset(self) -> data.Dataset:
         if self._dataset is None:
-            self._dataset = self.build_dataset()
+            source = self.build_dataset()
+            self._dataset = (
+                source if self._transform is None else AugmentedDataset(source, self._transform)
+            )
         return self._dataset
 
     @property
