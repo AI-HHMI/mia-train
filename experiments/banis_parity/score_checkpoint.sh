@@ -38,10 +38,9 @@ RUNS=/nrs/scicompsoft/orhane/mia-train-runs
 SCRATCH=/nrs/scicompsoft/orhane/mia-train-scratch
 EVAL=$SCRATCH/eval
 PROJECT=miaai
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RUN=""
-CUBE=/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100/val/seed100
+CUBE=/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/train_100/val/seed100.zarr
 TAG=bp
 # The sweep the benchmark rules allow on the *val* cube. Narrowed from mia_score.py's -1..11
 # default because every scored checkpoint so far has peaked at +5 or +6 and each extra threshold
@@ -167,9 +166,9 @@ fi
 VIZJOB=""
 if [[ $VIZ -eq 1 ]]; then
   VIZJOB=$(submit -q local -n 4 -W 0:30 ${WAIT[@]+"${WAIT[@]}"} \
-    -J "viz_${TAG}${STEP}" -cwd "$HERE" \
+    -J "viz_${TAG}${STEP}" -cwd "$BANIS" \
     -o "$SCRATCH/viz_${TAG}${STEP}_%J.log" -e "$SCRATCH/viz_${TAG}${STEP}_%J.err" \
-    "$THREADS $MYVENV/bin/python '$HERE/visualize_affinities.py' \
+    "$THREADS $MYVENV/bin/python '$BANIS/visualize_affinities.py' \
        --affinities '$AFF' --cube '$CUBE' --origin $ORIGIN --size $SIZE")
   echo "stage 3  visualise  job $VIZJOB  (figures land beside the zarr, in $EVAL)"
 fi

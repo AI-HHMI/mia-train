@@ -45,9 +45,9 @@ output_axes = "lcxyz"
 
 [[val_data.volumes]]
 name = "NISB base val seed100"
-path = "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/val/seed100.zarr"
-image_key = "img"
-label_key = "labels/seg"
+path = "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/val/seed100.zarr"
+image_key = "raw"
+label_key = "labels/public_gt-cell-nisb"
 zarr_version = "zarr3"
 weight = 1.0
 normalize = true

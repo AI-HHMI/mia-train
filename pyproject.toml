@@ -52,7 +52,13 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.11"
 mypy_path = "src"
-files = ["src", "tests", "experiments"]
+# `experiments` is deliberately absent, and adding it back would fail: it holds no Python at all
+# now. It held two scripts, and typechecking them put the core quality gate around code no test
+# covers, one of which reached into a sibling repo by `sys.path` insert -- so a core refactor
+# could be blocked by a plotting script whose dependencies live elsewhere. That one moved to the
+# `banis` repo that owns what it imports; the other was a one-off and was deleted. Experiments are
+# configs, submission scripts and write-ups.
+files = ["src", "tests"]
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true

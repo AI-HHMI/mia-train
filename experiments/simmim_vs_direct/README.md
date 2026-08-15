@@ -156,7 +156,8 @@ zero point.
 
 ## Scaling up: the other NISB variants
 
-`nisb_ngff_sidecar.py` (in this folder) unlocks the NISB variants downloaded in August, which
+A metadata-only sidecar, written once by a throwaway script since removed, unlocks the NISB
+variants downloaded in August, which
 `miao` could not read. It turned out **not** to be a bad download: NISB publishes each cube as a
 plain zarr v2 group -- `data.zarr` holding flat `img`/`seg` arrays, exactly what the benchmark's
 own BANIS code reads -- while miao needs OME-NGFF multiscale metadata. `base` and `liconn` are the

@@ -14,19 +14,20 @@
 # hyperparameters and post-processing thresholds; the test cube (seed101) is scored once. Neither
 # appears here -- val belongs in a [val_data] section, and test is never read during training.
 
-# Why `legacy/nisb` and not `dev/nisb`: on 2026-08-14 the shared tree was reorganised under
-# `lmd-v0.0.1`, moving `nisb/` to `dev/nisb/` and renaming `img` -> `raw` and `labels/seg` ->
-# `labels/public_gt-cell-nisb` (this killed a running job mid-epoch). `legacy/nisb` is the
-# pre-reorg copy: byte-identical data -- verified by `cmp` on a matched 120 MB shard and on every
-# zarr metadata field -- under the original key names.
+# Paths are `dev/nisb`, the only tree there is. The 2026-08-14 reorganisation under `lmd-v0.0.1`
+# moved `nisb/` to `dev/nisb/` and renamed `img` -> `raw` and `labels/seg` ->
+# `labels/public_gt-cell-nisb` (which killed a running job mid-epoch). These configs pointed for a
+# while at `legacy/nisb`, a byte-identical pre-reorg copy under the original key names, because
+# `dev` keeps only the OME-NGFF form while the eval path reads a flat layout. `legacy` has since
+# been deleted, so that choice is gone and the key renames are reflected below.
 #
-# It is preferred over `dev` for one hard reason: `dev` kept only the OME-NGFF form of each
-# subset, and the eval path (`banis/mia_predict.py`) reads the *flat* `train_100/val/seed100/
-# data.zarr` layout, which now survives only under `legacy`. Repointing at `dev` would mean
-# renaming both keys *and* teaching the prediction path to read NGFF.
+# The half of that migration this file cannot do: `banis/mia_predict.py` reads the *flat*
+# `<cube>/data.zarr` layout with its `img`/`seg` arrays, and no such layout exists anywhere now.
+# Scoring therefore needs an NGFF reader in `banis` -- a change over there, not here. Training
+# reads NGFF through miao and is unaffected.
 #
-# `legacy` is a deletion candidate. When it goes, the migration is: keys to `raw` /
-# `labels/public_gt-cell-nisb`, and an NGFF reader for the eval cube.
+# Runs recorded in `experiments/` were produced against `legacy`; their numbers stand, and the
+# configs that produced them are in git history and in each run's own `resolved_config.json`.
 
 # 9x9x20 nm is the native resolution of the s0 level, and the data is anisotropic: z voxels are
 # a little over twice as long as x and y. Asking for exactly the stored size keeps miao on level 0
@@ -48,41 +49,41 @@ samples_per_epoch: 1000
 
 volumes:
   - name: "NISB base seed0"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/train/seed0.zarr"
-    image_key: "img"
-    label_key: "labels/seg"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed0.zarr"
+    image_key: "raw"
+    label_key: "labels/public_gt-cell-nisb"
     zarr_version: "zarr3"
     weight: 0.2
     normalize: true   # uint8 on disk, so this maps to [0, 1] by dtype max
 
   - name: "NISB base seed1"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/train/seed1.zarr"
-    image_key: "img"
-    label_key: "labels/seg"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed1.zarr"
+    image_key: "raw"
+    label_key: "labels/public_gt-cell-nisb"
     zarr_version: "zarr3"
     weight: 0.2
     normalize: true
 
   - name: "NISB base seed2"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/train/seed2.zarr"
-    image_key: "img"
-    label_key: "labels/seg"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed2.zarr"
+    image_key: "raw"
+    label_key: "labels/public_gt-cell-nisb"
     zarr_version: "zarr3"
     weight: 0.2
     normalize: true
 
   - name: "NISB base seed3"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/train/seed3.zarr"
-    image_key: "img"
-    label_key: "labels/seg"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed3.zarr"
+    image_key: "raw"
+    label_key: "labels/public_gt-cell-nisb"
     zarr_version: "zarr3"
     weight: 0.2
     normalize: true
 
   - name: "NISB base seed4"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/train/seed4.zarr"
-    image_key: "img"
-    label_key: "labels/seg"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed4.zarr"
+    image_key: "raw"
+    label_key: "labels/public_gt-cell-nisb"
     zarr_version: "zarr3"
     weight: 0.2
     normalize: true

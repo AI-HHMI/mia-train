@@ -1,6 +1,6 @@
-"""Enforces the layout of `models/`, `layers/` and `algorithms/`.
+"""Enforces the layout of `models/`, `layers/`, `algorithms/` and `experiments/`.
 
-Two rules, both about being able to answer a question by listing a directory.
+Three rules, the first two about being able to answer a question by listing a directory.
 
 **`ls src/models/`** answers "what can I train?" -- every file there registers something a config
 can name, plus the two that define the contract. Reusable pieces that no config ever names --
@@ -12,9 +12,17 @@ registers a strategy. A strategy's own supporting code goes in a subpackage name
 pile. Note the subpackage cannot share a name with the module that registers the strategy, since
 one would shadow the other -- hence `affinity_seg.py` beside `affinity/`.
 
+**`experiments/` stays text.** Configs, submission scripts and write-ups belong in git; checkpoints,
+TensorBoard events and predictions do not. That separation is what keeps the directory cheap to
+carry: all four experiments together are ~135 KB of text, while the run artifacts they produced are
+1.4 TB on `/nrs`, a ratio of about ten million to one. `[environment].checkpoint_dir` routes
+artifacts out of the tree, and `utils.cluster` refuses a relative path so they cannot land here by
+accident -- but a figure, a metrics dump or a small checkpoint copied in by hand would slip past
+both, and git never forgets a blob.
+
 Checked rather than merely documented because a boundary like this decays quietly. Nothing fails
-when a helper is dropped into `models/` or `algorithms/`; the package simply drifts back to a bag
-of modules over a few months.
+when a helper is dropped into `models/` or `algorithms/`, or when a PNG is dropped into
+`experiments/`; the package simply drifts back to a bag of modules over a few months.
 """
 
 from __future__ import annotations
@@ -22,6 +30,7 @@ from __future__ import annotations
 import ast
 import importlib
 import pathlib
+import subprocess
 
 import pytest
 
@@ -29,7 +38,14 @@ import components  # noqa: F401  (populates the registries as a real run would)
 from algorithms.registry import AlgorithmRegistry
 from models.registry import ModelRegistry
 
-SRC = pathlib.Path(__file__).resolve().parents[2] / "src"
+REPO = pathlib.Path(__file__).resolve().parents[2]
+SRC = REPO / "src"
+
+# Generous against today's worst case -- the largest tracked file anywhere in the repo is a 25 KB
+# source file, and the largest under `experiments/` an 11 KB README -- while still far below
+# anything a run produces, the smallest of which is hundreds of megabytes. The point is to catch a
+# category error, not to police prose, so a write-up can grow sixfold before this complains.
+MAX_EXPERIMENT_FILE_BYTES = 64 * 1024
 
 # base.py defines the ABC and registry.py the registry itself: the contract every registrable
 # implementation satisfies, which is neither an implementation nor a reusable part.
@@ -160,3 +176,92 @@ def test_layers_do_not_depend_on_algorithms_or_the_engine():
 # loudly at import (`ModuleNotFoundError: No module named 'layers.common.rope'` takes the whole
 # suite down at collection), so such a test guards nothing while hardcoding filenames a rename
 # would break.
+
+
+def _git(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=REPO, capture_output=True, text=True, check=True
+    ).stdout
+
+
+def _tracked_experiment_blobs() -> dict[str, int]:
+    """Tracked paths under `experiments/` mapped to the size of the blob git holds for each.
+
+    Asks git rather than walking the filesystem, because tracked is the only thing that matters
+    here: an artifact left in a working tree costs nothing and `.gitignore` already covers the
+    `outputs/` case, whereas a committed one is in history permanently.
+
+    The size comes from the index rather than from `stat`, which is not the same thing twice over.
+    A file staged for deletion, or moved out of the tree before the removal is staged, is still
+    listed by `ls-files` and would raise `FileNotFoundError` on `stat`. And what costs the repo is
+    the blob, not whatever the worktree happens to hold right now.
+    """
+    records = []
+    for record in _git("ls-files", "-s", "-z", "--", "experiments").split("\0"):
+        if not record:
+            continue
+        meta, path = record.split("\t", 1)
+        records.append((meta.split()[1], path))
+
+    if not records:
+        return {}
+
+    # Keyed by object id, and deliberately not built as a sha -> path mapping: identical files
+    # share one blob, and this repo has three byte-identical copies of `nisb_base_256_aug.yaml`,
+    # so a dict keyed the other way would silently drop two of the three paths.
+    unique = sorted({sha for sha, _ in records})
+    batch = subprocess.run(
+        ["git", "cat-file", "--batch-check=%(objectname) %(objectsize)"],
+        cwd=REPO,
+        input="\n".join(unique),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    sizes = {
+        line.split()[0]: int(line.split()[1]) for line in batch.splitlines() if line.strip()
+    }
+    return {path: sizes[sha] for sha, path in records}
+
+
+@pytest.mark.unit
+def test_experiments_hold_no_large_files():
+    """No tracked file under `experiments/` may be artifact-sized."""
+    tracked = _tracked_experiment_blobs()
+    # A guard that silently checks nothing is worse than no guard: if the pathspec ever stops
+    # matching -- directory renamed, tests run from a tarball -- this says so instead of passing.
+    assert tracked, "no tracked files under experiments/; this check is not looking at anything"
+
+    oversized = {
+        name: size for name, size in tracked.items() if size > MAX_EXPERIMENT_FILE_BYTES
+    }
+    assert not oversized, (
+        f"tracked files under experiments/ exceed {MAX_EXPERIMENT_FILE_BYTES // 1024} KB: "
+        f"{oversized}. Experiments hold configs, scripts and write-ups; artifacts belong under "
+        "[environment].checkpoint_dir, which is outside the repo."
+    )
+
+
+@pytest.mark.unit
+def test_experiments_hold_no_binary_files():
+    """Size alone would let a small checkpoint or a thumbnail through.
+
+    Enforced by extension rather than by sniffing bytes, so the failure names the offending kind
+    of file and stays readable when it fires.
+    """
+    binary_suffixes = {
+        ".pt", ".pth", ".ckpt", ".safetensors", ".npy", ".npz", ".pkl",
+        ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".tif", ".tiff",
+        ".zip", ".gz", ".tar", ".h5", ".hdf5",
+    }
+    found = [
+        name
+        for name in _tracked_experiment_blobs()
+        if pathlib.Path(name).suffix.lower() in binary_suffixes
+        or ".zarr" in pathlib.Path(name).parts
+        or pathlib.Path(name).name.startswith("events.out.tfevents")
+    ]
+    assert not found, (
+        f"binary or artifact files tracked under experiments/: {found}. These belong beside the "
+        "run that produced them, under [environment].checkpoint_dir."
+    )
