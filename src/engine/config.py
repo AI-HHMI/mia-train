@@ -131,6 +131,24 @@ class TrainerConfig:
     # The probe costs one extra forward/backward per run, whose gradients are discarded.
     measure_mfu: bool = True
 
+    # Hold the encoder fixed for this many steps while the patch embedding and the algorithm's own
+    # head train against it, then unfreeze and train jointly. 0 disables it. The point is to spare
+    # a pretrained encoder the gradients of a randomly initialised head: adapting a 2D checkpoint
+    # to volumes, the patch embedding and the head are the two parts that start wrong, and the
+    # backbone is the part worth protecting until they are not.
+    #
+    # Only the *model's* parameters are frozen, and only those outside its input stem -- the
+    # algorithm's head sits outside the model and keeps training, which is the whole point.
+    # Note this does not make the phase cheap: the stem is below the blocks, so backward still
+    # traverses the whole stack to reach it. What it saves is the weight gradients and the
+    # optimizer state, not the pass.
+    freeze_backbone_steps: int = 0
+    # Linear ramp on the learning rate when the backbone joins, so it does not take a full-size
+    # step on its first one. Applies to every group, not just the newly unfrozen ones: the head has
+    # been training for `freeze_backbone_steps` already, and briefly slowing it too is a smaller
+    # distortion than running two learning-rate schedules at once.
+    unfreeze_warmup_steps: int = 1000
+
     precision: str = "fp32"
     log_every: int = 10
     checkpoint_every: int = 0
@@ -165,6 +183,19 @@ class TrainerConfig:
             raise ValueError(f"log_every must be >= 1, got {self.log_every}")
         if self.peak_tflops is not None and self.peak_tflops <= 0.0:
             raise ValueError(f"peak_tflops must be > 0 or None, got {self.peak_tflops}")
+        if self.freeze_backbone_steps < 0:
+            raise ValueError(
+                f"freeze_backbone_steps must be >= 0, got {self.freeze_backbone_steps}; 0 disables"
+            )
+        if self.freeze_backbone_steps >= self.max_steps:
+            raise ValueError(
+                f"freeze_backbone_steps ({self.freeze_backbone_steps}) must be < max_steps "
+                f"({self.max_steps}), or the backbone would never train"
+            )
+        if self.unfreeze_warmup_steps < 0:
+            raise ValueError(
+                f"unfreeze_warmup_steps must be >= 0, got {self.unfreeze_warmup_steps}"
+            )
         if not 0.0 < self.layerwise_lr_decay <= 1.0:
             raise ValueError(
                 f"layerwise_lr_decay must be in (0, 1], got {self.layerwise_lr_decay}; it is a "

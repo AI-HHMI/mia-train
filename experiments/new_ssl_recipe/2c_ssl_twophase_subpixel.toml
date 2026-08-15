@@ -1,0 +1,160 @@
+# Arm 2 (two-phase SSL) stage 3 of 3: the sub-pixel head on the encoder
+# 2b_ssl_twophase_interp leaves behind. 2b is its only predecessor and nothing follows it -- this
+# checkpoint is arm 2's answer, and the one to score against 1b and 3c.
+#
+# `new_ssl_recipe` runs three arms off one released DINOv3 ViT-B/16:
+#
+#   1  DINOv3 -> interp 50k -> sub-pixel 50k                                    (no SSL at all)
+#   2  DINOv3 -> SimMIM 100k with a frozen warm-up -> interp -> sub-pixel       (this arm)
+#   3  DINOv3 -> SimMIM 100k joint from step 0     -> interp -> sub-pixel
+#
+# Identical to 1b_dinov3_subpixel and 3c_ssl_joint_subpixel except for which encoder it loads,
+# which is what makes 2 vs 3 a reading on the frozen warm-up and 3 vs 1 a reading on the SSL
+# stage itself.
+#
+# The predecessor's run directory does not exist at submission time, so `PREV_CHECKPOINT` is
+# resolved in the job, exactly as init_comparison's submit.sh does it -- newest run, then the
+# numerically highest checkpoint, which is not the same as the most recently written one:
+#
+#   RUNS=/nrs/scicompsoft/orhane/mia-train-runs
+#   RUN=$(ls -dt $RUNS/sslrec__2b_ssl_twophase_interp_*/ | head -1)
+#   STEP=$(ls -d ${RUN}checkpoints/step_* | sed 's|.*step_||' | sort -n | tail -1)
+#   OUT=/nrs/scicompsoft/orhane/mia-train-scratch/new_ssl_recipe/2c_resolved.toml
+#   sed "s|PREV_CHECKPOINT|${RUN}checkpoints/step_${STEP}|" \
+#     experiments/new_ssl_recipe/2c_ssl_twophase_subpixel.toml > "$OUT"
+#
+#   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 12:00 -r -J sslrec_2c \
+#     -cwd /groups/scicompsoft/home/orhane/projects/mia-train -w "done(<2b job id>)" \
+#     -o /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_2c_%J.log \
+#     "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; \
+#      export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
+#      /groups/scicompsoft/home/orhane/myvenv/bin/torchrun --standalone --nproc_per_node=8 \
+#        src/train.py --config $OUT --resume"
+#
+# The resolution belongs inside the job, after the dependency has fired, which is what makes a
+# whole arm safe to submit in one go. `-r` plus `--resume` make a wall-clock overrun a requeue.
+
+experiment_name = "sslrec__2c_ssl_twophase_subpixel"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256            # 16^3 = 4096 tokens at patch 16
+patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
+in_chans = 1
+embed_dim = 768           # ViT-B/16: 85.7M released params, 88.2M with a 16^3 single-channel stem
+depth = 12                # init_comparison ran the same recipe at ViT-L, ~3.4x the parameters
+num_heads = 12            # head_dim 64, the same per-head width the ViT-L has
+n_storage_tokens = 4      # the released ViTs carry 4 registers
+# Neither of the next two is optional, and both are easy to lose when a config is copied: the
+# released weights carry LayerScale gains and a per-block masked key bias, and so does every
+# checkpoint descended from them. A model built without them has nowhere to put those tensors,
+# and the architecture it computes is not the one that was trained -- `strict` below turns that
+# into an error instead of a silent 2-point regression.
+layerscale_init = 1.0e-05
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+# Superposition in every stage of every arm, where init_comparison's cold arms use "vanilla":
+# nothing here is cold. A released 2D checkpoint says nothing about a third axis, and vanilla --
+# which hands depth its own third of the rotary channels -- rearranges the very channel layout
+# the pretrained attention was fitted against. Superposition keeps the 2D layout exactly and adds
+# a gated depth angle on top, so the weights transfer and the model starts numerically identical
+# to its 2D self. Two stages in, the gate is a trained parameter arriving in the checkpoint below,
+# and switching type here would discard 150k steps of what it learned about depth.
+pos_embed_rope_type = "superposition"
+
+[init]
+path = "PREV_CHECKPOINT"
+# `BaseAlgorithm` registers the backbone as `model`, so that is where stage 2's encoder sits in
+# its checkpoint. Keys outside the prefix -- the interpolating head's -- are dropped before the
+# unused-key check, which is exactly what leaves the new sub-pixel head at its initialisation.
+prefix = "model."
+# `rope_embed` buffers are derived from `base` by the model's own init_weights rather than
+# learned, so keeping this model's own costs nothing and sidesteps any disagreement in length.
+skip = ["rope_embed."]
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+decoder = "subpixel"
+decoder_hidden_dim = 256  # width on the token grid, where positions are 4096x cheaper
+decoder_readout_dim = 16  # width at voxel resolution -- the number that actually costs
+decoder_refine_depth = 2
+# Correct here and a handicap anywhere cold. Zeroing the output convolution makes the head emit a
+# constant, which protects an encoder that already solves the task from a randomly initialised
+# dense head's meaningless gradients -- but on a cold encoder it also zeroes the gradient reaching
+# that encoder, which is how the single-phase attempts stalled. This is the configuration that
+# produced 0.4941 nERL when warm-started in subpixel_decoder.
+decoder_zero_init_output = true
+
+[data]
+name = "miao_volumes"
+# The five NISB `base` training cubes at 256^3 with the 16 in-plane rotations/flips. Byte-identical
+# to init_comparison's copy, and shared by all eight stages here -- every step this arm has taken,
+# self-supervised and supervised, has been on these five cubes.
+config_path = "experiments/new_ssl_recipe/nisb_base_256_aug.yaml"
+samples_per_epoch = 1000  # bookkeeping only; `max_steps` is what ends the run
+
+[val_data]
+name = "miao_volumes"
+# The held-out cube, not in any training config: the inline keys below override the YAML's rather
+# than extend it, so `volumes` here *replaces* the five training cubes instead of adding a sixth.
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [256, 256, 256]
+# 32 crops is a cheap signal, not a model selector. In subpixel_decoder the lowest val loss did
+# not pick the best checkpoint (85k won on loss, 100k on nERL); at this sample count anything
+# under ~2 sd is sampling noise, and the arms are compared by scoring checkpoints, not by this.
+samples_per_epoch = 32
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/val/seed100.zarr"
+image_key = "raw"
+label_key = "labels/public_gt-cell-nisb"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+max_steps = 50000
+batch_size = 1            # per rank; 8 ranks -> global batch 8, matching BANIS and every prior run
+# This stage continues the tail of a single 100k plan rather than restarting one of its own.
+# 1.5453e-4 is what one 100k linear schedule (peak 3e-4, warmup 2000, min_lr_ratio 0.01) reaches
+# at step 50000, and the ratio below lands this stage on that plan's 3e-6 endpoint. Restarting at
+# the full 3e-4 would hand the encoder a rate nearly twice anything it saw in stage 2. Both
+# numbers are derived rather than copied: the same arithmetic reproduces init_comparison's
+# published 1.228e-4 / 0.0244 for its 150k + 100k split.
+#
+# The SSL stage is outside this plan on purpose. It has its own objective, its own 100k schedule
+# and its own annealing, and stitching all three stages into one curve would make the supervised
+# budget differ between arm 1 and arms 2 and 3 -- the one thing this experiment holds fixed.
+#
+# Caveat inherited from init_comparison: stage 2 declares max_steps = 50000 and so anneals all the
+# way to 3e-6 before stopping, which makes the handoff 3e-6 -> 1.5453e-4 rather than genuinely
+# continuous. The short warmup below softens the step up.
+lr = 1.5453e-4
+warmup_steps = 500
+min_lr_ratio = 0.0194
+lr_schedule = "linear"
+weight_decay = 0.05
+grad_clip_norm = 1.0
+# One rate for the whole model. The 0.9 x 0.2 pair these two keys carried in the original
+# experiment left patch_embed at an effective 1.4e-6, 696x below the baseline's rate, and the
+# patch embedding is precisely the layer with the most to relearn -- an inflated RGB kernel now
+# reading single-channel EM. Setting both to 1.0 was worth about 11x nERL in banis_parity, so
+# neither is a knob to reintroduce quietly.
+layerwise_lr_decay = 1.0
+patch_embed_lr_mult = 1.0
+activation_checkpointing = false  # a ViT-B at 256^3 fits; recomputation is 30% compute for nothing
+precision = "bf16"
+log_every = 100
+val_every = 5000
+checkpoint_every = 5000
+num_workers = 6
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1

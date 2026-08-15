@@ -23,7 +23,7 @@ from .activation_checkpoint import apply_activation_checkpointing
 from .checkpoint import CheckpointManager
 from .config import TrainerConfig
 from .mfu import ThroughputMeter, measure_step_flops
-from .optimizer import build_lr_scheduler, build_optimizer
+from .optimizer import build_lr_scheduler, build_optimizer, is_stem
 
 _AUTOCAST_DTYPES = {"bf16": torch.bfloat16}
 
@@ -104,6 +104,38 @@ class Trainer:
             return contextlib.nullcontext()
         return torch.autocast(self.device.type, dtype=dtype)
 
+    def _backbone_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
+        """The model's parameters outside its input stem -- what a warm-up holds fixed.
+
+        Scoped to `algorithm.model`, so an algorithm's own head is untouched however it is named.
+        The stem test is `optimizer.is_stem`, the same one the layerwise learning rate uses, so the
+        two cannot disagree about where the backbone begins.
+        """
+        return [
+            (name, parameter)
+            for name, parameter in self.algorithm.model.named_parameters()
+            if not is_stem(name)
+        ]
+
+    def _set_backbone_frozen(self, frozen: bool) -> None:
+        """Toggle the backbone's `requires_grad`, reporting the parameter count once.
+
+        Applied *after* `build_optimizer`, never before: `build_param_groups` skips parameters that
+        do not require grad, so freezing first would leave the backbone out of the optimizer
+        permanently and the groups would have to be rebuilt at the boundary -- which changes the
+        shape a checkpoint's optimizer state reloads into. Toggling afterwards keeps the group
+        structure fixed for the whole run; AdamW simply allocates no state for a parameter whose
+        grad stays None, and `zero_grad(set_to_none=True)` guarantees it does.
+        """
+        parameters = self._backbone_parameters()
+        for _, parameter in parameters:
+            parameter.requires_grad_(not frozen)
+        if self.is_primary:
+            count = sum(p.numel() for _, p in parameters)
+            verb = "froze" if frozen else "unfroze"
+            print(f"[freeze] {verb} {len(parameters)} backbone tensors ({count/1e6:.1f}M params)",
+                  flush=True)
+
     def _peak_flops(self) -> tuple[float | None, str]:
         """One GPU's peak throughput at this run's precision, and why it is unknown if it is."""
         if self.config.peak_tflops is not None:
@@ -173,6 +205,13 @@ class Trainer:
         batches = self._endless_batches(self.train_loader, start_epoch=step)
         self.algorithm.train()
 
+        # Decided from the *restored* step, not from zero: a job resumed past the boundary must
+        # come back unfrozen, and one resumed inside the warm-up must come back frozen. Getting
+        # this from `config` alone would silently retrain a resumed run with a frozen backbone.
+        backbone_frozen = step < self.config.freeze_backbone_steps
+        if backbone_frozen:
+            self._set_backbone_frozen(True)
+
         meter: ThroughputMeter | None = None
         if self.config.measure_mfu and step < self.config.max_steps:
             # Probe the batch the first step is about to train on, then put it back, so measuring
@@ -203,6 +242,13 @@ class Trainer:
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
             step += 1
+
+            if backbone_frozen and step >= self.config.freeze_backbone_steps:
+                # After the step that completes the warm-up, so the boundary step is the last one
+                # trained frozen -- matching `freeze_backbone_steps` as a count of frozen steps
+                # rather than as the index of the first joint one.
+                self._set_backbone_frozen(False)
+                backbone_frozen = False
 
             if step % self.config.log_every == 0:
                 logged = reduce_metrics(metrics)

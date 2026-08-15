@@ -31,6 +31,17 @@ _STEM_MARKERS = ("patch_embed", "pos_embed", "patch_proj", "level_embed")
 _BACKBONE_PREFIX = "model."
 
 
+def is_stem(name: str) -> bool:
+    """Whether a parameter belongs to the input adapter rather than the backbone proper.
+
+    Public because the frozen-backbone warm-up (`[trainer].freeze_backbone_steps`) needs the same
+    partition the layerwise learning rate uses, and two copies of this list would drift: a model
+    whose stem stopped being recognised here would be frozen in one place and given the largest
+    learning rate in the other, which is the worst of both.
+    """
+    return any(marker in name for marker in _STEM_MARKERS)
+
+
 def _block_count(model: nn.Module) -> int:
     """How many transformer blocks deep the model is, read from its parameter names."""
     depths = [
@@ -58,8 +69,7 @@ def parameter_depth(name: str, n_blocks: int, backbone_scoped: bool = False) -> 
     match = _BLOCK_INDEX.search(name)
     if match is not None:
         return int(match.group(1)) + 1
-    is_stem = any(marker in name for marker in _STEM_MARKERS)
-    if is_stem or name.endswith("_token") or "tokens" in name:
+    if is_stem(name) or name.endswith("_token") or "tokens" in name:
         return 0
     return n_blocks + 1
 
@@ -157,19 +167,37 @@ def decay_fraction(progress: float, schedule: str) -> float:
     raise ValueError(f"unknown lr_schedule {schedule!r}; expected one of {list(LR_SCHEDULES)}")
 
 
+def unfreeze_ramp(step: int, config: TrainerConfig) -> float:
+    """Linear ramp over `unfreeze_warmup_steps` once the backbone joins; 1.0 the rest of the time.
+
+    Written as a factor on top of the ordinary schedule rather than as a second branch inside it,
+    so the decay curve is the same function of `step` whether or not a freeze is configured. The
+    alternative -- restarting warmup at the boundary and re-basing the decay -- would change the
+    learning rate a run sees at every step after it, not just during the ramp.
+    """
+    if config.freeze_backbone_steps <= 0 or config.unfreeze_warmup_steps <= 0:
+        return 1.0
+    offset = step - config.freeze_backbone_steps
+    if offset < 0 or offset >= config.unfreeze_warmup_steps:
+        return 1.0
+    return (offset + 1) / config.unfreeze_warmup_steps
+
+
 def lr_multiplier(step: int, config: TrainerConfig) -> float:
     """Linear warmup then `config.lr_schedule` decay to `min_lr_ratio`, as a multiple of base LR.
 
     `step` is 0-based, matching LambdaLR's `last_epoch`. Returns 1.0 at the end of warmup and
     exactly `min_lr_ratio` at `max_steps`, whichever decay shape is in use -- the shapes differ
-    only in between.
+    only in between. When `freeze_backbone_steps` is set, the value is additionally ramped at the
+    unfreeze boundary; see `unfreeze_ramp`.
     """
     if config.warmup_steps > 0 and step < config.warmup_steps:
         return (step + 1) / config.warmup_steps
     decay_steps = max(1, config.max_steps - config.warmup_steps)
     progress = min(1.0, max(0.0, (step - config.warmup_steps) / decay_steps))
     remaining = decay_fraction(progress, config.lr_schedule)
-    return config.min_lr_ratio + (1.0 - config.min_lr_ratio) * remaining
+    scheduled = config.min_lr_ratio + (1.0 - config.min_lr_ratio) * remaining
+    return scheduled * unfreeze_ramp(step, config)
 
 
 def weight_decay_at(step: int, config: TrainerConfig) -> float:
