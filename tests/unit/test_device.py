@@ -149,7 +149,10 @@ def test_trainer_hands_the_algorithm_a_batch_moved_to_its_device(
 
     val_loader = trainer.val_loader
     assert val_loader is not None
-    assert len(devices) == 2 + len(val_loader)  # every train step and every val batch
+    # The MFU probe's batch, then every train step and every val batch. The probe is included
+    # rather than disabled because it hands a batch to the algorithm like any other caller, so
+    # it has to route through `move_to_device` for the same reason the loops do.
+    assert len(devices) == 1 + 2 + len(val_loader)
     assert all(device is trainer.device for device in devices)
     assert all(seen is moved for seen, moved in zip(algorithm.seen, returned, strict=True))
     assert all(seen.device == trainer.device for seen in algorithm.seen)

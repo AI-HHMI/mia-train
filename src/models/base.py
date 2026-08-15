@@ -17,7 +17,21 @@ class BaseModel(nn.Module, abc.ABC):
 
     @abc.abstractmethod
     def flops(self, input_shape: tuple[int, ...]) -> int:
-        """Estimated forward-pass FLOPs for a single input of the given shape (no batch dim)."""
+        """Estimated forward-pass FLOPs for a single input of the given shape (no batch dim).
+
+        `input_shape` is the shape the caller intends to run, and an implementation must either
+        answer for that shape or raise -- never quietly answer for the one it was configured with.
+        The domain is the architecture's own: the DINOv3 encoders accept any shape they could run,
+        because multi-crop SSL costs several resolutions within one step, while `ViT3D` and
+        `MuViT3D` accept only their configured geometry, because `embed` admits nothing else.
+        Both honour the contract; they differ in how wide it is, so a caller holding a `BaseModel`
+        should be prepared for a `ValueError` on a shape that model could not run.
+
+        This is an estimate of the *model's* arithmetic, not of a training step's: it excludes the
+        backward pass and knows nothing about masking, multi-crop, or an algorithm's decoder or
+        head. `engine.mfu` measures a real step instead of scaling this, and the module docstring
+        there records how far apart the two land.
+        """
 
     def prepare_input(self, batch: torch.Tensor, axes: str) -> torch.Tensor:
         """Turn a dataset-shaped batch into whatever this architecture consumes.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -15,11 +16,13 @@ from data.base import BaseDataset
 from distributed.parallel_dims import ParallelDims
 from distributed.parallelize import parallelize_algorithm
 from utils.device import move_to_device
+from utils.hardware_flops import peak_flops
 from utils.metrics import MetricLogger, reduce_metrics
 
 from .activation_checkpoint import apply_activation_checkpointing
 from .checkpoint import CheckpointManager
 from .config import TrainerConfig
+from .mfu import ThroughputMeter, measure_step_flops
 from .optimizer import build_lr_scheduler, build_optimizer
 
 _AUTOCAST_DTYPES = {"bf16": torch.bfloat16}
@@ -89,9 +92,10 @@ class Trainer:
             else None
         )
 
+        self.is_primary = not dist.is_initialized() or dist.get_rank() == 0
         self.logger = MetricLogger(
             log_dir=output_dir / "tensorboard",
-            is_primary=not dist.is_initialized() or dist.get_rank() == 0,
+            is_primary=self.is_primary,
         )
 
     def _autocast(self) -> Any:
@@ -99,6 +103,52 @@ class Trainer:
         if dtype is None:
             return contextlib.nullcontext()
         return torch.autocast(self.device.type, dtype=dtype)
+
+    def _peak_flops(self) -> tuple[float | None, str]:
+        """One GPU's peak throughput at this run's precision, and why it is unknown if it is."""
+        if self.config.peak_tflops is not None:
+            return self.config.peak_tflops * 1e12, ""
+        if self.device.type != "cuda":
+            return None, f"no peak-FLOPS figure for device type {self.device.type!r}"
+        return peak_flops(torch.cuda.get_device_name(self.device), self.config.precision)
+
+    def _build_throughput_meter(self, batch: Any) -> ThroughputMeter:
+        """Measure one step's FLOPs on `batch`, leaving no trace on the run.
+
+        Every rank measures, because the forward and backward it runs contain the same collectives
+        a real step does — a rank that skipped the probe would leave the others waiting in an
+        all-gather. Each rank counts its own local work, which is exactly the numerator a per-GPU
+        utilization figure wants.
+
+        The RNG state is restored afterwards so that enabling this cannot change what the run
+        trains on. The probe draws from the same global generator as mask sampling and
+        augmentation, so without the restore, two runs with one seed and different `measure_mfu`
+        would silently diverge from the first step.
+        """
+        peak, reason = self._peak_flops()
+        if peak is None and self.is_primary:
+            print(f"[mfu] utilization not reported: {reason}", flush=True)
+
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            step_flops = measure_step_flops(self.algorithm, batch, self._autocast)
+        finally:
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+
+        if self.is_primary:
+            peak_note = f"{peak / 1e12:.1f} TFLOP/s peak" if peak else "peak unknown"
+            print(
+                f"[mfu] measured {step_flops / 1e12:.3f} TFLOP per step per rank, {peak_note}",
+                flush=True,
+            )
+        return ThroughputMeter(
+            step_flops=step_flops,
+            peak_flops=peak,
+            samples_per_step=self.config.batch_size * self.dims.dp_world_size,
+        )
 
     def _endless_batches(self, loader: DataLoader, start_epoch: int = 0) -> Iterator[Any]:
         """Yield batches forever, re-seeding the sampler each pass.
@@ -123,6 +173,18 @@ class Trainer:
         batches = self._endless_batches(self.train_loader, start_epoch=step)
         self.algorithm.train()
 
+        meter: ThroughputMeter | None = None
+        if self.config.measure_mfu and step < self.config.max_steps:
+            # Probe the batch the first step is about to train on, then put it back, so measuring
+            # does not consume one. `_build_throughput_meter` restores the RNG, and together those
+            # make the probe invisible: the run sees the same batches in the same order with the
+            # same random draws whether or not it is enabled.
+            probe_batch = move_to_device(next(batches), self.device)
+            batches = itertools.chain([probe_batch], batches)
+            meter = self._build_throughput_meter(probe_batch)
+            meter.start()
+
+        logged_at = step
         while step < self.config.max_steps:
             batch = move_to_device(next(batches), self.device)
             with self._autocast():
@@ -146,6 +208,15 @@ class Trainer:
                 logged = reduce_metrics(metrics)
                 # `get_last_lr()` is typed `list[float | Tensor]` because tensor LRs are legal.
                 logged["lr"] = float(self.scheduler.get_last_lr()[0])
+                if meter is not None:
+                    # Sampled here, after `reduce_metrics` has already synchronized on `.item()`,
+                    # so the window is bounded by real device work rather than by a queue depth.
+                    # The step count is measured rather than assumed to be `log_every`: resuming
+                    # mid-cadence makes the first window shorter.
+                    window = meter.window(step - logged_at)
+                    if window is not None:
+                        logged.update(window.as_metrics())
+                logged_at = step
                 self.logger.log(step, logged)
 
             if self.config.checkpoint_every and step % self.config.checkpoint_every == 0:

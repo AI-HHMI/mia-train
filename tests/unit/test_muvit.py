@@ -429,10 +429,65 @@ def test_extra_forward_methods_names_what_mae_calls():
 @pytest.mark.unit
 def test_flops_grow_superlinearly_with_added_levels():
     # Attention is quadratic in the joint sequence, so a second level costs more than twice one
-    # level. That cross-level term is exactly what the architecture is buying.
-    one = _tiny(levels=(1,)).flops((1, 16, 16, 16))
-    two = _tiny(levels=(1, 4)).flops((1, 16, 16, 16))
+    # level. That cross-level term is exactly what the architecture is buying. Each model is asked
+    # about the sample it actually consumes, (L, C, D, H, W) -- the level count is part of the
+    # input, not just of the configuration.
+    one = _tiny(levels=(1,)).flops((1, 1, 16, 16, 16))
+    two = _tiny(levels=(1, 4)).flops((2, 1, 16, 16, 16))
     assert two > 2 * one
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("mlp_ratio", "expected"), [(1.0, 983_040), (2.0, 1_114_112), (4.0, 1_376_256)]
+)
+def test_flops_are_pinned_to_the_configured_mlp_ratio(mlp_ratio: float, expected: int):
+    # Pinned absolute values, matching `test_vit.py`: the superlinear-in-levels test above compares
+    # two of these counts against each other, so a hidden width that is wrong by a constant factor
+    # cancels out of it entirely and leaves the inequality holding. Closed form at the _tiny
+    # geometry (levels=(1, 4), so n = 2 * 8 = 16 joint tokens; d = 32, depth = 2,
+    # patch_volume = 512, hidden = int(d * mlp_ratio)):
+    #     patch_proj = 2*n*patch_volume*d               = 524_288
+    #     per_block  = 8*n*d*d + 4*n*n*d + 4*n*d*hidden = 163_840 + 2_048*hidden
+    #     total      = patch_proj + depth*per_block     = 851_968 + 4_096*hidden
+    # 2.0 is the default (and the paper's ratio); 1.0 and 4.0 are what tie the count to the setting
+    # rather than to that default.
+    model = _tiny(mlp_ratio=mlp_ratio)
+    assert model.flops((2, 1, 16, 16, 16)) == expected
+    # Ties the pinned number to the module it describes. `flops` recomputes `int(d * mlp_ratio)`
+    # instead of reading the width off the block, which is safe only while `TransformerBlock` sizes
+    # its hidden layer by exactly that expression -- unlike the DINOv3 encoders, whose SwiGLU
+    # rounds up to an alignment and forced them to read the built module. This asserts the
+    # condition, so a block that ever starts rounding fails here rather than skewing the count.
+    hidden_weight = dict(model.named_parameters())["blocks.0.mlp.0.weight"]
+    assert tuple(hidden_weight.shape) == (int(32 * mlp_ratio), 32)
+
+
+@pytest.mark.unit
+def test_flops_rejects_a_shape_the_model_cannot_run():
+    # A cost quoted for the configured geometry when the caller asked about another one is
+    # indistinguishable from a correct answer, so it is refused rather than returned. Both a wrong
+    # level count and a wrong volume are caught, since each changes the token count.
+    model = _tiny(levels=(1, 4))
+    with pytest.raises(ValueError, match="does not describe an input this model can run"):
+        model.flops((1, 1, 16, 16, 16))
+    with pytest.raises(ValueError, match="does not describe an input this model can run"):
+        model.flops((2, 1, 32, 32, 32))
+    with pytest.raises(ValueError, match="does not describe an input this model can run"):
+        model.flops((2, 3, 16, 16, 16))  # right levels and volume, wrong channel count
+
+
+@pytest.mark.unit
+def test_flops_rejects_a_vit3d_style_shape_that_omits_the_level_axis():
+    # The hole the whole-shape comparison closes. The guard used to test `input_shape[:1]` against
+    # `num_levels`, which on a one-level model accepted (C, D, H, W) -- reading the channel 1 as
+    # the level count 1 -- and returned a number for the ViT3D-style call it existed to catch. It
+    # cannot be rescued by counting from the other end either: with the channel dropped, the level
+    # axis sits exactly where a channel would. Both leading axes must be named.
+    model = _tiny(levels=(1,))
+    with pytest.raises(ValueError, match="does not describe an input this model can run"):
+        model.flops((1, 16, 16, 16))
+    assert model.flops((1, 1, 16, 16, 16)) > 0  # the same volume, fully named, is costed
 
 
 @pytest.mark.unit

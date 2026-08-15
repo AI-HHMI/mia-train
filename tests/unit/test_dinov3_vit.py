@@ -41,6 +41,23 @@ def _input(cls, batch: int = 2) -> torch.Tensor:
     return torch.randn(batch, 1, 16, 16, 16)
 
 
+def _shape(cls, side: int) -> tuple[int, ...]:
+    """One sample's shape at a given side length, as `flops` takes it -- no batch dimension."""
+    if cls is DinoVisionTransformer:
+        return (3, side, side)
+    return (1, side, side, side)
+
+
+# The side length each tiny model is configured for, and one twice as large: these encoders are
+# meant to run at resolutions other than the one they were built for, so the tests need both.
+CONFIGURED_SIDE = {DinoVisionTransformer: 32, DinoVisionTransformer3D: 16}
+
+# Forward FLOPs of the tiny models at the configured side and at twice it; derived below.
+PINNED_FLOPS = {
+    DinoVisionTransformer: {32: 3_883_520, 64: 16_515_584},
+    DinoVisionTransformer3D: {16: 4_829_952, 32: 38_290_176},
+}
+
 BOTH = pytest.mark.parametrize("cls", [DinoVisionTransformer, DinoVisionTransformer3D])
 
 
@@ -264,9 +281,97 @@ def test_declares_the_methods_fsdp_must_wrap(cls):
 @pytest.mark.unit
 @BOTH
 def test_flops_grows_with_depth(cls):
-    shallow = _model(cls, depth=2).flops(())
-    deep = _model(cls, depth=4).flops(())
+    shape = _shape(cls, CONFIGURED_SIDE[cls])
+    shallow = _model(cls, depth=2).flops(shape)
+    deep = _model(cls, depth=4).flops(shape)
     assert 0 < shallow < deep
+
+
+@pytest.mark.unit
+@BOTH
+def test_flops_scale_with_the_input_resolution(cls):
+    # Pinned absolute values rather than a bare inequality: the count was wrong by a constant for
+    # every resolution but one, and "greater than zero" is exactly what failed to notice. Closed
+    # form with p patches, n = p + 1 (CLS, no storage tokens) and depth = 2:
+    #     patch_proj = 2*p*patch_volume*d
+    #     per_block  = 8*n*d*d + 4*n*n*d + 4*n*d*hidden
+    #     total      = patch_proj + depth*per_block
+    # 2D at the tiny geometry: patch_volume = 8**2 * 3 = 192, d = 64, hidden = 256, p = 16 or 64.
+    # 3D: patch_volume = 8**3 * 1 = 512, d = 96, hidden = 384, p = 8 or 64.
+    model = _model(cls)
+    for side, expected in PINNED_FLOPS[cls].items():
+        assert model.flops(_shape(cls, side)) == expected
+
+
+@pytest.mark.unit
+@BOTH
+def test_flops_read_the_grid_off_the_input_not_the_configured_img_size(cls):
+    # The regression this pins: `flops` used to derive the grid from `self.num_patches`, so it
+    # reported the construction-time cost whatever it was asked about. These encoders have no
+    # position-embedding table and SSL runs global and local crops through them in the same step,
+    # so the answer has to follow the argument.
+    side = CONFIGURED_SIDE[cls]
+    small = _model(cls, img_size=side)
+    large = _model(cls, img_size=2 * side)
+    assert small.flops(_shape(cls, 2 * side)) == large.flops(_shape(cls, 2 * side))
+    assert large.flops(_shape(cls, side)) == small.flops(_shape(cls, side))
+
+
+@pytest.mark.unit
+@BOTH
+def test_flops_cost_anisotropic_crops(cls):
+    # `grid_size` cannot express these -- `img_size` is a single int, so it only describes a
+    # cube/square -- which is the other half of why the grid has to come from `input_shape`.
+    side = CONFIGURED_SIDE[cls]
+    model = _model(cls)
+    channels, _, *rest = _shape(cls, side)
+    stretched = (channels, 2 * side, *rest)  # one spatial axis doubled, the others left alone
+    cube, twice = model.flops(_shape(cls, side)), model.flops(_shape(cls, 2 * side))
+    assert cube < model.flops(stretched) < twice
+
+
+@pytest.mark.unit
+@BOTH
+def test_flops_use_the_ffn_width_that_was_actually_built(cls):
+    # SwiGLU runs three projections of 2/3 the nominal hidden width, so it matches the plain MLP's
+    # two full-width ones only while that 2/3 is already aligned. `ffn_ratio=3.5` is chosen so it
+    # is not: `swiglu64` then rounds up and the two genuinely differ, which is what the old
+    # `int(embed_dim * ffn_ratio)` formula could not see.
+    shape = _shape(cls, CONFIGURED_SIDE[cls])
+    plain = _model(cls, ffn_layer="mlp", ffn_ratio=3.5)
+    gated = _model(cls, ffn_layer="swiglu64", ffn_ratio=3.5)
+
+    plain_hidden = plain.blocks[0].mlp.fc1.out_features
+    gated_hidden = gated.blocks[0].mlp.w1.out_features
+    assert 3 * gated_hidden != 2 * plain_hidden  # otherwise the two would cost the same by luck
+
+    n = plain.num_patches + 1 + plain.n_storage_tokens
+    per_block = 2 * n * plain.embed_dim * (3 * gated_hidden - 2 * plain_hidden)
+    assert gated.flops(shape) - plain.flops(shape) == len(plain.blocks) * per_block
+
+
+@pytest.mark.unit
+@BOTH
+def test_flops_rejects_a_shape_with_no_spatial_axes(cls):
+    # An empty or truncated shape would otherwise silently cost a one-patch grid.
+    with pytest.raises(ValueError, match="patch grid"):
+        _model(cls).flops(())
+
+
+@pytest.mark.unit
+@BOTH
+def test_flops_reject_a_channel_count_the_model_could_not_run(cls):
+    # The resolution is free here, but the channel count is fixed by the patch convolution, so a
+    # shape naming another one describes a forward pass that raises. Unchecked it was answered
+    # anyway, with the configured model's cost: `patch_volume` is linear in `in_chans`, so the
+    # patch-projection term came back scaled by the ratio of the two counts and nothing said so.
+    model = _model(cls)
+    channels, *spatial = _shape(cls, CONFIGURED_SIDE[cls])
+    with pytest.raises(ValueError, match="channel axis"):
+        model.flops((channels + 1, *spatial))
+    # Naming only the spatial axes asserts nothing about channels, and is still costed: the shape
+    # has no channel to disagree with, and inventing one to demand would be a different contract.
+    assert model.flops(tuple(spatial)) == model.flops((channels, *spatial))
 
 
 @pytest.mark.unit

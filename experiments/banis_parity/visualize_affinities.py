@@ -123,7 +123,7 @@ def main() -> None:
     source.add_argument("--run", type=Path, help="a mia-train run dir; predicts on the fly")
     source.add_argument("--affinities", type=Path, help="an affinity zarr from mia_predict.py")
     p.add_argument("--cube", type=Path,
-                   default=Path("/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100/val/seed100"))
+                   default=Path("/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100/val/seed100"))
     p.add_argument("--origin", type=int, nargs=3, default=[1024, 1024, 512])
     p.add_argument("--size", type=int, default=256, help="edge length of the region shown")
     p.add_argument("--slices", type=int, default=4, help="how many z slices to lay out")

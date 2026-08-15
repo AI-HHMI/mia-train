@@ -41,7 +41,7 @@ PROJECT=miaai
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RUN=""
-CUBE=/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100/val/seed100
+CUBE=/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100/val/seed100
 TAG=bp
 # The sweep the benchmark rules allow on the *val* cube. Narrowed from mia_score.py's -1..11
 # default because every scored checkpoint so far has peaked at +5 or +6 and each extra threshold

@@ -28,6 +28,7 @@ import torch.nn as nn
 
 from layers.dinov3.block import SelfAttentionBlock
 from layers.dinov3.config import dtype_dict, ffn_layer_dict, init_weights_vit, norm_layer_dict
+from layers.dinov3.ffn import SwiGLUFFN
 from layers.dinov3.patch_embed import PatchEmbed3D
 from layers.dinov3.rope import RopePositionEmbedding3D, RopePositionEmbedding3DSuperposition
 from utils.module_ops import named_apply
@@ -108,7 +109,6 @@ class DinoVisionTransformer3D(BaseModel):
         self.patch_size = patch_size
         self.in_chans = in_chans
         self.img_size = img_size
-        self.ffn_ratio = ffn_ratio
 
         self.patch_embed = PatchEmbed3D(
             img_size=img_size,
@@ -460,12 +460,75 @@ class DinoVisionTransformer3D(BaseModel):
         return ("forward_features", "get_intermediate_layers")
 
     def flops(self, input_shape: tuple[int, ...]) -> int:
-        """Rough forward FLOPs for one sample: patch embedding, attention, and MLPs."""
-        n = self.num_patches + 1 + self.n_storage_tokens
+        """Rough forward FLOPs for one input of `input_shape`: patch embedding, attention, MLPs.
+
+        The grid is derived from `input_shape` rather than validated against the configured
+        `img_size` the way `ViT3D.flops` does, because unlike `ViT3D` this architecture really does
+        run at many crop sizes: it carries no position-embedding table to interpolate, DINOv3 SSL
+        pushes global and local crops of different sizes through `forward_features_list` inside a
+        single step, and `patch_features` reads the grid off its input for that reason. It is also
+        the only way an anisotropic crop can be costed at all: `img_size` is typed as a single int
+        here, so `grid_size` can describe nothing but a cube, while EM volumes are routinely
+        sampled with a different extent along z.
+
+        A ragged extent is rejected rather than floored, because `PatchEmbed3D.forward` asserts
+        divisibility on all three axes and says why: volumetric crops are assembled by the caller,
+        so a size that does not tile is a configuration error, not a resolution to handle. (The 2D
+        sibling genuinely does crop, which is why only this one checks.) Flooring here would answer
+        for a forward pass that raises -- the same silent-wrong-number failure the derivation above
+        exists to avoid.
+        """
+        if len(input_shape) < SPATIAL_RANK:
+            raise ValueError(
+                f"input_shape {tuple(input_shape)} does not describe an input this model can run: "
+                f"it needs at least {SPATIAL_RANK} axes to have a patch grid, e.g. (C, D, H, W)"
+            )
+        # The spatial extent is free, per the paragraph above, but the channel count is not: the
+        # patch convolution is built for `in_chans` and would raise on anything else, so a shape
+        # naming a different one describes a forward pass this model cannot run. It is optional
+        # only in the sense that a caller may name the volume alone and assert nothing about
+        # channels; when it is named it is checked, because `patch_volume` below is linear in it
+        # and the answer would otherwise come back scaled by the ratio of the two counts, which is
+        # indistinguishable from a correct one.
+        if len(input_shape) > SPATIAL_RANK and input_shape[-SPATIAL_RANK - 1] != self.in_chans:
+            raise ValueError(
+                f"input_shape {tuple(input_shape)} does not describe an input this model can run: "
+                f"the axis before its last {SPATIAL_RANK} is the channel axis and must be the "
+                f"configured in_chans {self.in_chans}"
+            )
+        spatial = input_shape[-SPATIAL_RANK:]
+        if any(extent % self.patch_size for extent in spatial):
+            raise ValueError(
+                f"input_shape {tuple(input_shape)} does not describe an input this model can run: "
+                f"its last {SPATIAL_RANK} axes {tuple(spatial)} must each be a multiple of "
+                f"patch_size {self.patch_size}, which PatchEmbed3D requires"
+            )
+
+        grid = tuple(s // self.patch_size for s in spatial)
+        num_patches = int(math.prod(grid))
+        n = num_patches + 1 + self.n_storage_tokens
         d = self.embed_dim
         depth = len(self.blocks)
+
+        # The patch convolution sees only the patch tokens; CLS and the storage tokens are learned
+        # parameters spliced into the sequence afterwards, so `num_patches` is right here and `n`
+        # is right everywhere below.
         patch_volume = self.patch_size**SPATIAL_RANK * self.in_chans
-        hidden = int(d * self.ffn_ratio)
-        patch_proj = 2 * self.num_patches * patch_volume * d
-        per_block = 2 * (4 * n * d * d) + 2 * (2 * n * n * d) + 2 * (2 * n * d * hidden)
+        patch_proj = 2 * num_patches * patch_volume * d
+
+        # The FFN width is read off the built block rather than recomputed as `int(d * ffn_ratio)`,
+        # because that expression is only the *nominal* hidden dim: `SwiGLUFFN` runs three
+        # projections at 2/3 of it rounded up to its `align_to`, and the two coincide only when
+        # 2/3 of the nominal width is already a multiple of that alignment. It is not for narrow
+        # models -- `embed_dim=32` with `swiglu64` rounds 85 up to 128 -- and there is no way to
+        # notice from here, so the built module is the only honest source.
+        block = self.blocks[0]
+        assert isinstance(block, SelfAttentionBlock)  # nn.ModuleList erases its element type
+        mlp = block.mlp
+        if isinstance(mlp, SwiGLUFFN):
+            ffn = 2 * (3 * n * d * mlp.w1.out_features)
+        else:
+            ffn = 2 * (2 * n * d * mlp.fc1.out_features)
+
+        per_block = 2 * (4 * n * d * d) + 2 * (2 * n * n * d) + ffn
         return int(patch_proj + depth * per_block)

@@ -57,6 +57,7 @@ class ViT3D(BaseModel):
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.embed_dim = embed_dim
+        self.mlp_ratio = mlp_ratio
         self.attention_backend = attention_backend
         self.grid_size = tuple(s // p for s, p in zip(img_size, patch_size, strict=True))
 
@@ -210,10 +211,43 @@ class ViT3D(BaseModel):
         return ("embed", "encode")
 
     def flops(self, input_shape: tuple[int, ...]) -> int:
-        """Rough forward FLOPs for one sample: patch embedding, attention, and MLPs."""
+        """Rough forward FLOPs for one sample: patch embedding, attention, and MLPs.
+
+        `input_shape` is validated against the configured geometry rather than used to re-derive a
+        grid. The token count is a function of the input volume in general, but `embed` admits
+        exactly one volume -- `img_size` -- so the only shape this model can be asked about is the
+        one whose grid is already `self.grid_size`, and deriving it again would just be the same
+        arithmetic on a value that has to be equal anyway. Disagreement is a caller error, and it
+        is checked rather than assumed away because the failure is otherwise silent and this is an
+        MFU denominator: quietly answering for `img_size` when the caller asked about a different
+        volume reports a plausible utilisation for a forward pass that would have raised.
+
+        The FFN term uses `mlp_ratio`, which is what `TransformerBlock` sizes its hidden layer
+        with; a fixed 4x here would have been right only for the default and off by tens of
+        percent for every other setting, in the direction that flatters a narrow model.
+        """
+        if input_shape[-SPATIAL_RANK:] != self.img_size:
+            raise ValueError(
+                f"input_shape {tuple(input_shape)} does not describe an input this model can run: "
+                f"its last {SPATIAL_RANK} axes must be the configured img_size {self.img_size}"
+            )
+        # The channel axis is optional -- a caller naming only the volume has not asserted anything
+        # about channels, and there is nothing to check -- but when it is there it belongs to the
+        # same contract as `img_size` and is just as load-bearing: `patch_volume` is linear in
+        # `in_channels`, so costing a 3-channel shape on a 1-channel model would answer with a
+        # patch-projection term three times too small, for a tensor `embed` rejects outright. That
+        # is precisely the silent wrong integer the img_size check above exists to prevent, so
+        # leaving the channel unchecked contradicted its own rationale.
+        if len(input_shape) > SPATIAL_RANK and input_shape[-SPATIAL_RANK - 1] != self.in_channels:
+            raise ValueError(
+                f"input_shape {tuple(input_shape)} does not describe an input this model can run: "
+                f"the axis before its last {SPATIAL_RANK} is the channel axis and must be the "
+                f"configured in_channels {self.in_channels}"
+            )
         n = self.num_patches
         d = self.embed_dim
         depth = len(self.blocks)
+        hidden = int(d * self.mlp_ratio)
         patch_proj = 2 * n * self.patch_volume * d
-        per_block = 2 * (4 * n * d * d) + 2 * (2 * n * n * d) + 2 * (2 * n * d * int(d * 4.0))
+        per_block = 2 * (4 * n * d * d) + 2 * (2 * n * n * d) + 2 * (2 * n * d * hidden)
         return int(patch_proj + depth * per_block)

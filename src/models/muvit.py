@@ -342,10 +342,51 @@ class MuViT3D(BaseModel):
 
         Attention is quadratic in the *joint* sequence, so adding a level costs more than the
         tokens it contributes -- that cross-level term is the point of the architecture.
+
+        `input_shape` is validated against the configured geometry rather than used to re-derive
+        the grid, for the same reason as `ViT3D.flops`: `embed` admits exactly one input geometry,
+        so the only shape this model can be asked about is the one whose sequence length is
+        already `self.num_patches`, and re-deriving it would be the same arithmetic on a value
+        that has to come out equal anyway. Disagreement is a caller error, and it is checked
+        rather than shrugged off because the failure is otherwise silent: the answer is a bare
+        integer with nothing to cross-check it against, so a cost quoted for the configured
+        geometry when the caller asked about another one -- a forward pass that would have raised
+        -- looks exactly like a correct answer.
+
+        The check covers the level axis on top of the spatial and channel ones `ViT3D` checks,
+        because that is where a multi-scale encoder differs: levels multiply the sequence length,
+        so a caller who asks a 3-level model about a single-level sample is off by 3x in the
+        projection term and 9x in attention -- enough to reverse the comparison the number was
+        computed for.
         """
+        # The entire per-sample shape is required and compared as a unit, where `ViT3D` lets the
+        # channel axis be omitted. The difference is that MuViT has two non-spatial axes, and
+        # dropping either one makes the other unreadable: a four-axis shape is equally well
+        # (L, D, H, W) or (C, D, H, W), and counting from the end cannot separate them because the
+        # surviving axis sits exactly where the other one would. Testing only the leading axis
+        # against `num_levels`, as this did, therefore had a hole at one level or one channel:
+        # `flops((1, 16, 16, 16))` on a `levels=(1,)` model passed the level check with the value
+        # that was actually the channel -- the ViT3D-style call the check was added to catch. The
+        # axes are load-bearing in different ways (levels multiply the sequence length, channels
+        # scale `patch_volume`), so neither may be guessed, and naming all of them guesses nothing.
+        expected = (self.num_levels, self.in_channels, *self.img_size)
+        if tuple(input_shape) != expected:
+            raise ValueError(
+                f"input_shape {tuple(input_shape)} does not describe an input this model can run: "
+                f"it must be the whole per-sample shape (levels, channels, *img_size) = {expected}"
+            )
         n = self.num_patches
         d = self.embed_dim
         depth = len(self.blocks)
+        # The nominal `int(d * mlp_ratio)` rather than a width read off `self.blocks[0].mlp`, which
+        # is what the two DINOv3 encoders do. There the module is the only honest source, because
+        # `SwiGLUFFN` rounds its three projections up to an alignment and the built width is not
+        # the nominal one. `TransformerBlock` has no such freedom: it builds exactly
+        # `nn.Linear(dim, int(dim * mlp_ratio))`, with no gating, alignment or per-model override,
+        # so the two sources cannot disagree and reading the module would only obscure the closed
+        # form the pinned test is derived from. `test_flops_are_pinned_to_the_configured_mlp_ratio`
+        # asserts the built weight's shape beside the pinned count, so if the block ever does size
+        # its hidden layer differently that test fails rather than this line going quietly wrong.
         hidden = int(d * self.mlp_ratio)
         patch_proj = 2 * n * self.patch_volume * d
         per_block = 2 * (4 * n * d * d) + 2 * (2 * n * n * d) + 2 * (2 * n * d * hidden)

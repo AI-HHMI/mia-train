@@ -17,7 +17,9 @@ diagnostics when it is not.
 
 from __future__ import annotations
 
+import contextlib
 import math
+from collections.abc import Iterator
 
 import torch
 import torch.nn as nn
@@ -25,6 +27,30 @@ import torch.nn.functional as F
 
 from layers.common.attention import flash4_status
 from layers.common.batched_tokens import cat_keep_shapes, uncat_with_shapes
+
+
+@contextlib.contextmanager
+def counting_kernels(module: nn.Module) -> Iterator[None]:
+    """Route this file's attention layers through SDPA for the duration, for FLOP counting.
+
+    The twin of `layers.common.attention.counting_kernels`, which sees none of these layers: the
+    two attention implementations share `flash4_status` but not a base class, so a single sweep
+    over `_AttentionBase` silently rewires nothing on a DINOv3 model and the FLOP count comes back
+    missing its entire attention term. Each implementation owns the knowledge of how to put itself
+    on a countable kernel; `engine.mfu` enters both.
+    """
+    switched = [
+        layer
+        for layer in module.modules()
+        if isinstance(layer, SelfAttention) and layer.use_fa4
+    ]
+    for layer in switched:
+        layer.use_fa4 = False
+    try:
+        yield
+    finally:
+        for layer in switched:
+            layer.use_fa4 = True
 
 
 def rope_rotate_half(x: torch.Tensor) -> torch.Tensor:

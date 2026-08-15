@@ -30,700 +30,700 @@ samples_per_epoch: 1000
 # `resolutions` request fails here rather than silently downsampling.
 volumes:
   - name: "NISB train_100 seed0"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed0.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed0.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed1"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed1.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed1.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed2"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed2.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed2.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed3"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed3.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed3.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed4"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed4.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed4.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed5"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed5.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed5.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed6"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed6.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed6.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed7"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed7.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed7.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed8"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed8.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed8.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed9"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed9.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed9.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed10"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed10.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed10.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed11"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed11.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed11.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed12"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed12.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed12.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed13"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed13.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed13.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed14"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed14.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed14.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed15"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed15.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed15.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed16"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed16.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed16.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed17"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed17.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed17.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed18"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed18.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed18.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed19"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed19.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed19.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed20"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed20.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed20.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed21"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed21.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed21.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed22"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed22.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed22.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed23"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed23.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed23.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed24"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed24.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed24.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed25"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed25.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed25.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed26"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed26.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed26.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed27"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed27.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed27.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed28"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed28.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed28.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed29"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed29.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed29.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed30"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed30.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed30.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed31"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed31.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed31.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed32"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed32.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed32.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed33"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed33.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed33.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed34"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed34.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed34.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed35"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed35.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed35.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed36"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed36.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed36.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed37"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed37.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed37.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed38"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed38.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed38.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed39"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed39.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed39.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed40"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed40.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed40.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed41"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed41.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed41.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed42"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed42.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed42.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed43"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed43.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed43.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed44"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed44.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed44.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed45"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed45.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed45.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed46"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed46.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed46.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed47"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed47.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed47.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed48"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed48.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed48.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed49"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed49.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed49.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed50"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed50.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed50.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed51"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed51.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed51.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed52"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed52.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed52.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed53"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed53.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed53.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed54"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed54.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed54.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed55"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed55.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed55.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed56"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed56.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed56.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed57"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed57.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed57.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed58"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed58.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed58.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed59"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed59.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed59.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed60"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed60.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed60.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed61"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed61.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed61.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed62"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed62.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed62.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed63"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed63.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed63.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed64"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed64.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed64.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed65"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed65.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed65.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed66"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed66.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed66.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed67"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed67.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed67.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed68"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed68.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed68.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed69"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed69.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed69.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed70"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed70.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed70.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed71"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed71.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed71.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed72"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed72.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed72.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed73"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed73.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed73.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed74"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed74.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed74.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed75"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed75.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed75.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed76"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed76.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed76.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed77"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed77.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed77.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed78"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed78.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed78.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed79"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed79.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed79.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed80"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed80.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed80.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed81"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed81.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed81.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed82"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed82.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed82.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed83"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed83.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed83.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed84"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed84.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed84.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed85"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed85.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed85.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed86"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed86.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed86.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed87"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed87.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed87.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed88"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed88.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed88.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed89"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed89.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed89.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed90"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed90.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed90.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed91"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed91.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed91.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed92"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed92.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed92.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed93"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed93.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed93.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed94"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed94.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed94.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed95"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed95.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed95.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed96"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed96.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed96.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed97"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed97.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed97.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed98"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed98.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed98.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"
     weight: 0.01
     normalize: true
   - name: "NISB train_100 seed99"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/train_100-ngff/train/seed99.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/train_100-ngff/train/seed99.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr2"

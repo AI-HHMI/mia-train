@@ -79,11 +79,55 @@ def test_multichannel_input_changes_patch_volume():
 
 
 @pytest.mark.unit
-def test_flops_and_parameter_counts_are_positive():
+def test_parameter_counts_are_positive():
     model = _tiny()
-    assert model.flops((1, 16, 16, 16)) > 0
     assert model.num_parameters() > 0
     assert model.num_parameters(trainable_only=True) == model.num_parameters()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("mlp_ratio", "expected"), [(1.0, 475_136), (2.0, 540_672), (4.0, 671_744)]
+)
+def test_flops_are_pinned_to_the_configured_mlp_ratio(mlp_ratio: float, expected: int):
+    # Pinned absolute values, because a FLOP count that is merely positive hides an arbitrarily
+    # wrong constant -- the FFN width was hardcoded to 4x for a while and no test noticed. Closed
+    # form at the _tiny geometry (n = 8 patches, d = 32, depth = 2, patch_volume = 512,
+    # hidden = int(d * mlp_ratio)):
+    #     patch_proj = 2*n*patch_volume*d               = 262_144
+    #     per_block  = 8*n*d*d + 4*n*n*d + 4*n*d*hidden = 73_728 + 1_024*hidden
+    #     total      = patch_proj + depth*per_block     = 409_600 + 2_048*hidden
+    # 4.0 is the default and is the one case a hardcoded 4x also gets right, so it is here only to
+    # show the two agree there; 1.0 and 2.0 are what actually tie the count to the block.
+    model = _tiny(mlp_ratio=mlp_ratio)
+    assert model.flops((1, 16, 16, 16)) == expected
+    # Ties the pinned number to the module it is supposed to describe: if TransformerBlock ever
+    # sizes its hidden layer differently, this fails alongside the count rather than leaving the
+    # count silently describing a model that no longer exists.
+    hidden_weight = dict(model.named_parameters())["blocks.0.mlp.0.weight"]
+    assert tuple(hidden_weight.shape) == (int(32 * mlp_ratio), 32)
+
+
+@pytest.mark.unit
+def test_flops_reject_an_input_shape_the_model_could_not_run():
+    # flops() is an MFU denominator, so a shape `embed` would refuse must not quietly come back
+    # with the answer for img_size.
+    model = _tiny()
+    with pytest.raises(ValueError, match="configured img_size"):
+        model.flops((1, 32, 32, 32))
+
+
+@pytest.mark.unit
+def test_flops_reject_a_channel_count_the_model_could_not_run():
+    # A channel mismatch is the same silent failure as a volume mismatch and was not caught:
+    # `patch_volume` is linear in `in_channels`, so a 3-channel shape came back with the 1-channel
+    # model's number -- a third of the true patch-projection term -- for a tensor `embed` refuses.
+    model = _tiny()
+    with pytest.raises(ValueError, match="channel axis"):
+        model.flops((3, 16, 16, 16))
+    # Naming only the volume asserts nothing about channels, so there is nothing to contradict and
+    # it is costed rather than rejected; a caller is not made to invent an axis to ask a question.
+    assert model.flops((16, 16, 16)) == model.flops((1, 16, 16, 16))
 
 
 @pytest.mark.unit

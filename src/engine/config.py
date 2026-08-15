@@ -122,6 +122,15 @@ class TrainerConfig:
     # activation memory grows with the cube of the crop size.
     activation_checkpointing: bool = False
 
+    # Peak dense throughput of one GPU, in TFLOP/s, as the denominator for MFU. None looks the
+    # device up in `utils.hardware_flops`; set it explicitly for a GPU that table does not know,
+    # or to override it. Use the dense figure, not the 2:4-sparsity one vendors headline with --
+    # nothing here prunes weights, and the sparse number would halve every reported MFU.
+    peak_tflops: float | None = None
+    # Measure a step's FLOPs once at startup and report `mfu`, `tflops_per_s` and `samples_per_s`.
+    # The probe costs one extra forward/backward per run, whose gradients are discarded.
+    measure_mfu: bool = True
+
     precision: str = "fp32"
     log_every: int = 10
     checkpoint_every: int = 0
@@ -154,6 +163,8 @@ class TrainerConfig:
             )
         if self.log_every < 1:
             raise ValueError(f"log_every must be >= 1, got {self.log_every}")
+        if self.peak_tflops is not None and self.peak_tflops <= 0.0:
+            raise ValueError(f"peak_tflops must be > 0 or None, got {self.peak_tflops}")
         if not 0.0 < self.layerwise_lr_decay <= 1.0:
             raise ValueError(
                 f"layerwise_lr_decay must be in (0, 1], got {self.layerwise_lr_decay}; it is a "

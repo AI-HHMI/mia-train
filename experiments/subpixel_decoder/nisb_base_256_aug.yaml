@@ -46,7 +46,7 @@ samples_per_epoch: 1000
 
 volumes:
   - name: "NISB base seed0"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/train/seed0.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/train/seed0.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr3"
@@ -55,7 +55,7 @@ volumes:
     aug_rot: "inplane"
 
   - name: "NISB base seed1"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/train/seed1.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/train/seed1.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr3"
@@ -64,7 +64,7 @@ volumes:
     aug_rot: "inplane"
 
   - name: "NISB base seed2"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/train/seed2.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/train/seed2.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr3"
@@ -73,7 +73,7 @@ volumes:
     aug_rot: "inplane"
 
   - name: "NISB base seed3"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/train/seed3.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/train/seed3.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr3"
@@ -82,7 +82,7 @@ volumes:
     aug_rot: "inplane"
 
   - name: "NISB base seed4"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/nisb/base/train/seed4.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/legacy/nisb/base/train/seed4.zarr"
     image_key: "img"
     label_key: "labels/seg"
     zarr_version: "zarr3"

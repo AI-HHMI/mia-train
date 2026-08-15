@@ -107,8 +107,18 @@ registries never change.
   `deploy/lsf/launch_multinode.sh`.
 - **Activation checkpointing:** `[trainer].activation_checkpointing = true`. Models and
   algorithms declare which regions are worth recomputing.
-- **Augmentation:** `[augment]` adds volumetric EM augmentations -- dropped and shifted sections,
-  intensity jitter, noise -- to the training data. Applied to the training dataset only; the engine
+- **Throughput and MFU:** every run logs `mfu`, `tflops_per_s` and `samples_per_s` alongside the
+  loss. A step's FLOPs are measured once at startup with `torch.utils.flop_counter`, not derived
+  from `model.flops()`, because the backbone's forward pass is not what a step costs: `mae` encodes
+  only unmasked tokens but decodes the full grid, `dinov3` runs a no-grad teacher plus a student
+  over ten crops at two resolutions, and the segmentation heads convolve at full voxel resolution.
+  The customary `3 x flops()` is off by 2.8x too high to 5.5x too low depending on the algorithm.
+  Peak throughput comes from a per-GPU table (`src/utils/hardware_flops.py`); override it with
+  `[trainer].peak_tflops`, or set `[trainer].measure_mfu = false` to skip the probe. On an
+  untabulated GPU the utilization is omitted and the throughput rates are still reported, rather
+  than a plausible-looking wrong number being logged.
+- **Augmentation:** `[augment]` adds volumetric EM augmentations: dropped and shifted sections,
+  intensity jitter, noise, to the training data. Applied to the training dataset only; the engine
   never wraps `[val_data]`, so no setting can silently change what a validation number means.
 - **Pretrained weights:** `[init]` loads a released or earlier-run checkpoint, reports what was
   copied, inflated, skipped or unused, and refuses silently-wrong loads.

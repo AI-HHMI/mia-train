@@ -8,7 +8,8 @@ without touching the surrounding transformer.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import contextlib
+from collections.abc import Callable, Iterator
 
 import torch
 import torch.nn as nn
@@ -45,6 +46,40 @@ def flash4_status() -> tuple[bool, str]:
         return False, f"compute capability {have} is below {needed} (Hopper)"
 
     return True, ""
+
+
+@contextlib.contextmanager
+def counting_kernels(module: nn.Module) -> Iterator[None]:
+    """Route every attention layer under `module` through SDPA for the duration.
+
+    For counting FLOPs, not for training. The arithmetic of attention does not depend on which
+    kernel performs it, but `torch.utils.flop_counter` can only see arithmetic that reaches the
+    dispatcher, and FlashAttention-4 does not: `flash_attn.cute.flash_attn_func` is a plain Python
+    function wrapping a CuTeDSL kernel, not a registered torch op, so nothing reaches
+    `__torch_dispatch__`. The counter does not warn about this — it silently attributes zero FLOPs
+    to attention. Measured on an H100 at B=2, N=1024, d=768: SDPA counts 16.106 GF, matching the
+    closed form exactly, while FA4 counts 9.664 GF, which is precisely the qkv and output
+    projections with the 6.442 GF attention term missing. At long context that error is most of
+    the step.
+
+    So a counted step runs SDPA and the real steps run whatever the config chose. `backend` is
+    restored alongside the usability flag because `_attend` deliberately raises when
+    `backend="flash4"` cannot use its kernel, and that guard would fire here.
+    """
+    saved = [
+        (layer, layer.backend, layer._flash4_usable)
+        for layer in module.modules()
+        if isinstance(layer, _AttentionBase)
+    ]
+    for layer, _, _ in saved:
+        layer.backend = "sdpa"
+        layer._flash4_usable = False
+    try:
+        yield
+    finally:
+        for layer, backend, usable in saved:
+            layer.backend = backend
+            layer._flash4_usable = usable
 
 
 class _AttentionBase(nn.Module):

@@ -3,6 +3,14 @@
 Ported from the DINOv3 reference implementation. A strided convolution whose kernel equals its
 stride is exactly a per-patch linear projection, so this is the standard ViT patchifier with the
 custom fan-in-scaled `reset_parameters` DINOv3 uses in place of PyTorch's conv default.
+
+The reference's per-module `flops()` helpers are deliberately not carried over. FLOP accounting
+here is a model-level concern -- `BaseModel.flops` takes an input shape and each model counts its
+whole forward pass, patch projection included -- so a counter on this module would be a second,
+uncalled copy of one line of that arithmetic, in a different unit: the reference counts MACs where
+the models count FLOPs. Uncalled is what made them wrong. The versions that were here undercounted
+by exactly the missing 2x and unconditionally charged for a normalisation that is `nn.Identity`
+whenever `norm_layer` is None, and since nothing ever called them, nothing caught either.
 """
 
 from __future__ import annotations
@@ -83,13 +91,6 @@ class PatchEmbed(nn.Module):
             x = x.reshape(-1, H, W, self.embed_dim)  # B H W C
         return x
 
-    def flops(self) -> float:
-        Ho, Wo = self.patches_resolution
-        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
-        if self.norm is not None:
-            flops += Ho * Wo * self.embed_dim
-        return flops
-
     def reset_parameters(self) -> None:
         k = 1 / (self.in_chans * (self.patch_size[0] ** 2))
         nn.init.uniform_(self.proj.weight, -math.sqrt(k), math.sqrt(k))
@@ -159,20 +160,6 @@ class PatchEmbed3D(nn.Module):
         if not self.flatten_embedding:
             x = x.reshape(-1, D, H, W, self.embed_dim)  # B D H W E
         return x
-
-    def flops(self) -> float:
-        Do, Ho, Wo = self.patches_resolution
-        flops = (
-            Do
-            * Ho
-            * Wo
-            * self.embed_dim
-            * self.in_chans
-            * (self.patch_size[0] * self.patch_size[1] * self.patch_size[2])
-        )
-        if self.norm is not None:
-            flops += Do * Ho * Wo * self.embed_dim
-        return flops
 
     def reset_parameters(self) -> None:
         k = 1 / (self.in_chans * (self.patch_size[0] ** 3))
