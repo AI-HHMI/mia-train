@@ -59,15 +59,60 @@ class VoxelHead(nn.Sequential):
     def __init__(self, *layers: nn.Module, mode: str = "trilinear") -> None:
         super().__init__(*layers)
         self.mode = mode
+        # (in, out, device, dtype) -> the 1-D resampling matrix. A plain dict rather than a buffer:
+        # these are derived from two integers, not learned, and putting them in `state_dict` would
+        # make a checkpoint depend on which crop sizes a run happened to see.
+        self._resample: dict[tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
+
+    def _axis_matrix(
+        self, extent: int, target: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """`(target, extent)` matrix applying 1-D linear interpolation along one axis.
+
+        Built by pushing an identity through `F.interpolate` itself rather than from the
+        interpolation formula. That is the point: `align_corners`, the half-pixel offset and the
+        boundary clamping are conventions, and a hand-derived matrix that disagreed with torch's
+        on any of them would produce a head that trains perfectly well and localises boundaries
+        half a voxel off. Reading the convention out of the function being replaced cannot drift
+        from it.
+        """
+        key = (extent, target, device, dtype)
+        cached = self._resample.get(key)
+        if cached is None:
+            basis = torch.eye(extent, device=device, dtype=torch.float32).reshape(extent, 1, extent)
+            columns = F.interpolate(basis, size=target, mode="linear", align_corners=False)
+            cached = columns.squeeze(1).T.contiguous().to(dtype)
+            self._resample[key] = cached
+        return cached
 
     def forward(self, x: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:  # type: ignore[override]
-        # Left to autocast, which runs this in fp32. That is the most expensive tensor in a dense
-        # algorithm -- upsampling multiplies it by the cube of the patch size, so fp32 costs 32 GiB
-        # rather than 16 at a 512-cube -- and forcing it to bf16 was measured and rejected:
-        # accumulating eight neighbours in bf16 is 1.4x less accurate than accumulating in fp32 and
-        # rounding once, with worst-case deviations of several percent of the feature scale. Memory
-        # is bought with a bigger GPU, not with the one number the head is built to produce.
-        x = F.interpolate(x, size=size, mode=self.mode, align_corners=False)
+        # Upsampling as a matmul per axis, not `F.interpolate`. Multi-linear interpolation is
+        # separable -- each axis is resampled independently -- so this computes exactly the same
+        # function, and `tests/unit/test_dense_heads.py` pins that against `F.interpolate` to
+        # 1e-14 in double precision.
+        #
+        # The reason to write it out is the backward pass. `upsample_trilinear3d_backward` reduces
+        # the full-resolution gradient onto the patch grid with `atomicAdd`, which at a 16^3 grid
+        # over a 256-cube means ~262k contributions contending for each input cell. Measured on an
+        # H100 at exactly that shape it costs 91.5 ms per forward+backward, against 10.2 ms for
+        # the matmul form -- 9x -- because a matmul's backward is a matmul, with no contention.
+        # It also removes the reason the operation had to stay in fp32: the atomic version loses
+        # the gradient in bf16 (relative error 0.85, i.e. noise), while the matmul accumulates on
+        # tensor cores in fp32 whatever the input dtype.
+        #
+        # fp32 is kept anyway, and not only for continuity with what autocast used to do here: at
+        # this shape it is also the *faster* option, since autocast's casts on a multi-gigabyte
+        # tensor cost more than bf16 arithmetic saves (10.2 ms against 12.5 ms). So the numerics
+        # are unchanged from the interpolation this replaces, exactly, and nothing is traded.
+        with torch.autocast(x.device.type, enabled=False):
+            x = x.float()
+            for axis in reversed(range(len(size))):
+                matrix = self._axis_matrix(x.shape[-1], size[axis], x.device, x.dtype)
+                # Resample the trailing axis, then rotate it to the front of the spatial block so
+                # the next pass sees a fresh one. After `rank` passes the axes are back in order,
+                # and the volume has grown one axis at a time rather than all at once -- which
+                # also keeps the intermediates smaller than a single fused upsample would.
+                x = (x @ matrix.T).movedim(-1, 2)
         for layer in self:
             x = layer(x)
         return x

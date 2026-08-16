@@ -287,7 +287,21 @@ class Trainer:
                     # `get_last_lr()` is typed `list[float | Tensor]` because tensor LRs are legal.
                     logged["lr"] = float(self.scheduler.get_last_lr()[0])
                     now = time.perf_counter()
-                    logged["data_wait_frac"] = data_seconds / max(now - window_start, 1e-9)
+                    stalled = data_seconds / max(now - window_start, 1e-9)
+                    logged["data_wait_frac"] = stalled
+                    if dist.is_initialized():
+                        # The worst rank, not the mean, and not rank 0's own figure. Every rank
+                        # synchronizes with every other one each step, so a single rank waiting on
+                        # its input pipeline holds all of them there -- and the ranks that are
+                        # merely waiting record no stall of their own, because from their side the
+                        # time is spent inside a collective. Reported from rank 0 alone, this
+                        # metric therefore reads ~0 during precisely the steps it exists to
+                        # explain. That is not hypothetical: it is what a per-sample cost that
+                        # depends on the crop, like the affinity task's connected components,
+                        # produces.
+                        worst = torch.tensor(stalled, device=self.device)
+                        dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+                        logged["data_wait_frac_max"] = float(worst.item())
                     data_seconds, window_start = 0.0, now
                     if meter is not None:
                         # Sampled here, after `reduce_metrics` has already synchronized on
