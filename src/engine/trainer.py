@@ -81,6 +81,8 @@ class Trainer:
             rank=dp_rank,
             world_size=self.dims.dp_world_size,
             num_workers=config.num_workers,
+            persistent_workers=config.persistent_workers,
+            prefetch_factor=config.prefetch_factor,
         )
         self.val_loader = (
             val_dataset.build_dataloader(
@@ -89,6 +91,8 @@ class Trainer:
                 world_size=self.dims.dp_world_size,
                 shuffle=False,
                 num_workers=config.num_workers,
+                persistent_workers=config.persistent_workers,
+                prefetch_factor=config.prefetch_factor,
             )
             if val_dataset is not None
             else None

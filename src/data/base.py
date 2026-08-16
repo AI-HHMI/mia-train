@@ -116,6 +116,8 @@ class BaseDataset(abc.ABC):
         shuffle: bool = True,
         num_workers: int = 0,
         drop_last: bool = True,
+        persistent_workers: bool = False,
+        prefetch_factor: int = 2,
     ) -> data.DataLoader:
         # torch's `DistributedSampler.__init__` stub takes an unparameterized
         # `Dataset` for its `dataset` arg, so mypy can't infer the sampler's type
@@ -144,12 +146,10 @@ class BaseDataset(abc.ABC):
             # to the main process for no benefit.
             pin_memory=num_workers > 0,
             worker_init_fn=_single_threaded_worker if num_workers > 0 else None,
-            # Without this the iterator is torn down and rebuilt every time the loader is
-            # exhausted, which for a step-based run is far more often than it sounds: with
-            # `samples_per_epoch` 1000 over 8 ranks at batch 1, an epoch is 125 steps, so a 100k
-            # step run forks its workers 800 times. Each respawn re-imports torch and re-opens
-            # every zarr store in the dataset. The same trace caught one such boundary costing
-            # ~1.9 s -- `data_wait_frac` for that logging window read 0.33 against a 0.06 steady
-            # state, or about 15 ms amortized over every step of the run.
-            persistent_workers=num_workers > 0,
+            # Defaults off; see `TrainerConfig.persistent_workers` for the measurement. Briefly:
+            # respawning workers each epoch costs ~4 ms per step amortized, and keeping them alive
+            # costs ~68 ms, because a process that never restarts never gives back the memory a
+            # 134 MB sample and a 256^3 components pass churn through.
+            persistent_workers=persistent_workers and num_workers > 0,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
         )

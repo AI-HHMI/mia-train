@@ -276,3 +276,30 @@ def test_a_single_process_loader_gets_no_worker_hooks() -> None:
     loader = _Dataset().build_dataloader(batch_size=1, rank=0, world_size=1, num_workers=0)
     assert loader.worker_init_fn is None
     assert loader.pin_memory is False
+
+
+@pytest.mark.unit
+def test_workers_do_not_persist_across_epochs_by_default() -> None:
+    """Measured, not assumed: long-lived workers cost ~68 ms/step against ~4 ms saved.
+
+    A volumetric sample is 134 MB and the affinity components pass allocates a 256^3 array per
+    call, and a worker process that never restarts never gives that back. Recycling them at each
+    epoch boundary is the cheaper end of the trade by a wide margin -- see
+    `TrainerConfig.persistent_workers` for the numbers. Pinned here because the default reads as
+    a pessimisation to anyone who has not seen them.
+    """
+    from engine.config import TrainerConfig
+
+    assert TrainerConfig(max_steps=10, batch_size=1).persistent_workers is False
+
+    loader = _Dataset().build_dataloader(batch_size=1, rank=0, world_size=1, num_workers=2)
+    assert loader.persistent_workers is False
+    assert loader.prefetch_factor == 2
+
+
+@pytest.mark.unit
+def test_prefetch_factor_must_be_at_least_one() -> None:
+    from engine.config import TrainerConfig
+
+    with pytest.raises(ValueError, match="prefetch_factor"):
+        TrainerConfig(max_steps=10, batch_size=1, prefetch_factor=0)

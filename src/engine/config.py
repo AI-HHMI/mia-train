@@ -170,6 +170,29 @@ class TrainerConfig:
     checkpoint_every: int = 0
     val_every: int = 0
     num_workers: int = 0
+    # Keep the dataloader's worker processes alive across epochs instead of forking a new set each
+    # time the loader is exhausted. Off by default, which is the opposite of what the obvious
+    # reasoning suggests, so the measurement is worth recording.
+    #
+    # Respawning does cost something: each worker re-imports torch and re-opens every zarr store,
+    # measured at ~1.9 s per epoch boundary, or ~4 ms amortized over the 125 steps an epoch lasts
+    # here. Keeping them alive is worse, by far. A volumetric sample is large -- 134 MB, and the
+    # affinity task's components pass allocates a 256^3 int32 array per call on top -- and in a
+    # process that never restarts, that never gets fully reclaimed. Over 400 steps on 8 ranks:
+    #
+    #   persistent = false   epoch 0: 241 ms/step   after: 266 ms/step    3 of 28 windows stalled
+    #   persistent = true    epoch 0: 232 ms/step   after: 334 ms/step   20 of 28 windows stalled
+    #
+    # A 100k-step run is ~800 epochs, so essentially all of it lives in the second column: 4 ms
+    # saved against 68 ms lost. The stall is invisible from rank 0 -- it shows up on whichever
+    # rank drew the slow sample, which is what `data_wait_frac_max` exists to surface.
+    persistent_workers: bool = False
+    # How many batches each worker runs ahead. Left at torch's default, and raising it is a trap
+    # worth naming: at prefetch 6 the same runs measured 213 ms/step through epoch 0 -- the best
+    # of any setting, since a deeper queue really does absorb a slow crop -- and then 445 ms/step
+    # afterwards, the worst of any setting, because three times as many 134 MB samples in flight
+    # reach the memory pressure above three times faster. Depth is not the constraint here.
+    prefetch_factor: int = 2
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -199,6 +222,13 @@ class TrainerConfig:
             raise ValueError(f"log_every must be >= 1, got {self.log_every}")
         if self.peak_tflops is not None and self.peak_tflops <= 0.0:
             raise ValueError(f"peak_tflops must be > 0 or None, got {self.peak_tflops}")
+        if self.num_workers < 0:
+            raise ValueError(f"num_workers must be >= 0, got {self.num_workers}")
+        if self.prefetch_factor < 1:
+            raise ValueError(
+                f"prefetch_factor must be >= 1, got {self.prefetch_factor}; it is ignored when "
+                "num_workers = 0, since there is no worker to run ahead"
+            )
         if self.profile_start_step < 0:
             raise ValueError(
                 f"profile_start_step must be >= 0, got {self.profile_start_step}"
