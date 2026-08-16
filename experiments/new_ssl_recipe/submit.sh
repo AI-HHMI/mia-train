@@ -6,12 +6,20 @@
 #   bash experiments/new_ssl_recipe/submit.sh --smoke 2    # 20 steps of arm 2's stages, one GPU
 #   bash experiments/new_ssl_recipe/submit.sh --stage 2b_ssl_twophase_interp   # one stage, see below
 #
-#   1  control  : finetune interpolating 50k -> sub-pixel 50k
-#   2  two-phase: SimMIM 100k with a 10k frozen warm-up -> interpolating 50k -> sub-pixel 50k
-#   3  joint    : SimMIM 100k, no freeze            -> interpolating 50k -> sub-pixel 50k
+#   1  control  : finetune interpolating 100k -> sub-pixel 100k
+#   2  two-phase: SimMIM 200k with a 20k frozen warm-up -> interpolating 100k -> sub-pixel 100k
+#   3  joint    : SimMIM 200k, no freeze             -> interpolating 100k -> sub-pixel 100k
+#   4  joint@32 : SimMIM 100k at global batch 32     -> interpolating 100k -> sub-pixel 100k
 #
-# All three start from the released DINOv3 **ViT-B/16** checkpoint, so 2 vs 3 isolates the frozen
+# All four start from the released DINOv3 **ViT-L/16** checkpoint, so 2 vs 3 isolates the frozen
 # warm-up and 3 vs 1 isolates the SSL stage itself. See README.md.
+#
+# Arm 4 differs from the others in two ways at once and is not a drop-in comparison. It runs
+# **every** stage at global batch 32 (local 2 x 16 ranks, i.e. 2 whole nodes) where arms 1-3 run
+# global batch 8, and its SSL stage is 100k steps rather than 200k -- 3.2M samples against arm 3's
+# 1.6M. Arms 2 and 3 were stopped after their SSL stages plateaued inside ~10k steps with val loss
+# drifting up; arm 4 is the response. Because its finetune batch also differs from arm 1's, a
+# batch-32 version of arm 1 is still owed before arm 4's result can be read as "SSL helped".
 #
 # **Queue-agnostic by default.** Every stage is submitted twice, once to gpu_h100 and once to
 # gpu_h200, so it starts on whichever generation frees up first rather than waiting on one. The two
@@ -80,10 +88,26 @@ dep_of () { local d=""; for id in "$@"; do d+="${d:+ || }done($id)"; done; echo 
 
 # stage <config> <wall clock> [<predecessor experiment_name> <dependency expression>]
 # Prints the job ids of the twins it submitted.
+# Set MULTINODE=1 before a `stage` call to run it across two whole nodes instead of one. Arm 4 is
+# the only user: its stages carry `dp_shard = 16` at local batch 2, which needs 16 ranks and so
+# cannot fit the single-node `--standalone` path the other arms use. Everything else about a stage
+# -- the twin lock, PREV_CHECKPOINT resolution, the cmd script -- is identical either way.
+#
+# Two constraints that are not negotiable, both from deploy/lsf/README.md:
+#   * `*_parallel` queues allocate WHOLE nodes; a partial request there wastes the remainder and
+#     disables CPU fencing. 2 H100 nodes is `-n 192` at 96 slots each, `-app parallel-96`.
+#   * H100 and H200 sit on SEPARATE InfiniBand fabrics with no path between them, so a job must
+#     stay inside one generation. The twins still work -- each is a self-contained 2-node job on
+#     one queue -- but a single job may never span both.
+MULTINODE=${MULTINODE:-0}
+NODES=${NODES:-2}
+
 stage () {
   local config=$1 wall=$2 prev=${3:-} dep=${4:-}
   local name; name=$(basename "$config" .toml)
   local cfg="$config" prologue="" procs=$GPUS slots=$SLOTS
+  local stage_multinode=$MULTINODE
+  MULTINODE=0   # one-shot: set it immediately before each multi-node stage, never sticky
   # Names the lock, the command script, the job and its logs. Smoke runs get their own, so a
   # 20-step check submitted while the real chain is queued cannot take the real stage's lock and
   # send it home with exit 42.
@@ -94,7 +118,7 @@ stage () {
     wall=0:30; procs=1; slots=12
     cfg="$STAGE/$tag.toml"
     # `freeze_backbone_steps` is rewritten too, and not only for tidiness: the trainer rejects a
-    # config whose freeze outlasts the run, so arm 2's 10000 against max_steps 20 would abort at
+    # config whose freeze outlasts the run, so arm 2's 20000 against max_steps 20 would abort at
     # startup. 2 of 20 keeps the smoke run's 10% proportion, and exercises the unfreeze boundary.
     sed -e "s/^experiment_name = .*/experiment_name = \"$tag\"/" \
         -e 's/^max_steps = .*/max_steps = 20/' -e 's/^warmup_steps = .*/warmup_steps = 2/' \
@@ -109,8 +133,10 @@ stage () {
     local resolved="$STAGE/${tag}_resolved.toml"
     local glob="$RUNS/sslrec__${prev}_*/"
     # A smoke run resolves against its own chain rather than against a stand-in encoder the way
-    # init_comparison did: nothing of this shape exists to borrow, since every prior experiment
-    # here is ViT-L. The chain's `done()` dependency is what makes it safe -- the predecessor has
+    # init_comparison did. Borrowing one of its ViT-L encoders would now load -- this experiment is
+    # ViT-L too -- but it would test the wrong thing: a smoke run exists to check that *this*
+    # chain's own handoff works, and a borrowed checkpoint is exactly the step that would not be
+    # exercised. The chain's `done()` dependency is what makes it safe -- the predecessor has
     # written its step-20 checkpoint before this job starts.
     [[ $SMOKE -eq 1 ]] && glob="$STAGE/smoke/smoke_${prev}_*/"
     # Resolved in the job, after the predecessor has written checkpoints. Highest step chosen
@@ -131,14 +157,34 @@ sed \"s|PREV_CHECKPOINT|\${RUN}checkpoints/step_\$STEP|\" '$cfg' > '$resolved'"
     echo "$PIN"
     echo "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
     [[ -n "$prologue" ]] && echo "$prologue"
-    printf '%s --standalone --nproc_per_node=%s src/train.py --config %q %s\n' \
-      "$VENV/bin/torchrun" "$procs" "$cfg" \
-      "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--resume")"
+    if [[ ${stage_multinode:-0} -eq 1 ]]; then
+      # launch_multinode.sh reads LSB_MCPU_HOSTS itself and blaunches one torchrun per node, so
+      # this passes GPUs-per-node rather than a total. It forwards PYTHONPATH into each node's
+      # command; `$PIN` above is what sets it, and without that the pinned miao never reaches the
+      # workers and every rank dies in MiaoConfig validation before step 1.
+      printf 'MIA_TRAIN=%q VENV=%q %q/deploy/lsf/launch_multinode.sh %s %q %s\n' \
+        "$REPO" "$VENV" "$REPO" "$procs" "$cfg" \
+        "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--resume")"
+    else
+      printf '%s --standalone --nproc_per_node=%s src/train.py --config %q %s\n' \
+        "$VENV/bin/torchrun" "$procs" "$cfg" \
+        "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--resume")"
+    fi
   } > "$cmd"
 
   local ids=() q id
-  for q in "${QUEUES[@]}"; do
-    id=$(bsub -P "$PROJECT" -q "$q" -gpu "num=$procs" -n "$slots" -W "$wall" -r \
+  local queues=("${QUEUES[@]}") extra=()
+  if [[ ${stage_multinode:-0} -eq 1 ]]; then
+    # Whole-node queues, whole-node slot count, and `mode=shared` so all 8 GPUs on a node are
+    # visible to the one torchrun launched there.
+    queues=(gpu_h100_parallel gpu_h200_parallel)
+    extra=(-app "parallel-$SLOTS" -gpu "num=$procs:mode=shared")
+    slots=$((SLOTS * NODES))
+  else
+    extra=(-gpu "num=$procs")
+  fi
+  for q in "${queues[@]}"; do
+    id=$(bsub -P "$PROJECT" -q "$q" "${extra[@]}" -n "$slots" -W "$wall" -r \
       ${dep:+-w "$dep"} -J "sslrec_$tag" -cwd "$REPO" \
       -o "$LOGS/sslrec_${tag}_%J.log" -e "$LOGS/sslrec_${tag}_%J.err" \
       "bash '$CLAIM' '$STAGE/locks/$tag' '$cmd'" | jobid)
@@ -157,26 +203,37 @@ if [[ -n "$ONE_STAGE" ]]; then
   prev=${PREV_STAGE:-}
   dep=${DEPENDS_ON:-}
   [[ "$dep" =~ ^[0-9]+$ ]] && dep="done($dep)"
-  report "$ONE_STAGE" "$(stage "$cfg" "${WALL:-12:00}" "$prev" "$dep")"
+  report "$ONE_STAGE" "$(stage "$cfg" "${WALL:-20:00}" "$prev" "$dep")"
   exit 0
 fi
 
-# Wall times are init_comparison's, scaled by step count and by model: ViT-B/16 is roughly a third
-# of ViT-L/16's cost per step (half the depth, 0.56x the width), and these stages are 50k or 100k
-# rather than 150k or 100k. Every request keeps a wide margin anyway -- `--resume` means an
-# underestimate costs a requeue from the last checkpoint, not a lost run, while an overestimate
-# only makes the stage harder to backfill.
+# Wall times come from the slowest per-step rate init_comparison's own ViT-L runs measured for each
+# stage type -- 0.41 s/step interpolating (1a/2a/3b/4a spanned 0.401-0.408), 0.47 s/step sub-pixel
+# (3c/1b/2b/4b spanned 0.440-0.468), 0.17 s/step SimMIM (3a) -- times this experiment's step counts:
+# ~9.4 h for a 200k SSL stage, ~11.4 h for a 100k interpolating finetune, ~13.0 h for a 100k
+# sub-pixel one. Taking the slowest rather than the mean is the point: these spreads are node and
+# input-pipeline variation, not model differences, so a run can land anywhere in the range. Every request keeps a wide margin on that, and the margin is
+# cheap in both directions: `-r` below marks the job requeuable and `--resume` makes the requeued
+# job continue from its last checkpoint, so hitting the wall costs a requeue rather than the run,
+# while an overestimate only makes the stage harder to backfill.
 ARMS=("$@"); [[ ${#ARMS[@]} -gt 0 ]] || ARMS=(1 2 3)
 for arm in "${ARMS[@]}"; do
   case $arm in
-    1) a=$(stage "$HERE/1a_dinov3_interp.toml" 12:00); report 1a_dinov3_interp "$a"
-       b=$(stage "$HERE/1b_dinov3_subpixel.toml" 10:00 1a_dinov3_interp "$(dep_of $a)"); report 1b_dinov3_subpixel "$b" ;;
-    2) a=$(stage "$HERE/2a_ssl_twophase.toml" 12:00); report 2a_ssl_twophase "$a"
-       b=$(stage "$HERE/2b_ssl_twophase_interp.toml" 12:00 2a_ssl_twophase "$(dep_of $a)"); report 2b_ssl_twophase_interp "$b"
-       c=$(stage "$HERE/2c_ssl_twophase_subpixel.toml" 10:00 2b_ssl_twophase_interp "$(dep_of $b)"); report 2c_ssl_twophase_subpixel "$c" ;;
-    3) a=$(stage "$HERE/3a_ssl_joint.toml" 12:00); report 3a_ssl_joint "$a"
-       b=$(stage "$HERE/3b_ssl_joint_interp.toml" 12:00 3a_ssl_joint "$(dep_of $a)"); report 3b_ssl_joint_interp "$b"
-       c=$(stage "$HERE/3c_ssl_joint_subpixel.toml" 10:00 3b_ssl_joint_interp "$(dep_of $b)"); report 3c_ssl_joint_subpixel "$c" ;;
-    *) echo "unknown arm: $arm (expected 1, 2 or 3)" >&2; exit 2 ;;
+    1) a=$(stage "$HERE/1a_dinov3_interp.toml" 20:00); report 1a_dinov3_interp "$a"
+       b=$(stage "$HERE/1b_dinov3_subpixel.toml" 20:00 1a_dinov3_interp "$(dep_of $a)"); report 1b_dinov3_subpixel "$b" ;;
+    2) a=$(stage "$HERE/2a_ssl_twophase.toml" 18:00); report 2a_ssl_twophase "$a"
+       b=$(stage "$HERE/2b_ssl_twophase_interp.toml" 20:00 2a_ssl_twophase "$(dep_of $a)"); report 2b_ssl_twophase_interp "$b"
+       c=$(stage "$HERE/2c_ssl_twophase_subpixel.toml" 20:00 2b_ssl_twophase_interp "$(dep_of $b)"); report 2c_ssl_twophase_subpixel "$c" ;;
+    3) a=$(stage "$HERE/3a_ssl_joint.toml" 18:00); report 3a_ssl_joint "$a"
+       b=$(stage "$HERE/3b_ssl_joint_interp.toml" 20:00 3a_ssl_joint "$(dep_of $a)"); report 3b_ssl_joint_interp "$b"
+       c=$(stage "$HERE/3c_ssl_joint_subpixel.toml" 20:00 3b_ssl_joint_interp "$(dep_of $b)"); report 3c_ssl_joint_subpixel "$c" ;;
+    4) # Every stage of arm 4 is 2 nodes x 8 GPUs = 16 ranks at local batch 2 (global 32). The
+       # finetune stages match 4a's batch rather than arm 1's, so arm 4 is internally consistent
+       # but NOT directly comparable to arm 1 -- a batch-32 control is still owed. Walls are arm
+       # 1-3's halved and rounded up, since 16 ranks at batch 2 do 4x the samples per step.
+       MULTINODE=1; a=$(stage "$HERE/4a_ssl_joint_b32.toml" 12:00); report 4a_ssl_joint_b32 "$a"
+       MULTINODE=1; b=$(stage "$HERE/4b_ssl_b32_interp.toml" 16:00 4a_ssl_joint_b32 "$(dep_of $a)"); report 4b_ssl_b32_interp "$b"
+       MULTINODE=1; c=$(stage "$HERE/4c_ssl_b32_subpixel.toml" 16:00 4b_ssl_b32_interp "$(dep_of $b)"); report 4c_ssl_b32_subpixel "$c" ;;
+    *) echo "unknown arm: $arm (expected 1, 2, 3 or 4)" >&2; exit 2 ;;
   esac
 done

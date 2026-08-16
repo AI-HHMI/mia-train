@@ -50,6 +50,13 @@ cd '$MIA_TRAIN' || exit 1
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+# Forwarded explicitly: \`blaunch\` starts a fresh shell on every node, so anything the submitting
+# environment set is gone unless it is written into this command. PYTHONPATH is the one that
+# matters -- the NISB data configs need a pinned \`miao\` (they set \`aug_rot\`, which the default
+# build rejects outright), and single-node \`submit.sh\` pins it the same way. Without this the
+# workers die in \`MiaoConfig\` validation before the first step, which reads as a config error
+# rather than as a missing environment.
+export PYTHONPATH='${PYTHONPATH:-}'
 exec '$VENV/bin/torchrun' \
   --nnodes=$NNODES --nproc_per_node=$GPUS_PER_NODE \
   --rdzv_backend=c10d --rdzv_id=$LSB_JOBID --rdzv_endpoint=$MASTER:$PORT \

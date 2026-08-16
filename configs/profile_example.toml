@@ -1,0 +1,96 @@
+# Profiling a training step: the same NISB affinity run as `nisb_affinity_smoke.toml`, with
+# `[trainer].profile` turned on. Reach for this when `mfu` says a run is slow and you want to
+# know *what* it is slow on.
+#
+#   bsub -P <project> -q gpu_h100 -gpu "num=2" -n 24 -W 0:30 ... \
+#     torchrun --standalone --nproc_per_node=2 src/train.py --config configs/profile_example.toml
+#
+# Then, with no GUI and no port forwarding:
+#
+#   python -m engine.profiler <checkpoint_dir>/profile_example_<timestamp>
+#
+# which prints how the step divided between the input pipeline, the forward, the backward, the
+# collectives and the algorithm's own work, and names the file to open at https://ui.perfetto.dev
+# for the full timeline. See README.md, "Profiling a run".
+#
+# Nothing here changes what the model computes. Profiling is an observation of a normal run: the
+# same config with `profile = false` trains identically, step for step.
+
+experiment_name = "profile_example"
+
+[model]
+name = "vit3d"
+img_size = [64, 64, 64]
+patch_size = [8, 8, 8]
+in_channels = 1
+embed_dim = 384
+depth = 6
+num_heads = 6
+attention_backend = "auto"
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder_hidden_dim = 64
+# Left at its default deliberately. `split_disconnected` runs a connected-components pass over
+# every label crop inside the training step, and it is one of the things a trace makes visible --
+# it appears as its own `relabel_connected` row rather than being buried in the forward.
+split_disconnected = true
+
+[data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [64, 64, 64]
+samples_per_epoch = 1000
+
+[trainer]
+# Long enough to leave the profiled window behind and log a few ordinary steps after it, so the
+# `mfu` either side of the window shows what profiling cost.
+max_steps = 80
+batch_size = 2
+lr = 1.0e-4
+warmup_steps = 5
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+log_every = 10
+val_every = 0          # a validation pass inside the profiled window would distort it
+checkpoint_every = 0
+num_workers = 4
+seed = 0
+
+# ---------------------------------------------------------------------------------------------
+# The profiler. Every key below is optional and off or defaulted in an ordinary run.
+# ---------------------------------------------------------------------------------------------
+
+profile = true
+
+# Where the window sits, counted from this process's first step rather than the absolute training
+# step -- so a job resumed at step 60000 still profiles its own 50th step instead of never
+# profiling at all. The default of 50 exists to get clear of the start of a run: cuDNN picks its
+# convolution algorithms on first sight of a shape, the caching allocator is still growing, and
+# the dataloader's workers are still filling their prefetch queues. A trace of step 3 would mostly
+# describe those, none of which recur.
+profile_start_step = 50
+
+# How many steps to record. Six is enough to see the variation between steps -- which for
+# volumetric data is real, since the cost of the affinity targets depends on how many objects a
+# crop happens to contain -- while keeping the trace to a few hundred megabytes.
+profile_steps = 6
+
+# Rank 0 only by default. Set true to trace every rank, which costs a trace per rank and buys the
+# one question a single rank cannot answer: whether the ranks are balanced. A collective is only
+# as fast as its slowest participant, so a rank sitting in an all-gather may be waiting rather
+# than communicating, and telling those apart needs every rank's timeline.
+profile_all_ranks = false
+
+# Allocator activity alongside the timeline, for deciding whether activation checkpointing would
+# pay. Off here: it is a separate question from where the time goes, and it makes the trace
+# larger.
+profile_memory = false
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 2
+tp = 1

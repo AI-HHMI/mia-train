@@ -34,7 +34,7 @@
 # The resolution belongs inside the job, after the dependency has fired, which is what makes a
 # whole arm safe to submit in one go. `-r` plus `--resume` make a wall-clock overrun a requeue.
 
-experiment_name = "sslrec__3b_ssl_joint_interp"
+experiment_name = "sslrec__4b_ssl_b32_interp"
 
 [model]
 name = "dinov3_vit3d"
@@ -120,7 +120,7 @@ normalize = true
 # whether more total steps help. The two supervised stages of an arm are treated as one 200k plan
 # split in half -- see 3c's learning rate.
 max_steps = 100000
-batch_size = 1            # per rank; 8 ranks -> global batch 8, matching BANIS and every prior run
+batch_size = 2            # per rank; 16 ranks -> global batch 32, matching 4a rather than arm 1
 lr = 3.0e-4
 warmup_steps = 2000
 min_lr_ratio = 0.01       # linear to 3e-6, so a run that stops early has still annealed
@@ -144,5 +144,5 @@ seed = 0
 
 [parallelism]
 dp_replicate = 1
-dp_shard = 8
+dp_shard = 16
 tp = 1

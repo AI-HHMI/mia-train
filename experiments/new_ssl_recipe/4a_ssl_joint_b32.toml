@@ -1,34 +1,46 @@
-# Arm 3 (joint SSL) stage 1 of 3: SimMIM on the NISB training cubes from the released DINOv3
-# ViT-L/16, with the whole model training from step 0. Nothing precedes it; 3b_ssl_joint_interp
-# fine-tunes the encoder it produces, and 3c_ssl_joint_subpixel closes the arm.
+# Arm 4 (joint SSL at 4x batch) stage 1 of 3: SimMIM on the NISB training cubes from the released
+# DINOv3 ViT-L/16, whole model training from step 0. Nothing precedes it; 4b_ssl_b32_interp
+# fine-tunes the encoder it produces, and 4c_ssl_b32_subpixel closes the arm.
 #
-# This file is 2a_ssl_twophase.toml minus the freeze. Nothing else about it differs -- same
-# checkpoint, same masking, same 200k steps, same schedule, same data, same seed -- and the pair
-# is the question this experiment exists to answer: is a 2D-pretrained encoder better off sitting
-# out the first tenth of an SSL run while its inflated stem and the randomly initialised SimMIM
-# head sort themselves out, or better off adapting alongside them?
+# **Why this arm exists.** Arms 2 and 3 ran the SSL stage at global batch 8 and were stopped: both
+# converged inside ~10k steps and then sat flat, with val loss drifting *up* from ~25k (3a: 0.1011
+# at 25k -> 0.1094 at 45k). That val set is the five training cubes re-sampled, not a held-out
+# one, so the drift reads as mild overfitting to five volumes rather than as a generalisation
+# curve -- which is exactly what more samples per step should push back on. So this arm is arm 3
+# with the batch multiplied by four and the step count halved: 32 x 100k = 3.2M samples against
+# arm 3's 8 x 200k = 1.6M, in half the wall-clock steps.
 #
-# `new_ssl_recipe` runs three arms off that one checkpoint:
+# **The one thing deliberately NOT changed is the learning rate.** It stays at 3.0e-4, the rate
+# every other stage here uses. The textbook move at 4x batch is to scale it -- linearly to 1.2e-3,
+# or by sqrt to 6e-4 -- and that may well be the right call, but it would confound "does a bigger
+# batch fix the plateau" with "does a bigger learning rate". Keeping it fixed means the per-sample
+# rate is 4x lower, which is the conservative direction: if this arm still plateaus, the rate is
+# the next thing to try, and nothing about this run will have to be discounted.
 #
-#   1  DINOv3 -> interp 100k -> sub-pixel 100k                                  (no SSL at all)
-#   2  DINOv3 -> SimMIM 200k with a frozen warm-up -> interp -> sub-pixel
-#   3  DINOv3 -> SimMIM 200k joint from step 0     -> interp -> sub-pixel       (this arm)
+# **Topology.** 2 nodes x 8 GPUs = 16 ranks at local batch 2. Multi-node, unlike every other stage
+# here, so it goes to a `*_parallel` queue via deploy/lsf/launch_multinode.sh rather than through
+# submit.sh (which is `--standalone`, single-node only). H100 and H200 sit on separate InfiniBand
+# fabrics with no path between them, so the job must stay inside one generation -- one queue, not
+# a mix. Measured at 256^3 on one unsharded H100, local batch 2 peaks at 16.7 GiB of 79 (21%) and
+# runs at 0.134 s/step, so ~3.7 h of compute for 100k steps before collective overhead; FSDP
+# across 16 ranks only lowers the per-GPU figure.
 #
-# Arm 3 is also the arm that answers the coarser question: against arm 1, which never does SSL at
-# all, it says whether a 200k SimMIM stage on five cubes earns its GPU-hours.
-#
-#   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 18:00 -r -J sslrec_3a \
+#   bsub -P miaai -q gpu_h100_parallel -app parallel-96 -gpu "num=8:mode=shared" \
+#     -n 192 -W 12:00 -r -J sslrec_4a \
 #     -cwd /groups/scicompsoft/home/orhane/projects/mia-train \
-#     -o /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_3a_%J.log \
-#     "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; \
-#      export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
-#      /groups/scicompsoft/home/orhane/myvenv/bin/torchrun --standalone --nproc_per_node=8 \
-#        src/train.py --config experiments/new_ssl_recipe/3a_ssl_joint.toml --resume"
+#     -o /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_4a_%J.log \
+#     -e /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_4a_%J.err \
+#     "MIA_TRAIN=/groups/scicompsoft/home/orhane/projects/mia-train \
+#      VENV=/groups/scicompsoft/home/orhane/myvenv \
+#      /groups/scicompsoft/home/orhane/projects/mia-train/deploy/lsf/launch_multinode.sh 8 \
+#        experiments/new_ssl_recipe/4a_ssl_joint_b32.toml --resume"
 #
-# The wall clock is the same as 2a's, and not by copy-paste: a freeze does not shorten a step, so
-# the two arms cost the same. `-r` with `--resume` make an overrun a requeue rather than a loss.
+# 192 slots is 2 whole H100 nodes at 96 slots each; `*_parallel` allocates whole nodes and a
+# partial request there wastes the rest. Swap the queue for gpu_h200_parallel to run on the other
+# generation -- but never mix, per the fabric note above.
 
-experiment_name = "sslrec__3a_ssl_joint"
+
+experiment_name = "sslrec__4a_ssl_joint_b32"
 
 [model]
 name = "dinov3_vit3d"
@@ -95,8 +107,8 @@ config_path = "experiments/new_ssl_recipe/nisb_base_256_aug.yaml"
 samples_per_epoch = 32
 
 [trainer]
-max_steps = 200000
-batch_size = 1            # per rank; 8 ranks -> global batch 8, matching BANIS and every prior run
+max_steps = 100000
+batch_size = 2            # per rank; 16 ranks -> global batch 32, 4x every other stage here
 lr = 3.0e-4
 warmup_steps = 2000
 min_lr_ratio = 0.01       # linear to 3e-6, so a run that stops early has still annealed
@@ -132,5 +144,5 @@ seed = 0
 
 [parallelism]
 dp_replicate = 1
-dp_shard = 8
+dp_shard = 16
 tp = 1

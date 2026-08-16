@@ -225,13 +225,21 @@ class AffinitySegmentation(BaseAlgorithm):
         return self.decoder_out(x, tuple(size))
 
     def _targets(self, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(B, X, Y, Z) instance ids -> (affinity target, loss mask), both float/bool."""
-        if self.split_disconnected:
-            # Per sample: components must not be shared across a batch, and the ids of one crop
-            # say nothing about another's.
-            labels = torch.stack([relabel_connected(sample) for sample in labels])
-        target, mask = affinities_from_labels(labels, self.offsets, self.ignore_index)
-        return target.float(), mask
+        """(B, X, Y, Z) instance ids -> (affinity target, loss mask), both float/bool.
+
+        Annotated because this is the part of the step a FLOP counter cannot see. `mfu` scores
+        every operation here at zero -- they are comparisons, gathers and scatters, not
+        multiply-adds -- while `relabel_connected` alone runs a data-dependent number of
+        device-to-host synchronizations per sample. A trace is the only thing that shows it.
+        """
+        with torch.profiler.record_function("affinity_targets"):
+            if self.split_disconnected:
+                # Per sample: components must not be shared across a batch, and the ids of one crop
+                # say nothing about another's.
+                with torch.profiler.record_function("relabel_connected"):
+                    labels = torch.stack([relabel_connected(sample) for sample in labels])
+            target, mask = affinities_from_labels(labels, self.offsets, self.ignore_index)
+            return target.float(), mask
 
     def _step(self, batch: Any) -> dict[str, torch.Tensor]:
         if self.label_key not in batch:
@@ -250,8 +258,10 @@ class AffinitySegmentation(BaseAlgorithm):
                 f"{(volumes.shape[0], *volumes.shape[2:])})"
             )
 
-        tokens, grid = self.encoder.patch_features(volumes)
-        logits = self._decode(tokens, grid, volumes.shape[2:])
+        with torch.profiler.record_function("encoder"):
+            tokens, grid = self.encoder.patch_features(volumes)
+        with torch.profiler.record_function("decoder"):
+            logits = self._decode(tokens, grid, volumes.shape[2:])
         target, mask = self._targets(labels)
 
         # Masked mean rather than a masked tensor: the border slab each offset shifts in from has

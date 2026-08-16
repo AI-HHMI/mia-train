@@ -1,12 +1,12 @@
 # Arm 2 (two-phase SSL) stage 2 of 3: supervised affinities with the interpolating head, on the
-# encoder 2a_ssl_twophase produced. 2a -- SimMIM 100k opened with a frozen backbone -- is its only
+# encoder 2a_ssl_twophase produced. 2a -- SimMIM 200k opened with a frozen backbone -- is its only
 # predecessor; 2c_ssl_twophase_subpixel warm-starts from this stage and closes the arm.
 #
-# `new_ssl_recipe` runs three arms off one released DINOv3 ViT-B/16:
+# `new_ssl_recipe` runs three arms off one released DINOv3 ViT-L/16:
 #
-#   1  DINOv3 -> interp 50k -> sub-pixel 50k                                    (no SSL at all)
-#   2  DINOv3 -> SimMIM 100k with a frozen warm-up -> interp -> sub-pixel       (this arm)
-#   3  DINOv3 -> SimMIM 100k joint from step 0     -> interp -> sub-pixel
+#   1  DINOv3 -> interp 100k -> sub-pixel 100k                                  (no SSL at all)
+#   2  DINOv3 -> SimMIM 200k with a frozen warm-up -> interp -> sub-pixel       (this arm)
+#   3  DINOv3 -> SimMIM 200k joint from step 0     -> interp -> sub-pixel
 #
 # From here on the three arms are the same file with a different encoder loaded into it, which is
 # the only way 2 vs 3 (the frozen warm-up) and 3 vs 1 (the SSL stage itself) mean anything.
@@ -22,7 +22,7 @@
 #   sed "s|PREV_CHECKPOINT|${RUN}checkpoints/step_${STEP}|" \
 #     experiments/new_ssl_recipe/2b_ssl_twophase_interp.toml > "$OUT"
 #
-#   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 12:00 -r -J sslrec_2b \
+#   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 20:00 -r -J sslrec_2b \
 #     -cwd /groups/scicompsoft/home/orhane/projects/mia-train -w "done(<2a job id>)" \
 #     -o /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_2b_%J.log \
 #     "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; \
@@ -40,9 +40,9 @@ name = "dinov3_vit3d"
 img_size = 256            # 16^3 = 4096 tokens at patch 16
 patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
 in_chans = 1
-embed_dim = 768           # ViT-B/16: 85.7M released params, 88.2M with a 16^3 single-channel stem
-depth = 12                # init_comparison ran the same recipe at ViT-L, ~3.4x the parameters
-num_heads = 12            # head_dim 64, the same per-head width the ViT-L has
+embed_dim = 1024          # ViT-L/16: 303.2M released params, 306.6M with a 16^3 single-channel stem
+depth = 24                # the size init_comparison ran this same recipe at
+num_heads = 16            # head_dim 64, the same per-head width the aborted ViT-B attempt had
 n_storage_tokens = 4      # the released ViTs carry 4 registers
 # Neither of the next two is optional, and both are easy to lose when a config is copied: the
 # released weights carry LayerScale gains and a per-block masked key bias, and so does every
@@ -57,7 +57,7 @@ pos_embed_rope_dtype = "fp32"
 # which hands depth its own third of the rotary channels -- rearranges the very channel layout
 # the pretrained attention was fitted against. Superposition keeps the 2D layout exactly and adds
 # a gated depth angle on top, so the weights transfer and the model starts numerically identical
-# to its 2D self. By this stage the gate is no longer at its initial value: it spent 100k SimMIM
+# to its 2D self. By this stage the gate is no longer at its initial value: it spent 200k SimMIM
 # steps learning how much depth to mix in, and it arrives in the checkpoint below.
 pos_embed_rope_type = "superposition"
 
@@ -114,11 +114,11 @@ weight = 1.0
 normalize = true
 
 [trainer]
-# 50k, matching arm 1's first supervised stage exactly. The SSL stage's 100k steps are extra, and
+# 100k, matching arm 1's first supervised stage exactly. The SSL stage's 200k steps are extra, and
 # deliberately so: the question is what a fixed SSL budget adds to a fixed fine-tuning budget, not
-# whether more total steps help. The two supervised stages of an arm are treated as one 100k plan
+# whether more total steps help. The two supervised stages of an arm are treated as one 200k plan
 # split in half -- see 2c's learning rate.
-max_steps = 50000
+max_steps = 100000
 batch_size = 1            # per rank; 8 ranks -> global batch 8, matching BANIS and every prior run
 lr = 3.0e-4
 warmup_steps = 2000
@@ -133,7 +133,7 @@ grad_clip_norm = 1.0
 # neither is a knob to reintroduce quietly.
 layerwise_lr_decay = 1.0
 patch_embed_lr_mult = 1.0
-activation_checkpointing = false  # a ViT-B at 256^3 fits; recomputation is 30% compute for nothing
+activation_checkpointing = false  # a ViT-L at 256^3 fits; recomputation is 30% compute for nothing
 precision = "bf16"
 log_every = 100
 val_every = 5000

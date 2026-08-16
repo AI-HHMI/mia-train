@@ -1,21 +1,21 @@
-# Arm 1 (control) stage 1 of 2: the released DINOv3 ViT-B/16 fine-tuned straight into affinities
+# Arm 1 (control) stage 1 of 2: the released DINOv3 ViT-L/16 fine-tuned straight into affinities
 # with the interpolating head. Nothing precedes it -- this stage is where arm 1 begins -- and
 # 1b_dinov3_subpixel warm-starts from the encoder it leaves behind, which closes the arm.
 #
 # `new_ssl_recipe` runs three arms off that one checkpoint:
 #
-#   1  DINOv3 -> interp 50k -> sub-pixel 50k                            (this arm: no SSL at all)
-#   2  DINOv3 -> SimMIM 100k with a frozen warm-up -> interp -> sub-pixel
-#   3  DINOv3 -> SimMIM 100k joint from step 0     -> interp -> sub-pixel
+#   1  DINOv3 -> interp 100k -> sub-pixel 100k                          (this arm: no SSL at all)
+#   2  DINOv3 -> SimMIM 200k with a frozen warm-up -> interp -> sub-pixel
+#   3  DINOv3 -> SimMIM 200k joint from step 0     -> interp -> sub-pixel
 #
 # Arm 3 against arm 1 is what the SSL stage itself is worth; arm 2 against arm 3 is what the
 # frozen warm-up is worth. Arm 1 is the control both of those are measured against, so it has to
 # be the other arms with the SimMIM stage deleted and nothing else changed.
 #
-# The recipe is ../init_comparison/'s, with two deliberate differences: ViT-B rather than ViT-L,
-# and every arm starts from the released weights, so nothing here is ever cold.
+# The recipe is ../init_comparison/'s, at the same ViT-L, with one deliberate difference: every
+# arm starts from the released weights, so nothing here is ever cold.
 #
-#   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 12:00 -r -J sslrec_1a \
+#   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 20:00 -r -J sslrec_1a \
 #     -cwd /groups/scicompsoft/home/orhane/projects/mia-train \
 #     -o /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_1a_%J.log \
 #     "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; \
@@ -23,9 +23,9 @@
 #      /groups/scicompsoft/home/orhane/myvenv/bin/torchrun --standalone --nproc_per_node=8 \
 #        src/train.py --config experiments/new_ssl_recipe/1a_dinov3_interp.toml --resume"
 #
-# The wall clock is init_comparison's ViT-L figure scaled to this stage's step count and left
-# generous; `-r` together with `--resume` make an overrun a requeue that continues from the last
-# checkpoint rather than a lost run.
+# The wall clock is submit.sh's, which derives it from a measured 0.41 s/step at this size: about
+# 11.3 h for 100k, requested with margin. `-r` together with `--resume` make an overrun a requeue
+# that continues from the last checkpoint rather than a lost run.
 
 experiment_name = "sslrec__1a_dinov3_interp"
 
@@ -34,9 +34,9 @@ name = "dinov3_vit3d"
 img_size = 256            # 16^3 = 4096 tokens at patch 16
 patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
 in_chans = 1
-embed_dim = 768           # ViT-B/16: 85.7M released params, 88.2M with a 16^3 single-channel stem
-depth = 12                # init_comparison ran the same recipe at ViT-L, ~3.4x the parameters
-num_heads = 12            # head_dim 64, the same per-head width the ViT-L has
+embed_dim = 1024          # ViT-L/16: 303.2M released params, 306.6M with a 16^3 single-channel stem
+depth = 24                # the size init_comparison ran this same recipe at
+num_heads = 16            # head_dim 64, the same per-head width the aborted ViT-B attempt had
 n_storage_tokens = 4      # the released ViTs carry 4 registers
 # Neither of the next two is optional, and both are easy to lose when a config is copied: the
 # released weights were trained with LayerScale gains and a per-block masked key bias. A model
@@ -55,8 +55,8 @@ pos_embed_rope_dtype = "fp32"
 pos_embed_rope_type = "superposition"
 
 [init]
-path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
-inflate_2d_to_3d = true   # (768,3,16,16) -> (768,1,16,16,16): RGB averaged, spread over depth
+path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+inflate_2d_to_3d = true   # (1024,3,16,16) -> (1024,1,16,16,16): RGB averaged, spread over depth
 skip = ["rope_embed."]    # derived from `base`, not learned; 2D and 3D disagree on length
 strict = true
 
@@ -102,10 +102,10 @@ weight = 1.0
 normalize = true
 
 [trainer]
-# 50k, where init_comparison gave its phase 1 150k: six supervised stages plus two 100k SSL stages
-# have to fit alongside each other, and a ViT-B step is roughly a third of a ViT-L one. The two
-# supervised stages of an arm are treated as one 100k plan split in half -- see 1b's learning rate.
-max_steps = 50000
+# 100k, where init_comparison gave its phase 1 150k: six supervised stages plus two 200k SSL
+# stages have to fit alongside each other, which is what pays for the shorter supervised
+# budget. The two are one 200k plan split in half, not two plans -- see 1b's learning rate.
+max_steps = 100000
 batch_size = 1            # per rank; 8 ranks -> global batch 8, matching BANIS and every prior run
 lr = 3.0e-4
 warmup_steps = 2000
@@ -120,7 +120,7 @@ grad_clip_norm = 1.0
 # neither is a knob to reintroduce quietly.
 layerwise_lr_decay = 1.0
 patch_embed_lr_mult = 1.0
-activation_checkpointing = false  # a ViT-B at 256^3 fits; recomputation is 30% compute for nothing
+activation_checkpointing = false  # a ViT-L at 256^3 fits; recomputation is 30% compute for nothing
 precision = "bf16"
 log_every = 100
 val_every = 5000

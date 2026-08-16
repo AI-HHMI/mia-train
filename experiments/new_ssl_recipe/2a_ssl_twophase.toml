@@ -1,20 +1,20 @@
 # Arm 2 (two-phase SSL) stage 1 of 3: SimMIM on the NISB training cubes, starting from the
-# released DINOv3 ViT-B/16 and opening with a frozen backbone. Nothing precedes it;
+# released DINOv3 ViT-L/16 and opening with a frozen backbone. Nothing precedes it;
 # 2b_ssl_twophase_interp fine-tunes the encoder it produces, and 2c_ssl_twophase_subpixel closes
 # the arm.
 #
 # `new_ssl_recipe` runs three arms off that one checkpoint:
 #
-#   1  DINOv3 -> interp 50k -> sub-pixel 50k                                    (no SSL at all)
-#   2  DINOv3 -> SimMIM 100k with a frozen warm-up -> interp -> sub-pixel       (this arm)
-#   3  DINOv3 -> SimMIM 100k joint from step 0     -> interp -> sub-pixel
+#   1  DINOv3 -> interp 100k -> sub-pixel 100k                                  (no SSL at all)
+#   2  DINOv3 -> SimMIM 200k with a frozen warm-up -> interp -> sub-pixel       (this arm)
+#   3  DINOv3 -> SimMIM 200k joint from step 0     -> interp -> sub-pixel
 #
 # This file and 3a_ssl_joint.toml differ in exactly two keys, the two at the bottom of [trainer],
 # and that difference is the experiment's actual question: is a 2D-pretrained encoder better off
 # sitting out the first tenth of an SSL run while its stem and the SSL head sort themselves out?
 # Arm 1 answers the coarser question of whether the SSL stage earns its GPU-hours at all.
 #
-#   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 16:00 -r -J sslrec_2a \
+#   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 18:00 -r -J sslrec_2a \
 #     -cwd /groups/scicompsoft/home/orhane/projects/mia-train \
 #     -o /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_2a_%J.log \
 #     "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; \
@@ -22,8 +22,9 @@
 #      /groups/scicompsoft/home/orhane/myvenv/bin/torchrun --standalone --nproc_per_node=8 \
 #        src/train.py --config experiments/new_ssl_recipe/2a_ssl_twophase.toml --resume"
 #
-# The wall clock is init_comparison's ViT-L SimMIM figure left as is, which a ViT-B should finish
-# well inside; `-r` with `--resume` make an overrun a requeue rather than a lost run.
+# The wall clock is submit.sh's, which derives it from a measured 0.17 s/step at this size: about
+# 9.4 h for 200k, requested with margin; `-r` with `--resume` make an overrun a requeue rather
+# than a lost run.
 
 experiment_name = "sslrec__2a_ssl_twophase"
 
@@ -32,9 +33,9 @@ name = "dinov3_vit3d"
 img_size = 256            # 16^3 = 4096 tokens at patch 16
 patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
 in_chans = 1
-embed_dim = 768           # ViT-B/16: 85.7M released params, 88.2M with a 16^3 single-channel stem
-depth = 12                # init_comparison ran the same recipe at ViT-L, ~3.4x the parameters
-num_heads = 12            # head_dim 64, the same per-head width the ViT-L has
+embed_dim = 1024          # ViT-L/16: 303.2M released params, 306.6M with a 16^3 single-channel stem
+depth = 24                # the size init_comparison ran this same recipe at
+num_heads = 16            # head_dim 64, the same per-head width the aborted ViT-B attempt had
 n_storage_tokens = 4      # the released ViTs carry 4 registers
 # Neither of the next two is optional, and both are easy to lose when a config is copied: the
 # released weights were trained with LayerScale gains and a per-block masked key bias. A model
@@ -53,8 +54,8 @@ pos_embed_rope_dtype = "fp32"
 pos_embed_rope_type = "superposition"
 
 [init]
-path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
-inflate_2d_to_3d = true   # (768,3,16,16) -> (768,1,16,16,16): RGB averaged, spread over depth
+path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+inflate_2d_to_3d = true   # (1024,3,16,16) -> (1024,1,16,16,16): RGB averaged, spread over depth
 skip = ["rope_embed."]    # derived from `base`, not learned; 2D and 3D disagree on length
 strict = true
 
@@ -87,7 +88,7 @@ config_path = "experiments/new_ssl_recipe/nisb_base_256_aug.yaml"
 samples_per_epoch = 32
 
 [trainer]
-max_steps = 100000
+max_steps = 200000
 batch_size = 1            # per rank; 8 ranks -> global batch 8, matching BANIS and every prior run
 lr = 3.0e-4
 warmup_steps = 2000
@@ -103,7 +104,7 @@ grad_clip_norm = 1.0
 # only thing training for the first tenth of the run.
 layerwise_lr_decay = 1.0
 patch_embed_lr_mult = 1.0
-activation_checkpointing = false  # a ViT-B at 256^3 fits; recomputation is 30% compute for nothing
+activation_checkpointing = false  # a ViT-L at 256^3 fits; recomputation is 30% compute for nothing
 precision = "bf16"
 log_every = 100
 val_every = 5000
@@ -117,7 +118,7 @@ seed = 0
 # For these first steps every parameter of the model outside its input stem is held at the value
 # it arrived with, while the patch embedding and SimMIM's head -- a single randomly initialised
 # linear layer -- train against a fixed encoder. What that buys is a matter of what starts wrong.
-# The transformer blocks are the part that is *right*: 12 blocks of representation learned on
+# The transformer blocks are the part that is *right*: 24 blocks of representation learned on
 # 1.7B natural images, and the whole point of starting from them. The two parts that are wrong
 # are the head, which is noise, and the stem, an RGB kernel averaged and smeared over a depth
 # axis it has never seen, now reading single-channel EM. Training all three at once means the
@@ -125,14 +126,14 @@ seed = 0
 # cannot yet predict anything, using features extracted by a stem still finding its scale.
 # Holding it still lets the two wrong parts converge onto the good one instead of the reverse.
 #
-# 10k of 100k is a round 10% and is deliberately not tuned: the recipe this comes from calls the
+# 20k of 200k is a round 10% and is deliberately not tuned: the recipe this comes from calls the
 # phase short and leaves it at that, and inventing a precise number here would add a second thing
 # arm 2 differs by, which is exactly what the comparison against arm 3 cannot afford.
-freeze_backbone_steps = 10000
+freeze_backbone_steps = 20000
 # The learning rate ramps back up over this many steps once the backbone joins, so the encoder's
 # first permitted update is not a full-size one taken against a schedule that has already spent
-# 10k steps decaying. The ramp applies to every group, the head included: the head has had those
-# 10k steps to itself, and briefly slowing it too is a smaller distortion than running two
+# 20k steps decaying. The ramp applies to every group, the head included: the head has had those
+# 20k steps to itself, and briefly slowing it too is a smaller distortion than running two
 # learning-rate schedules side by side.
 #
 # None of this makes the phase cheap. The stem sits below every block, so backward still traverses

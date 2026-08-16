@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from .checkpoint import CheckpointManager
 from .config import TrainerConfig
 from .mfu import ThroughputMeter, measure_step_flops
 from .optimizer import build_lr_scheduler, build_optimizer, is_stem
+from .profiler import StepProfiler, annotate, current_rank, should_profile
 
 _AUTOCAST_DTYPES = {"bf16": torch.bfloat16}
 
@@ -224,53 +226,93 @@ class Trainer:
             meter.start()
 
         logged_at = step
-        while step < self.config.max_steps:
-            batch = move_to_device(next(batches), self.device)
-            with self._autocast():
-                # Through __call__, not training_step: `BaseAlgorithm.forward` aliases it, and
-                # plain replication only all-reduces gradients from forward hooks.
-                metrics = self.algorithm(batch)
-            metrics["loss"].backward()
+        # Host seconds spent blocked on the input pipeline since the last log, and the wall clock
+        # they are a fraction of. Reported as `data_wait_frac` on every run, not only profiled
+        # ones: it is the single number that separates "the GPU is busy and slow" from "the GPU is
+        # idle waiting for a batch", it costs two clock reads per step, and needing a trace to
+        # answer a yes/no question that cheap would be the wrong trade.
+        data_seconds = 0.0
+        window_start = time.perf_counter()
 
-            if self.config.grad_clip_norm is not None:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.algorithm.parameters(), self.config.grad_clip_norm
-                )
-                metrics["grad_norm"] = grad_norm
+        with StepProfiler(
+            self.output_dir,
+            start_step=self.config.profile_start_step,
+            active=self.config.profile_steps,
+            profile_memory=self.config.profile_memory,
+            enabled=self.config.profile
+            and should_profile(current_rank(), self.config.profile_all_ranks),
+        ) as profiler:
+            while step < self.config.max_steps:
+                # Timed on the host, with no device synchronization: what is being measured is how
+                # long this process sat in `next()` waiting for a worker to hand over a sample,
+                # which is a host-side wait by construction. Forcing a sync to "improve" it would
+                # only fold the previous step's device queue into the number.
+                wait_start = time.perf_counter()
+                with annotate("data_wait"):
+                    raw_batch = next(batches)
+                data_seconds += time.perf_counter() - wait_start
 
-            self.optimizer.step()
-            self.scheduler.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            step += 1
+                with annotate("h2d"):
+                    batch = move_to_device(raw_batch, self.device)
 
-            if backbone_frozen and step >= self.config.freeze_backbone_steps:
-                # After the step that completes the warm-up, so the boundary step is the last one
-                # trained frozen -- matching `freeze_backbone_steps` as a count of frozen steps
-                # rather than as the index of the first joint one.
-                self._set_backbone_frozen(False)
-                backbone_frozen = False
+                with annotate("forward"), self._autocast():
+                    # Through __call__, not training_step: `BaseAlgorithm.forward` aliases it, and
+                    # plain replication only all-reduces gradients from forward hooks.
+                    metrics = self.algorithm(batch)
+                with annotate("backward"):
+                    metrics["loss"].backward()
 
-            if step % self.config.log_every == 0:
-                logged = reduce_metrics(metrics)
-                # `get_last_lr()` is typed `list[float | Tensor]` because tensor LRs are legal.
-                logged["lr"] = float(self.scheduler.get_last_lr()[0])
-                if meter is not None:
-                    # Sampled here, after `reduce_metrics` has already synchronized on `.item()`,
-                    # so the window is bounded by real device work rather than by a queue depth.
-                    # The step count is measured rather than assumed to be `log_every`: resuming
-                    # mid-cadence makes the first window shorter.
-                    window = meter.window(step - logged_at)
-                    if window is not None:
-                        logged.update(window.as_metrics())
-                logged_at = step
-                self.logger.log(step, logged)
+                if self.config.grad_clip_norm is not None:
+                    with annotate("grad_clip"):
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.algorithm.parameters(), self.config.grad_clip_norm
+                        )
+                    metrics["grad_norm"] = grad_norm
 
-            if self.config.checkpoint_every and step % self.config.checkpoint_every == 0:
-                self.checkpoints.save(step)
+                with annotate("optimizer"):
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+                step += 1
 
-            if self.config.val_every and step % self.config.val_every == 0:
-                self.logger.log(step, self.validate(), prefix="val")
-                self.algorithm.train()
+                if backbone_frozen and step >= self.config.freeze_backbone_steps:
+                    # After the step that completes the warm-up, so the boundary step is the last
+                    # one trained frozen -- matching `freeze_backbone_steps` as a count of frozen
+                    # steps rather than as the index of the first joint one.
+                    self._set_backbone_frozen(False)
+                    backbone_frozen = False
+
+                if step % self.config.log_every == 0:
+                    logged = reduce_metrics(metrics)
+                    # `get_last_lr()` is typed `list[float | Tensor]` because tensor LRs are legal.
+                    logged["lr"] = float(self.scheduler.get_last_lr()[0])
+                    now = time.perf_counter()
+                    logged["data_wait_frac"] = data_seconds / max(now - window_start, 1e-9)
+                    data_seconds, window_start = 0.0, now
+                    if meter is not None:
+                        # Sampled here, after `reduce_metrics` has already synchronized on
+                        # `.item()`, so the window is bounded by real device work rather than by a
+                        # queue depth. The step count is measured rather than assumed to be
+                        # `log_every`: resuming mid-cadence makes the first window shorter.
+                        window = meter.window(step - logged_at)
+                        if window is not None:
+                            logged.update(window.as_metrics())
+                    logged_at = step
+                    self.logger.log(step, logged)
+
+                if self.config.checkpoint_every and step % self.config.checkpoint_every == 0:
+                    self.checkpoints.save(step)
+
+                if self.config.val_every and step % self.config.val_every == 0:
+                    self.logger.log(step, self.validate(), prefix="val")
+                    self.algorithm.train()
+                    # Validation runs a whole loader inside one training step's timing window, and
+                    # it is not training time. Rebasing here keeps it out of `data_wait_frac`
+                    # rather than letting one window report a fraction that describes the
+                    # validation pass.
+                    data_seconds, window_start = 0.0, time.perf_counter()
+
+                profiler.step()
 
         # Save the final state unless the last step happened to land on the cadence. Otherwise
         # finishing a run discards up to `checkpoint_every - 1` steps of training, since

@@ -109,14 +109,11 @@ registries never change.
   algorithms declare which regions are worth recomputing.
 - **Throughput and MFU:** every run logs `mfu`, `tflops_per_s` and `samples_per_s` alongside the
   loss. A step's FLOPs are measured once at startup with `torch.utils.flop_counter`, not derived
-  from `model.flops()`, because the backbone's forward pass is not what a step costs: `mae` encodes
-  only unmasked tokens but decodes the full grid, `dinov3` runs a no-grad teacher plus a student
-  over ten crops at two resolutions, and the segmentation heads convolve at full voxel resolution.
-  The customary `3 x flops()` is off by 2.8x too high to 5.5x too low depending on the algorithm.
-  Peak throughput comes from a per-GPU table (`src/utils/hardware_flops.py`); override it with
-  `[trainer].peak_tflops`, or set `[trainer].measure_mfu = false` to skip the probe. On an
-  untabulated GPU the utilization is omitted and the throughput rates are still reported, rather
-  than a plausible-looking wrong number being logged.
+  from `model.flops()`. Peak throughput comes from a per-GPU table (`src/utils/hardware_flops.py`); 
+  override it with `[trainer].peak_tflops`, or set `[trainer].measure_mfu = false` to skip the probe. 
+  On an untabulated GPU the utilization is omitted and the throughput rates are still reported.
+- **Profiling:** `[trainer].profile = true` traces a few steps and writes them to
+  `<run>/profile/`. See [Profiling a run](#profiling-a-run) below.
 - **Augmentation:** `[augment]` adds volumetric EM augmentations: dropped and shifted sections,
   intensity jitter, noise, to the training data. Applied to the training dataset only; the engine
   never wraps `[val_data]`, so no setting can silently change what a validation number means.
@@ -126,6 +123,56 @@ registries never change.
   scheduling, and rank-based weight-decay exemption. Linear or cosine LR decay after warmup.
 - **Checkpointing:** Saves PyTorch distributed checkpoint (DCP), so a run can resume under a 
   different parallelism layout than it was saved with.
+
+## Profiling a run
+
+**1. Turn it on:** Add to `[trainer]`, or copy [`configs/profile_example.toml`](configs/profile_example.toml),
+which is a small runnable run with every knob commented:
+
+```toml
+[trainer]
+profile = true              # everything below is optional
+profile_start_step = 50     # counted from this process's first step, so resumed runs still profile
+profile_steps = 6
+profile_all_ranks = false   # true to catch load imbalance between ranks
+profile_memory = false      # allocator activity, for activation-checkpointing decisions
+```
+
+Run the job exactly as usual. The profiler trace lands in `<run>/profile/`.
+
+**2. View the trace:**
+
+```bash
+python -m engine.profiler <run directory>
+```
+
+That prints where the step went:
+
+```
+  profiled steps        6
+  mean step                446.0 ms
+  GPU busy                 359.9 ms/step    81.5%
+  GPU idle                  81.6 ms/step    18.5%   <- host could not keep the device fed
+
+  --- annotated regions, device time ---
+  region                              ms/step   % step
+  forward                               199.8    44.8%
+  relabel_connected                     106.8    23.9%
+  encoder                                48.7    10.9%
+  ...
+  host blocked in cudaStreamSynchronize & co: 124.1 ms/step over 41 calls/step
+
+  --- slowest kernels ---
+  void at::native::...::upsample_trilinear3d_backward...             90.19    20.2%
+  Memcpy HtoD (Pageable -> Device)                                   21.70     4.9%
+```
+
+It accepts a run directory, its `profile/` subdirectory, or a trace file, and picks the newest
+trace it finds.
+
+**3. For the full timeline:** Open `<run>/profile/*.pt.trace.json` at
+**[ui.perfetto.dev](https://ui.perfetto.dev)** and drag the file in (it
+reads the gzipped form too). The command in step 2 prints the exact path to drag.
 
 ## Experiments
 

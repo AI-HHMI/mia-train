@@ -99,4 +99,26 @@ class BaseDataset(abc.ABC):
             sampler=sampler,
             num_workers=num_workers,
             drop_last=drop_last,
+            # A volumetric crop is large enough that how it reaches the GPU is a real cost, not a
+            # detail. At 256^3 one sample is 134 MB (a float32 image beside an int32 label), and
+            # out of pageable memory the driver cannot DMA it directly: it stages through an
+            # internal bounce buffer at roughly a fifth of the link's rate, and `.to(non_blocking=
+            # True)` silently degrades to a blocking copy because there is no way to know when a
+            # pageable page may be reused. Measured in a trace of this repo's affinity fine-tune,
+            # that copy was 21.7 ms of every 377 ms step, spent as `Memcpy HtoD (Pageable ->
+            # Device)`. Pinning makes the same transfer a direct DMA and lets it overlap the
+            # previous step's compute.
+            #
+            # Conditional on there being workers to pin in: the pinning thread only exists on the
+            # multi-process path, and asking for it with `num_workers=0` adds a synchronous copy
+            # to the main process for no benefit.
+            pin_memory=num_workers > 0,
+            # Without this the iterator is torn down and rebuilt every time the loader is
+            # exhausted, which for a step-based run is far more often than it sounds: with
+            # `samples_per_epoch` 1000 over 8 ranks at batch 1, an epoch is 125 steps, so a 100k
+            # step run forks its workers 800 times. Each respawn re-imports torch and re-opens
+            # every zarr store in the dataset. The same trace caught one such boundary costing
+            # ~1.9 s -- `data_wait_frac` for that logging window read 0.33 against a 0.06 steady
+            # state, or about 15 ms amortized over every step of the run.
+            persistent_workers=num_workers > 0,
         )

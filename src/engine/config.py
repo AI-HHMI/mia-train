@@ -131,6 +131,22 @@ class TrainerConfig:
     # The probe costs one extra forward/backward per run, whose gradients are discarded.
     measure_mfu: bool = True
 
+    # Write a torch.profiler trace of a few steps to `<run>/profile/`. Off by default: this is a
+    # diagnostic to reach for when `mfu` says a run is slow, not something every run should carry.
+    # See `engine.profiler` for what the trace does and does not record.
+    profile: bool = False
+    # Which steps to trace, counted from this process's first step rather than from the absolute
+    # training step, so a resumed job still profiles. The default skips the window where cuDNN is
+    # still choosing algorithms and the allocator is still growing, neither of which recurs.
+    profile_start_step: int = 50
+    profile_steps: int = 6
+    # Every rank, rather than rank 0 alone. Costs a trace per rank; buys the one thing a single
+    # rank cannot show, which is whether the ranks are balanced -- see `profiler.should_profile`.
+    profile_all_ranks: bool = False
+    # Record allocator activity alongside the timeline. Useful for deciding whether activation
+    # checkpointing would pay, and separable from the timing question, so it is its own switch.
+    profile_memory: bool = False
+
     # Hold the encoder fixed for this many steps while the patch embedding and the algorithm's own
     # head train against it, then unfreeze and train jointly. 0 disables it. The point is to spare
     # a pretrained encoder the gradients of a randomly initialised head: adapting a 2D checkpoint
@@ -183,6 +199,15 @@ class TrainerConfig:
             raise ValueError(f"log_every must be >= 1, got {self.log_every}")
         if self.peak_tflops is not None and self.peak_tflops <= 0.0:
             raise ValueError(f"peak_tflops must be > 0 or None, got {self.peak_tflops}")
+        if self.profile_start_step < 0:
+            raise ValueError(
+                f"profile_start_step must be >= 0, got {self.profile_start_step}"
+            )
+        if self.profile_steps < 1:
+            raise ValueError(
+                f"profile_steps must be >= 1, got {self.profile_steps}; set profile = false to "
+                "disable profiling instead"
+            )
         if self.freeze_backbone_steps < 0:
             raise ValueError(
                 f"freeze_backbone_steps must be >= 0, got {self.freeze_backbone_steps}; 0 disables"

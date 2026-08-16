@@ -2,11 +2,11 @@
 # 2b_ssl_twophase_interp leaves behind. 2b is its only predecessor and nothing follows it -- this
 # checkpoint is arm 2's answer, and the one to score against 1b and 3c.
 #
-# `new_ssl_recipe` runs three arms off one released DINOv3 ViT-B/16:
+# `new_ssl_recipe` runs three arms off one released DINOv3 ViT-L/16:
 #
-#   1  DINOv3 -> interp 50k -> sub-pixel 50k                                    (no SSL at all)
-#   2  DINOv3 -> SimMIM 100k with a frozen warm-up -> interp -> sub-pixel       (this arm)
-#   3  DINOv3 -> SimMIM 100k joint from step 0     -> interp -> sub-pixel
+#   1  DINOv3 -> interp 100k -> sub-pixel 100k                                  (no SSL at all)
+#   2  DINOv3 -> SimMIM 200k with a frozen warm-up -> interp -> sub-pixel       (this arm)
+#   3  DINOv3 -> SimMIM 200k joint from step 0     -> interp -> sub-pixel
 #
 # Identical to 1b_dinov3_subpixel and 3c_ssl_joint_subpixel except for which encoder it loads,
 # which is what makes 2 vs 3 a reading on the frozen warm-up and 3 vs 1 a reading on the SSL
@@ -23,7 +23,7 @@
 #   sed "s|PREV_CHECKPOINT|${RUN}checkpoints/step_${STEP}|" \
 #     experiments/new_ssl_recipe/2c_ssl_twophase_subpixel.toml > "$OUT"
 #
-#   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 12:00 -r -J sslrec_2c \
+#   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 20:00 -r -J sslrec_2c \
 #     -cwd /groups/scicompsoft/home/orhane/projects/mia-train -w "done(<2b job id>)" \
 #     -o /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_2c_%J.log \
 #     "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; \
@@ -41,9 +41,9 @@ name = "dinov3_vit3d"
 img_size = 256            # 16^3 = 4096 tokens at patch 16
 patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
 in_chans = 1
-embed_dim = 768           # ViT-B/16: 85.7M released params, 88.2M with a 16^3 single-channel stem
-depth = 12                # init_comparison ran the same recipe at ViT-L, ~3.4x the parameters
-num_heads = 12            # head_dim 64, the same per-head width the ViT-L has
+embed_dim = 1024          # ViT-L/16: 303.2M released params, 306.6M with a 16^3 single-channel stem
+depth = 24                # the size init_comparison ran this same recipe at
+num_heads = 16            # head_dim 64, the same per-head width the aborted ViT-B attempt had
 n_storage_tokens = 4      # the released ViTs carry 4 registers
 # Neither of the next two is optional, and both are easy to lose when a config is copied: the
 # released weights carry LayerScale gains and a per-block masked key bias, and so does every
@@ -59,7 +59,7 @@ pos_embed_rope_dtype = "fp32"
 # the pretrained attention was fitted against. Superposition keeps the 2D layout exactly and adds
 # a gated depth angle on top, so the weights transfer and the model starts numerically identical
 # to its 2D self. Two stages in, the gate is a trained parameter arriving in the checkpoint below,
-# and switching type here would discard 150k steps of what it learned about depth.
+# and switching type here would discard 300k steps of what it learned about depth.
 pos_embed_rope_type = "superposition"
 
 [init]
@@ -117,25 +117,25 @@ weight = 1.0
 normalize = true
 
 [trainer]
-max_steps = 50000
+max_steps = 100000
 batch_size = 1            # per rank; 8 ranks -> global batch 8, matching BANIS and every prior run
-# This stage continues the tail of a single 100k plan rather than restarting one of its own.
-# 1.5453e-4 is what one 100k linear schedule (peak 3e-4, warmup 2000, min_lr_ratio 0.01) reaches
-# at step 50000, and the ratio below lands this stage on that plan's 3e-6 endpoint. Restarting at
+# This stage continues the tail of a single 200k plan rather than restarting one of its own.
+# 1.53e-4 is what one 200k linear schedule (peak 3e-4, warmup 2000, min_lr_ratio 0.01) reaches at
+# step 100000, and the ratio below lands this stage on that plan's 3e-6 endpoint. Restarting at
 # the full 3e-4 would hand the encoder a rate nearly twice anything it saw in stage 2. Both
 # numbers are derived rather than copied: the same arithmetic reproduces init_comparison's
 # published 1.228e-4 / 0.0244 for its 150k + 100k split.
 #
-# The SSL stage is outside this plan on purpose. It has its own objective, its own 100k schedule
+# The SSL stage is outside this plan on purpose. It has its own objective, its own 200k schedule
 # and its own annealing, and stitching all three stages into one curve would make the supervised
 # budget differ between arm 1 and arms 2 and 3 -- the one thing this experiment holds fixed.
 #
-# Caveat inherited from init_comparison: stage 2 declares max_steps = 50000 and so anneals all the
-# way to 3e-6 before stopping, which makes the handoff 3e-6 -> 1.5453e-4 rather than genuinely
+# Caveat inherited from init_comparison: stage 2 declares max_steps = 100000 and so anneals all
+# the way to 3e-6 before stopping, which makes the handoff 3e-6 -> 1.53e-4 rather than genuinely
 # continuous. The short warmup below softens the step up.
-lr = 1.5453e-4
+lr = 1.53e-4
 warmup_steps = 500
-min_lr_ratio = 0.0194
+min_lr_ratio = 0.0196
 lr_schedule = "linear"
 weight_decay = 0.05
 grad_clip_norm = 1.0
@@ -146,7 +146,7 @@ grad_clip_norm = 1.0
 # neither is a knob to reintroduce quietly.
 layerwise_lr_decay = 1.0
 patch_embed_lr_mult = 1.0
-activation_checkpointing = false  # a ViT-B at 256^3 fits; recomputation is 30% compute for nothing
+activation_checkpointing = false  # a ViT-L at 256^3 fits; recomputation is 30% compute for nothing
 precision = "bf16"
 log_every = 100
 val_every = 5000
