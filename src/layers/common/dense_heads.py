@@ -138,6 +138,22 @@ class SubPixelHead(nn.Module):
         self.expand = conv_transpose(
             hidden, readout, kernel_size=self.patch_size, stride=self.patch_size
         )
+        if self.expand.kernel_size != self.expand.stride:
+            # `_expand_tokens` evaluates this layer as a per-token matmul, which is only the same
+            # function while stride equals kernel: that is what makes each token's output block
+            # disjoint from its neighbours', so there is no overlap to add. The line above
+            # satisfies it today, and this guards the edit that would not -- the class docstring
+            # proposes exactly one, an overlapping `kernel_size = 2 * patch_size` to widen the
+            # support across block seams. Made under that change, the matmul would quietly drop
+            # the overlap and return a different function, and the equivalence test would not
+            # notice because it builds the head through this same constructor.
+            raise ValueError(
+                f"SubPixelHead expands with kernel_size={self.expand.kernel_size} and "
+                f"stride={self.expand.stride}. They must be equal: the expansion is computed as a "
+                "per-token matmul (see _expand_tokens), which is only equivalent to the "
+                "transposed convolution when each token's block is disjoint. An overlapping "
+                "kernel needs the convolution back, and the matmul removed."
+            )
         refine: list[nn.Module] = []
         for _ in range(refine_depth):
             refine += [conv(readout, readout, kernel_size=3, padding=1), nn.GELU()]
@@ -151,6 +167,60 @@ class SubPixelHead(nn.Module):
     def set_output_bias(self, bias: float) -> None:
         """Start from a constant prediction of `bias` (a logit) rather than zero."""
         nn.init.constant_(cast(torch.Tensor, self.out.bias), bias)
+
+    def _expand_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """`self.expand`'s function, computed as a matmul instead of a transposed convolution.
+
+        Identical arithmetic, on `self.expand`'s own parameters -- the module still owns the weight
+        and the bias, is still initialised by torch, and still appears under the same names in a
+        checkpoint. Only the kernel that evaluates it changes.
+
+        It has to change because cuDNN evaluates the convolution form catastrophically badly at
+        this shape. Profiled on an H100 at a 256-cube with patch 16, the expansion cost 152 ms of
+        a 344 ms step across two kernels (`strided_dgrad_indexed` and
+        `sm80_xmma_dgrad_implicit_gemm_indexed`) -- note the `sm80`, an Ampere kernel on a Hopper
+        card, cuDNN having no tuned Hopper kernel for a 3D transposed convolution at
+        kernel == stride == 16 and falling back a generation. The arithmetic is 4096 tokens x 256
+        channels x 16 readout x 4096 kernel elements = 68.7 GMAC, or 412 GFLOP with backward,
+        which at this card's 989 TFLOP/s is 0.42 ms. Measured against that, the convolution runs
+        at roughly 0.3% of peak.
+
+        The matmul form is available only because `kernel_size == stride`, which makes the
+        expansion separable per token: each input position writes one disjoint output block and
+        nothing overlaps, so the whole layer is `(tokens, hidden) @ (hidden, readout * patch)`
+        followed by a fold. That is a dense GEMM, which the same hardware runs near peak.
+
+        The fold is the part the class docstring warns about, and the warning is right: a
+        permutation that swaps two spatial axes trains perfectly well and segments silently wrong.
+        It is not defended by care here but by `tests/unit/test_dense_heads.py`, which asserts this
+        method agrees with `self.expand` -- the convolution it replaces -- elementwise. A wrong
+        permutation fails that test rather than a downstream benchmark six weeks later.
+        """
+        batch, hidden, *grid = x.shape
+        rank = len(grid)
+        readout = self.expand.out_channels
+
+        # (B, hidden, *grid) -> (B, tokens, hidden), one row per input position.
+        tokens = x.flatten(2).transpose(1, 2)
+        # ConvTranspose weight is (in_channels, out_channels, *kernel), so flattening everything
+        # after the first axis gives (hidden, readout * prod(patch)) with the trailing axes still
+        # in (out_channel, *kernel) order -- exactly what the reshape below unpacks.
+        expanded = tokens @ self.expand.weight.reshape(hidden, -1)
+
+        # (B, *grid, readout, *patch) -> (B, readout, grid_0, patch_0, grid_1, patch_1, ...), so
+        # that each axis pairs its token index with its within-block offset before they are merged.
+        expanded = expanded.reshape(batch, *grid, readout, *self.patch_size)
+        order = [0, rank + 1]
+        for axis in range(rank):
+            order += [1 + axis, rank + 2 + axis]
+        expanded = expanded.permute(*order).reshape(
+            batch, readout, *[g * p for g, p in zip(grid, self.patch_size, strict=True)]
+        )
+
+        bias = self.expand.bias
+        if bias is not None:
+            expanded = expanded + bias.reshape(readout, *(1,) * rank)
+        return expanded
 
     def forward(self, x: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
         # `size` is checked rather than interpolated to. With kernel == stride the output is
@@ -166,6 +236,6 @@ class SubPixelHead(nn.Module):
                 "whole number of patches; use a crop divisible by the patch size."
             )
         x = self.project(x)
-        x = self.expand(x)
+        x = self._expand_tokens(x)
         x = self.refine(x)
         return self.out(x)

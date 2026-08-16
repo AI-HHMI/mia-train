@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 
@@ -188,3 +190,101 @@ def test_output_can_start_non_zero_so_a_cold_encoder_gets_gradient() -> None:
         "with zero_init_output=False the encoder-facing projection must receive gradient on the "
         "first step"
     )
+
+
+# ------------------------------------------------- the sub-pixel expansion, as a matmul
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("patch_size", [(4, 4, 4), (2, 4, 8), (8, 8), (3, 5)])
+def test_matmul_expansion_equals_the_transposed_convolution(patch_size):
+    """`_expand_tokens` must agree with the `ConvTranspose3d` it replaces, elementwise.
+
+    This is the test the class docstring asks for. The expansion was rewritten from a transposed
+    convolution to a per-token matmul plus a fold because cuDNN evaluates the convolution form at
+    ~0.3% of peak at kernel == stride == 16, and the fold is a permutation -- one that swapped two
+    spatial axes would train perfectly well and segment silently wrong. Comparing against the
+    convolution itself is what makes that failure loud.
+
+    Anisotropic and non-power-of-two patches are included deliberately: a transposed axis is
+    invisible when every axis has the same extent, which is exactly the shape the affinity configs
+    use.
+    """
+    rank = len(patch_size)
+    grid = (3, 2, 4)[:rank]
+    head = SubPixelHead(in_dim=6, patch_size=patch_size, out_channels=2, hidden=5, readout=3)
+
+    # Random rather than the initialised values: the default init is small and symmetric enough
+    # that a wrong permutation could pass on it.
+    torch.manual_seed(0)
+    with torch.no_grad():
+        head.expand.weight.normal_()
+        head.expand.bias.normal_()
+    head = head.double()
+    x = torch.randn(2, 5, *grid, dtype=torch.float64)
+
+    assert torch.allclose(head._expand_tokens(x), head.expand(x), rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.unit
+def test_matmul_expansion_places_each_token_in_its_own_block():
+    """A single non-zero token must light up exactly its own block and nothing else.
+
+    The elementwise test above would also pass if both implementations shared a wrong convention.
+    This pins the convention itself against the definition: with kernel == stride, input position
+    (i, j, k) owns output block [i*p : (i+1)*p, ...] and no other voxel.
+    """
+    patch = (2, 3, 4)
+    head = SubPixelHead(in_dim=4, patch_size=patch, out_channels=2, hidden=4, readout=1)
+    with torch.no_grad():
+        head.expand.weight.fill_(1.0)
+        head.expand.bias.zero_()
+
+    x = torch.zeros(1, 4, 2, 2, 2)
+    x[0, :, 1, 0, 1] = 1.0  # one token, all hidden channels
+    out = head._expand_tokens(x)
+
+    block = out[0, 0, 1 * patch[0]:2 * patch[0], 0:patch[1], 1 * patch[2]:2 * patch[2]]
+    assert torch.all(block != 0), "the owning block must be written"
+    total = (out != 0).sum()
+    assert int(total) == block.numel(), "no voxel outside the owning block may be touched"
+
+
+@pytest.mark.unit
+def test_expansion_parameters_keep_their_checkpoint_names_and_shapes():
+    """The rewrite must not move a single parameter, or every trained sub-pixel head is stranded.
+
+    `self.expand` stays an `nn.ConvTranspose3d` precisely so this holds; only the forward changed.
+    """
+    head = SubPixelHead(in_dim=8, patch_size=(4, 4, 4), out_channels=3, hidden=6, readout=2)
+    state = head.state_dict()
+    assert state["expand.weight"].shape == (6, 2, 4, 4, 4)  # (hidden, readout, *patch)
+    assert state["expand.bias"].shape == (2,)
+
+
+@pytest.mark.unit
+def test_an_overlapping_expansion_is_refused_rather_than_silently_wrong():
+    """The matmul is only the transposed convolution while the blocks are disjoint.
+
+    Guards the one change the class docstring proposes -- an overlapping `kernel_size =
+    2 * patch_size` to widen support across seams. Under it the matmul would drop the overlap and
+    compute a different function, and the equivalence test would miss it, since that test builds
+    the head through the constructor being patched.
+    """
+    import torch.nn as nn
+
+    from layers.common import dense_heads
+
+    class _Overlapping(nn.ConvTranspose3d):
+        """The docstring's proposal: kernel twice the patch, stride still the patch."""
+
+        def __init__(self, in_ch: int, out_ch: int, kernel_size: tuple[int, ...], stride: Any):
+            widened = (2 * kernel_size[0], 2 * kernel_size[1], 2 * kernel_size[2])
+            super().__init__(in_ch, out_ch, kernel_size=widened, stride=stride)
+
+    dense_heads.CONV_TRANSPOSE[3] = _Overlapping
+    try:
+        with pytest.raises(ValueError, match="disjoint"):
+            SubPixelHead(in_dim=4, patch_size=(4, 4, 4), out_channels=2, hidden=4, readout=2)
+    finally:
+        dense_heads.CONV_TRANSPOSE[3] = nn.ConvTranspose3d
