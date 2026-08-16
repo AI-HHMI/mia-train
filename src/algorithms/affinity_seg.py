@@ -27,8 +27,10 @@ from models.base import BaseModel
 
 from .affinity.targets import (
     LONG_RANGE,
+    SplitDisconnectedLabels,
     affinities_from_labels,
     affinity_offsets,
+    cc3d_available,
     relabel_connected,
 )
 from .base import BaseAlgorithm
@@ -82,6 +84,11 @@ class AffinitySegmentation(BaseAlgorithm):
         self.offsets = affinity_offsets(SPATIAL_RANK, long_range)
         self.decoder_kind = decoder
         self.encoder = model
+        # Set by `sample_transform` when the engine takes the connected-components pass off this
+        # algorithm's hands and into the dataloader's workers. Until then `_targets` does it
+        # itself, so an algorithm driven without the engine -- a test, a notebook -- still
+        # produces split targets rather than silently unsplit ones.
+        self._split_delegated = False
 
         # Patch tokens -> voxel-resolution affinity logits, by one of two routes.
         #
@@ -127,6 +134,30 @@ class AffinitySegmentation(BaseAlgorithm):
                 nn.Conv3d(decoder_hidden_dim, len(self.offsets), kernel_size=1),
                 mode="trilinear",
             )
+
+    def sample_transform(self) -> SplitDisconnectedLabels | None:
+        """Hand the connected-components pass to the dataloader's workers, when it can be.
+
+        `None` -- keeping the work on the training device -- in the two cases where it cannot:
+        when `split_disconnected` is off and there is no work to do at all, and when the optional
+        `affinity` extra is not installed. The second is a fallback rather than an error because
+        the device path is *correct*, only slow: making a missing optional dependency break every
+        existing affinity config would be a worse trade than running them at the speed they
+        already run at. It says so rather than degrading in silence, since the symptom otherwise
+        is a run that is 40% slower than an identical one elsewhere for no visible reason.
+        """
+        if not self.split_disconnected:
+            return None
+        if not cc3d_available():
+            print(
+                "[affinity] splitting disconnected components on the training device: cc3d is "
+                "not installed. This costs ~107 ms per step at 256^3 and reports as zero FLOPs, "
+                "so `mfu` will understate the run. Install it with: pip install -e '.[affinity]'",
+                flush=True,
+            )
+            return None
+        self._split_delegated = True
+        return SplitDisconnectedLabels(self.label_key)
 
     def checkpointable_modules(self) -> tuple[nn.Module, ...]:
         """The full-resolution half of the head, which is where this algorithm's memory goes.
@@ -233,7 +264,7 @@ class AffinitySegmentation(BaseAlgorithm):
         device-to-host synchronizations per sample. A trace is the only thing that shows it.
         """
         with torch.profiler.record_function("affinity_targets"):
-            if self.split_disconnected:
+            if self.split_disconnected and not self._split_delegated:
                 # Per sample: components must not be shared across a batch, and the ids of one crop
                 # say nothing about another's.
                 with torch.profiler.record_function("relabel_connected"):

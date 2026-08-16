@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from data.augment import AugmentedDataset, VolumeAugmentation
+from data.augment import TransformedDataset, VolumeAugmentation
 from engine.config import AugmentConfig
 
 SHAPE = (1, 1, 8, 10, 12)   # l, c, x, y, z -- deliberately non-cubic
@@ -141,7 +141,8 @@ def test_wrapper_applies_the_transform_and_preserves_length() -> None:
         def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
             return {"img": torch.zeros(SHAPE)}
 
-    wrapped = AugmentedDataset(_Source(), VolumeAugmentation(intensity=True, add_intensity=1.0))
+    augmentation = VolumeAugmentation(intensity=True, add_intensity=1.0)
+    wrapped = TransformedDataset(_Source(), (augmentation,))
     assert len(wrapped) == 3
     torch.manual_seed(0)
     assert any(not torch.equal(wrapped[i]["img"], torch.zeros(SHAPE)) for i in range(3))

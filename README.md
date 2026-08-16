@@ -11,9 +11,15 @@ capabilities without touching the core (see [Installing](#installing)).
 
 ```bash
 pip install -e .                    # core
+pip install -e '.[affinity]'        # + cc3d, for the affinity instance-segmentation task
 pip install -e '.[cellmap]'         # + HuggingFace datasets, for the CellMap tasks
 pip install -e '.[dev]'             # + pytest, ruff, mypy
 ```
+
+`affinity` is worth installing before any serious `affinity_seg` run. Without it the algorithm
+still trains, and to the same targets, but it splits disconnected label components on the training
+device instead of in the dataloader's workers — measured at 107 ms of every 377 ms step at 256³.
+A run that falls back says so on startup.
 
 Machine-local paths (dataset roots, checkpoint directory, venv, scheduler project) live in
 `configs/cluster/active.toml` (untracked), which can be created by copying 
@@ -114,6 +120,12 @@ registries never change.
   On an untabulated GPU the utilization is omitted and the throughput rates are still reported.
 - **Profiling:** `[trainer].profile = true` traces a few steps and writes them to
   `<run>/profile/`. See [Profiling a run](#profiling-a-run) below.
+- **Work in the dataloader's workers:** an algorithm may declare per-sample preprocessing via
+  `BaseAlgorithm.sample_transform()`, and the engine attaches it to the training *and* validation
+  datasets — unlike `[augment]`, since this builds targets rather than perturbing inputs. It is
+  for work that depends only on one sample and would otherwise sit between the batch arriving and
+  the loss. `affinity_seg` uses it for the connected-components pass over its label crop, which
+  needs the `affinity` extra; the profiler section below is how that was found.
 - **Augmentation:** `[augment]` adds volumetric EM augmentations: dropped and shifted sections,
   intensity jitter, noise, to the training data. Applied to the training dataset only; the engine
   never wraps `[val_data]`, so no setting can silently change what a validation number means.

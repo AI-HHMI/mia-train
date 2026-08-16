@@ -163,15 +163,29 @@ class VolumeAugmentation:
         return sample
 
 
-class AugmentedDataset(data.Dataset):
-    """A map-style dataset with a transform applied to each sample as it is read."""
+class TransformedDataset(data.Dataset):
+    """A map-style dataset with transforms applied to each sample as it is read, in order.
 
-    def __init__(self, source: data.Dataset, transform: VolumeAugmentation) -> None:
+    Order is the order they were attached, and it matters: augmentation comes first, and anything
+    deriving structure from the labels comes after. `_shift_slices` moves whole sections of the
+    image *and* its labels, which can sever an object that was connected before -- so a
+    connected-components pass run before augmentation would describe a volume that no longer
+    exists.
+
+    Everything here runs inside the dataloader's worker processes, which is the point: work placed
+    here costs no GPU time and parallelises over `num_workers`, where the same work on the training
+    device would sit on the critical path between the batch arriving and the loss.
+    """
+
+    def __init__(self, source: data.Dataset, transforms: tuple[Any, ...]) -> None:
         self.source = source
-        self.transform = transform
+        self.transforms = transforms
 
     def __len__(self) -> int:
         return len(self.source)  # type: ignore[arg-type]
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        return self.transform(self.source[index])
+        sample = self.source[index]
+        for transform in self.transforms:
+            sample = transform(sample)
+        return sample

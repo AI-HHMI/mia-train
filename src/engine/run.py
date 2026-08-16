@@ -220,6 +220,22 @@ def build_trainer(
     algorithm = AlgorithmRegistry.build(
         config.algorithm.name, model, train_dataset, **config.algorithm.kwargs
     )
+    # After the algorithm exists, because only it knows what it needs, and before the Trainer
+    # builds its dataloaders, because `attach_transform` refuses a dataset already materialised.
+    #
+    # Both datasets, unlike `[augment]` above. This is target construction rather than
+    # augmentation: a validation loss computed against targets built a different way from the
+    # training ones is not comparable to them, and the difference would show up as a mysterious
+    # train/val gap rather than as an error.
+    sample_transform = algorithm.sample_transform()
+    if sample_transform is not None:
+        for dataset in (train_dataset, val_dataset):
+            if dataset is not None:
+                dataset.attach_transform(sample_transform)
+        print(
+            f"[data] {type(sample_transform).__name__} runs in the dataloader workers",
+            flush=True,
+        )
     return Trainer(
         algorithm=algorithm,
         train_dataset=train_dataset,

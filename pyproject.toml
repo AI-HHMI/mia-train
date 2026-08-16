@@ -16,6 +16,13 @@ cellmap = [
     "datasets>=2.0",
     "pillow>=9.0",
 ]
+# Connected-components for the affinity task, computed in the dataloader's workers. Optional
+# because `affinity_seg` is correct without it -- it falls back to the torch implementation in
+# `algorithms/affinity/targets.py`, which runs on the training device -- but that fallback costs
+# roughly 107 ms of every 377 ms step at 256^3, so a serious affinity run wants this installed.
+affinity = [
+    "connected-components-3d>=3.0",
+]
 dev = [
     "pytest>=7.0",
     "ruff>=0.4",

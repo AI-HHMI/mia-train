@@ -11,6 +11,9 @@ their own failure modes, and they are far easier to test directly than through a
 
 from __future__ import annotations
 
+import importlib.util
+from typing import Any
+
 import torch
 
 # The NISB baseline's six offsets, in the order it emits them: three short-range (nearest
@@ -103,6 +106,80 @@ def relabel_connected(labels: torch.Tensor) -> torch.Tensor:
     # Dense 1..K ids, so downstream code can assume small numbers, with non-objects restored.
     _, dense = torch.unique(parent.view(spatial_shape), return_inverse=True)
     return torch.where(foreground, dense.reshape(spatial_shape) + 1, labels)
+
+
+def cc3d_available() -> bool:
+    """Whether the optional `affinity` extra is installed (`pip install -e '.[affinity]'`)."""
+    return importlib.util.find_spec("cc3d") is not None
+
+
+def relabel_connected_cc3d(labels: torch.Tensor) -> torch.Tensor:
+    """`relabel_connected`, computed by `cc3d` on the CPU. Same partition, ~50x faster.
+
+    The two are interchangeable by construction and are pinned as such in
+    `tests/unit/test_affinities.py`: this returns different *numbers* -- neither function promises
+    particular ids -- but the same grouping of voxels into components, which is all
+    `affinities_from_labels` reads, since it only ever evaluates `a == b` and `a > 0`.
+
+    Why a second implementation exists at all. The torch version is written to run wherever its
+    input already is, and on the training device that turns out to be the wrong place: it is an
+    iterative algorithm whose termination is data-dependent, so each round ends in a
+    `torch.equal` that blocks the host until the device drains. Measured on a real 256^3 NISB
+    crop it runs 5-6 hooking rounds of 5 pointer-jumping passes each -- 30-34 blocking
+    synchronizations -- over an adjacency list of 36-42M edges, costing 107 ms of every 377 ms
+    training step and counting as zero FLOPs, which is most of why that run reports 6% MFU.
+    `cc3d` does the same work in ~98 ms of *worker* CPU, off the critical path.
+
+    On the same crops the torch version needs 4.4-6.4 s on the CPU, so this is not a matter of
+    moving the existing implementation to the host: a union-find in C is what makes the worker
+    placement viable at all, and that is the whole reason for the dependency.
+
+    Background (0) and ignore (negative ids) pass through untouched, as they must. `cc3d` has no
+    negative label space, so ignore voxels are masked to background before the pass and restored
+    after; the mask is what keeps them from being absorbed into a neighbouring component.
+    """
+    import cc3d  # imported here: the `affinity` extra is optional, see `cc3d_available`
+    import numpy as np
+
+    array = labels.detach().cpu().numpy()
+    foreground = array > 0
+    # `+ 1` so component ids start at 1: cc3d numbers from 0 for background, and a 0 here would
+    # read as background to `affinities_from_labels`, which treats it as affine to nothing.
+    components = cc3d.connected_components(np.where(foreground, array, 0), connectivity=6)
+    merged = np.where(foreground, components.astype(np.int64) + 1, array.astype(np.int64))
+    return torch.from_numpy(merged).to(labels.device)
+
+
+class SplitDisconnectedLabels:
+    """Replace a sample's label crop with one whose components are split, in a worker process.
+
+    A callable class rather than a closure because `DataLoader` workers are forked from a pickled
+    copy of the dataset, and a closure over an algorithm would drag the whole model into every
+    worker. This holds a key and nothing else.
+
+    Operates on one *sample*, before collation, so the label carries its scale-level axis and no
+    batch axis -- `(L, X, Y, Z)`. Levels are handled one at a time because connectivity is a
+    property of a volume and levels are not pixel-aligned, so treating the level axis as spatial
+    would connect components across resolutions.
+    """
+
+    def __init__(self, label_key: str = "label") -> None:
+        self.label_key = label_key
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        if self.label_key not in sample:
+            raise KeyError(
+                f"no {self.label_key!r} in the sample, which carries {sorted(sample)}; the "
+                "affinity algorithm asked for its labels to be split into connected components "
+                "in the dataloader, and silently skipping that would train it on targets that "
+                "join pieces of an object the crop shows as separate"
+            )
+        labels = sample[self.label_key]
+        sample = dict(sample)
+        sample[self.label_key] = torch.stack(
+            [relabel_connected_cc3d(level) for level in labels]
+        ).to(labels.dtype)
+        return sample
 
 
 def _adjacency(

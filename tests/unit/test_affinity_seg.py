@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 import torch
 
+from algorithms.affinity.targets import cc3d_available
 from algorithms.affinity_seg import AffinitySegmentation
 from algorithms.registry import AlgorithmRegistry
 from layers.common.dense_heads import VoxelHead
@@ -272,3 +273,74 @@ def test_interpolate_stays_the_default():
 def test_unknown_decoder_is_rejected():
     with pytest.raises(ValueError, match="decoder must be one of"):
         _algorithm(decoder="transposed")
+
+
+# ---------------------------------------------------- delegating the split to the dataloader
+
+
+@pytest.mark.unit
+def test_no_sample_transform_when_splitting_is_off():
+    assert _algorithm(split_disconnected=False).sample_transform() is None
+
+
+def _reentering_labels() -> torch.Tensor:
+    """(B, L, X, Y, Z) holding one id in two runs 4 voxels apart -- exactly `long_range` here.
+
+    The gap is the point: `_algorithm` uses `long_range=4`, so the (4, 0, 0) offset relates x=0
+    to x=4, which carry the same id on disk but belong to different components inside the crop.
+    That one affinity channel is where splitting is visible and everything else is unchanged.
+    """
+    labels = torch.zeros(1, 1, CROP, 1, 1, dtype=torch.long)
+    labels[0, 0, 0:2] = 5
+    labels[0, 0, 4:6] = 5
+    return labels
+
+
+@pytest.mark.unit
+def test_the_device_path_still_splits_when_nothing_was_delegated():
+    """An algorithm driven without the engine must not silently produce unsplit targets.
+
+    `sample_transform` is what hands the work to the workers, and an algorithm nobody asked for
+    one is still responsible for doing it. A test or a notebook that builds this class directly
+    would otherwise train against targets joining pieces the crop shows as separate.
+    """
+    algorithm = _algorithm(split_disconnected=True)
+    assert algorithm._split_delegated is False
+
+    target, _ = algorithm._targets(algorithm._prepare_labels(_reentering_labels()))
+    long_range_x = algorithm.offsets.index((4, 0, 0))
+    assert target[0, long_range_x, 0, 0, 0] == 0.0, "the two runs must not be one object"
+
+
+@pytest.mark.unit
+def test_an_unsplit_run_would_call_them_one_object():
+    """The control for the test above: without splitting, that same affinity is positive.
+
+    Without it, the assertion above would pass just as well against a target that is zero for an
+    unrelated reason.
+    """
+    algorithm = _algorithm(split_disconnected=False)
+    target, _ = algorithm._targets(algorithm._prepare_labels(_reentering_labels()))
+    long_range_x = algorithm.offsets.index((4, 0, 0))
+    assert target[0, long_range_x, 0, 0, 0] == 1.0
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not cc3d_available(), reason="needs the 'affinity' extra (cc3d)")
+def test_delegating_stops_the_algorithm_doing_it_twice(monkeypatch: pytest.MonkeyPatch):
+    """Once delegated, `_targets` must not repeat the pass -- that was the entire point.
+
+    Patched on `algorithms.affinity_seg`, not on the module that defines it: the algorithm does
+    `from .affinity.targets import relabel_connected`, which binds the name in its own namespace
+    at import, so patching the definition site would leave the call site untouched and the spy
+    would never fire.
+    """
+    algorithm = _algorithm(split_disconnected=True)
+    assert algorithm.sample_transform() is not None
+    assert algorithm._split_delegated is True
+
+    def fail(*args: Any, **kwargs: Any):
+        raise AssertionError("the device-side split ran even though the workers had it")
+
+    monkeypatch.setattr("algorithms.affinity_seg.relabel_connected", fail)
+    algorithm._targets(algorithm._prepare_labels(_reentering_labels()))

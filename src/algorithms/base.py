@@ -31,6 +31,27 @@ class BaseAlgorithm(nn.Module, abc.ABC):
     def validation_step(self, batch: Any) -> dict[str, torch.Tensor]:
         """Run one validation iteration; returns logged metrics for this batch."""
 
+    def sample_transform(self) -> Any | None:
+        """Per-sample preprocessing this algorithm needs, to run in the dataloader's workers.
+
+        `None` for most strategies. A strategy answers with a callable when it derives something
+        from a sample that is expensive, depends only on that sample, and would otherwise sit on
+        the critical path between the batch arriving and the loss -- affinity prediction's
+        connected-components pass over the label crop being the case this exists for. Measured
+        there: 107 ms of every 377 ms step on the training device, against ~98 ms in a worker
+        where six of them run concurrently against a 2.5 samples/s demand.
+
+        The engine attaches the result to the training *and* validation datasets, which is what
+        separates this from `[augment]`: augmentation deliberately never touches validation,
+        because it changes what a validation number means. This is not augmentation -- it is part
+        of constructing the target, and train and validation must construct targets the same way
+        or their losses are not comparable.
+
+        Returning a callable is a promise that the algorithm no longer does this work itself, so a
+        strategy must decide once, at construction, rather than per call.
+        """
+        return None
+
     def checkpointable_modules(self) -> tuple[nn.Module, ...]:
         """Submodules of the *strategy* worth recomputing in backward, beside the model's own.
 
