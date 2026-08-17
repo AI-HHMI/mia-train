@@ -1,56 +1,72 @@
-"""Volumetric augmentations for electron-microscopy training data.
+"""Turning an `[augment]` section into one callable, from `miao.augment`'s primitives.
 
-These reproduce the augmentation recipe the BANIS NISB baselines train with, which is where the
-specific operations and their default magnitudes come from. Two of them model artefacts particular
-to serial-section EM rather than generic image noise:
+The operations themselves live in `miao`, which is where an augmentation belongs: it transforms a
+sample and knows nothing about models, losses or parallelism. What is here is the part `miao`
+deliberately does not take on -- composition. Its functions are pure, ungated and single-purpose
+by design, and it declined to grow a config language for assembling them, on the grounds that a
+recipe is imperative code and YAML is a poor place to write imperative code. So the recipe lives
+in whatever consumes miao, and for this repo that is here.
 
-  * **Dropped sections.** A section can be lost or unusable, leaving a blank plane through the
-    volume. The label is deliberately *not* blanked with it: the neuron still passes through, and
-    the model has to carry an object across the gap rather than treat it as a boundary.
-  * **Section shift.** Sections are imaged separately and aligned afterwards, so alignment is
-    imperfect and a plane can sit offset from its neighbours.
+Three decisions this file owns, none of which the config states:
 
-The reference implementation shifts the image and leaves the labels in place, which desynchronises
-them by up to `shift_magnitude` voxels. Here both move together: an image-only shift trains the
-model against targets that no longer describe the image it is shown, and boundary localisation is
-the first thing that costs. That is a deliberate divergence from the reference.
+  * **Order.** Geometric operations run first and receive image and labels together, so they stay
+    registered; photometric ones run last and receive only the image. Section drops sit with the
+    photometric group because they are image-only, though they model an artefact rather than a
+    photometric effect.
+  * **Gating.** Each operation sits behind its own coin flip at `APPLY_PROB`, which is the BANIS
+    reference's structure: a per-section probability of 0.05 therefore reaches roughly 2.5% of
+    sections overall, so the reference's numbers can be used here as written. miao's functions are
+    ungated, so this is the only place that can be expressed.
+  * **Axis layouts.** `miao`'s geometric functions need the position of z/y/x in each tensor they
+    are given, and an image and its labels do not agree on that under every `output_axes` -- a
+    label carries no channel axis, so a channel-last layout puts the image's spatial axes one
+    position earlier. Getting this wrong does not raise; it rotates or rolls the two apart. The
+    dataset already declares its layout, so the offsets are derived from it rather than configured.
 
-Magnitudes are meaningful only against a known intensity range. Both this repo and the reference
-present images in [0, 1], so the reference defaults transfer unchanged -- note that
-`noise_scale = 0.5` is severe, a standard deviation of up to half the dynamic range, and is
-applied to only half of samples.
-
-Everything runs on the sample, inside the dataloader's workers, so it costs no GPU time and
-parallelises over `num_workers`. Randomness comes from torch's global generator, which
-`DataLoader` already seeds differently per worker and per epoch.
+Randomness comes from the global `numpy` generator, which `DataLoader` reseeds per worker and per
+epoch. `miao`'s functions take the generator as an argument, and this is the choice that gets
+multi-worker streams right without a `worker_init_fn`: a `default_rng()` held on this object would
+be inherited by fork and every worker would draw the identical stream.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import torch
-import torch.utils.data as data
+import numpy as np
+from miao.augment import (
+    additive_noise,
+    drop_sections,
+    intensity_jitter,
+    rot90inplane,
+    rot90isocube,
+    shift_sections,
+    spatial_dims_for,
+)
 
-SPATIAL_RANK = 3
-# Each operation is gated by a coin flip before its own parameters apply, so a per-slice
-# probability of 0.05 reaches roughly 2.5% of slices overall. Copied from the reference rather than
-# folded into the probabilities, so its numbers can be used here as written.
+# Rotation subgroups, by what they may exchange. "inplane" excludes the sectioning axis, which is
+# what anisotropic EM needs; "full" is the 48-element group and requires cubic voxels.
+ROTATIONS = ("none", "inplane", "full")
+# The axis serial sectioning runs along, and so the one "inplane" never permutes. Named rather
+# than configured: it is a property of how the data was acquired, and the dataset already declares
+# its axis order, so a second setting could only disagree with it.
+SECTION_AXIS = "z"
+# Each operation is gated by a coin flip before its own parameters apply. Copied from the
+# reference rather than folded into the probabilities, so its numbers can be used as written.
 APPLY_PROB = 0.5
 
 
 class VolumeAugmentation:
-    """Photometric and section-artefact augmentation of one sample.
+    """One sample in, one augmented sample out, composing `miao.augment` in a fixed order.
 
-    Applies to the trailing three axes, which is where the spatial dimensions sit in every layout
-    this repo produces (`lcxyz` for images, `lxyz` for labels), so no axis string is needed.
-
-    `image_keys` receive everything; `label_keys` receive only the geometric operations, since a
-    class index is not a quantity that can be brightened or have noise added to it.
+    Every field mirrors one on `AugmentConfig`. `sample_axes` is the dataset's declared layout
+    (e.g. `"lcxyz"`), needed only to locate the spatial axes; a dataset that declares none can
+    still use the photometric operations, which do not care where the axes are.
     """
 
     def __init__(
         self,
+        rotate: str = "none",
         drop_slice_prob: float = 0.0,
         shift_slice_prob: float = 0.0,
         shift_magnitude: int = 10,
@@ -58,9 +74,12 @@ class VolumeAugmentation:
         mul_intensity: float = 0.1,
         add_intensity: float = 0.1,
         noise_scale: float = 0.0,
+        sample_axes: str | None = None,
         image_keys: tuple[str, ...] = ("img",),
         label_keys: tuple[str, ...] = ("label",),
     ) -> None:
+        if rotate not in ROTATIONS:
+            raise ValueError(f"rotate must be one of {ROTATIONS}, got {rotate!r}")
         for name, value in (
             ("drop_slice_prob", drop_slice_prob),
             ("shift_slice_prob", shift_slice_prob),
@@ -74,6 +93,21 @@ class VolumeAugmentation:
         if not image_keys:
             raise ValueError("image_keys is empty, so no augmentation could ever apply")
 
+        geometric = rotate != "none" or (shift_slice_prob > 0 and shift_magnitude > 0)
+        if geometric and sample_axes is None:
+            raise ValueError(
+                "rotation and section shifting move the spatial axes, so they need the dataset's "
+                "axis order to know where those axes are, but this dataset declares no "
+                "sample_axes. Use a dataset that declares its layout, or configure only the "
+                "photometric operations (intensity, noise), which do not depend on it."
+            )
+        if rotate == "inplane" and sample_axes is not None and SECTION_AXIS not in sample_axes:
+            raise ValueError(
+                f"rotate='inplane' holds the sectioning axis {SECTION_AXIS!r} fixed, but the "
+                f"dataset's axis order {sample_axes!r} has no {SECTION_AXIS!r} among its axes."
+            )
+
+        self.rotate = rotate
         self.drop_slice_prob = drop_slice_prob
         self.shift_slice_prob = shift_slice_prob
         self.shift_magnitude = shift_magnitude
@@ -81,111 +115,100 @@ class VolumeAugmentation:
         self.mul_intensity = mul_intensity
         self.add_intensity = add_intensity
         self.noise_scale = noise_scale
+        self.sample_axes = sample_axes
         self.image_keys = tuple(image_keys)
         self.label_keys = tuple(label_keys)
 
-    @staticmethod
-    def _coin(probability: float = APPLY_PROB) -> bool:
-        return bool(torch.rand(()).item() < probability)
+    def _dims_for(self, key: str) -> tuple[int, int, int]:
+        """Where the spatial axes sit in the tensor under `key`.
+
+        Labels are the reason this is per key rather than one value for the sample: miao returns
+        them without the image's channel axis, so under a channel-last `output_axes` the image's
+        spatial axes sit one position earlier than the label's. Passing one offset for both
+        transforms them differently, which no error reports.
+        """
+        assert self.sample_axes is not None  # guarded in __init__ for the ops that need it
+        axes = self.sample_axes if key in self.image_keys else self.sample_axes.replace("c", "")
+        return spatial_dims_for(axes)
+
+    def _section_slot(self) -> int:
+        """Which `spatial_dims` slot holds the sectioning axis.
+
+        A slot index, not an axis position, because that is what `rot90inplane` takes -- and it
+        moves with the layout, since `spatial_dims` lists the axes in the order `output_axes`
+        gives them. `"lczyx"` puts z first and `"lcxyz"` puts it last, so hard-coding either is
+        wrong for the other, and wrong quietly: the run holds the wrong axis fixed and permutes
+        the sectioning axis into the image plane, which anisotropic data cannot survive.
+        """
+        assert self.sample_axes is not None
+        return [axis for axis in self.sample_axes if axis in "zyx"].index(SECTION_AXIS)
 
     @staticmethod
-    def _uniform(low: float, high: float) -> float:
-        return float(torch.empty(()).uniform_(low, high).item())
+    def _coin(rng: Any, probability: float = APPLY_PROB) -> bool:
+        return bool(rng.random() < probability)
 
     def _present(self, sample: dict[str, Any], keys: tuple[str, ...]) -> list[str]:
-        return [key for key in keys if key in sample]
-
-    def _drop_slices(self, sample: dict[str, Any], images: list[str]) -> None:
-        """Blank whole sections of the image, leaving the labels intact."""
-        axis = int(torch.randint(-SPATIAL_RANK, 0, ()).item())
-        extent = sample[images[0]].shape[axis]
-        drop = torch.rand(extent) < self.drop_slice_prob
-        if not bool(drop.any()):
-            return
-        index = torch.nonzero(drop, as_tuple=False).squeeze(1)
-        for key in images:
-            sample[key].index_fill_(axis, index, 0.0)
-
-    def _shift_slices(self, sample: dict[str, Any], keys: list[str]) -> None:
-        """Offset individual sections within their own plane, image and labels together."""
-        axis = int(torch.randint(-SPATIAL_RANK, 0, ()).item())
-        extent = sample[keys[0]].shape[axis]
-        selected = torch.rand(extent) < self.shift_slice_prob
-        for position in torch.nonzero(selected, as_tuple=False).squeeze(1).tolist():
-            # One pair of shifts, drawn once and applied to every tensor, so the image and its
-            # labels stay registered to each other.
-            shifts = [
-                int(torch.randint(-self.shift_magnitude, self.shift_magnitude + 1, ()).item())
-                for _ in range(SPATIAL_RANK - 1)
-            ]
-            for key in keys:
-                # `movedim` gives a view with the shifted axis at the front; indexing it away
-                # leaves the other two spatial axes as the final two dimensions, in their original
-                # relative order -- whichever axis was chosen. So the in-plane axes are always
-                # (-2, -1) here, and computing them from `axis` only agrees for `axis == -1`.
-                view = sample[key].movedim(axis, 0)[position]
-                view.copy_(torch.roll(view, shifts=shifts, dims=(-2, -1)))
-
-    def _jitter_intensity(self, sample: dict[str, Any], images: list[str]) -> None:
-        scale = self._uniform(1.0 - self.mul_intensity, 1.0 + self.mul_intensity)
-        offset = self._uniform(-self.add_intensity, self.add_intensity)
-        for key in images:
-            sample[key].mul_(scale).add_(offset)
-
-    def _add_noise(self, sample: dict[str, Any], images: list[str]) -> None:
-        # The reference draws the standard deviation itself uniformly, so most affected samples
-        # get much less than `noise_scale`.
-        deviation = self._uniform(0.0, 1.0) * self.noise_scale
-        for key in images:
-            sample[key].add_(torch.randn_like(sample[key]) * deviation)
+        # A volume without labels yields miao's empty sentinel, which has no spatial axes to
+        # transform; treating it as a tensor is what the geometric functions assert against.
+        return [
+            key for key in keys
+            if key in sample and getattr(sample[key], "numel", lambda: 1)()
+        ]
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
-        sample = dict(sample)
+        # The global numpy generator; `DataLoader` reseeds it per worker and per epoch.
+        rng = np.random
+
         images = self._present(sample, self.image_keys)
         if not images:
             raise KeyError(
                 f"no image key {self.image_keys} in the sample, which carries {sorted(sample)}; "
                 "augmentation would silently do nothing"
             )
-        # Cloned because every operation writes in place, and a dataset is free to hand out a view
-        # of something it caches.
-        for key in images + self._present(sample, self.label_keys):
-            sample[key] = sample[key].clone()
+        geometric = images + self._present(sample, self.label_keys)
+        sample = dict(sample)
 
-        if self.drop_slice_prob > 0 and self._coin():
-            self._drop_slices(sample, images)
-        if self.shift_slice_prob > 0 and self.shift_magnitude > 0 and self._coin():
-            self._shift_slices(sample, images + self._present(sample, self.label_keys))
-        if self.intensity and self._coin():
-            self._jitter_intensity(sample, images)
-        if self.noise_scale > 0 and self._coin():
-            self._add_noise(sample, images)
-        return sample
+        # Geometric first, image and labels together so one draw moves both.
+        if self.rotate != "none":
+            spin = rot90isocube if self.rotate == "full" else rot90inplane
+            extra = {} if self.rotate == "full" else {"fixed_axis": self._section_slot()}
+            rotated = spin(
+                rng,
+                *(sample[key] for key in geometric),
+                spatial_dims=[self._dims_for(key) for key in geometric],
+                pixel_size=sample.get("pixel_size"),
+                **extra,
+            )
+            sample.update(zip(geometric, rotated, strict=True))
 
+        if self.shift_slice_prob > 0 and self.shift_magnitude > 0 and self._coin(rng):
+            shifted = shift_sections(
+                rng,
+                *(sample[key] for key in geometric),
+                prob=self.shift_slice_prob,
+                magnitude=self.shift_magnitude,
+                spatial_dims=[self._dims_for(key) for key in geometric],
+            )
+            sample.update(zip(geometric, shifted, strict=True))
 
-class TransformedDataset(data.Dataset):
-    """A map-style dataset with transforms applied to each sample as it is read, in order.
+        # Photometric and image-only from here. `drop_sections` is among them because it touches
+        # the image alone -- a label must survive a lost section, or the model learns that a gap
+        # in the picture is a boundary in the specimen.
+        if self.drop_slice_prob > 0 and self._coin(rng):
+            for key in images:
+                sample[key] = drop_sections(
+                    rng, sample[key], prob=self.drop_slice_prob,
+                    spatial_dims=self._dims_for(key),
+                )
 
-    Order is the order they were attached, and it matters: augmentation comes first, and anything
-    deriving structure from the labels comes after. `_shift_slices` moves whole sections of the
-    image *and* its labels, which can sever an object that was connected before -- so a
-    connected-components pass run before augmentation would describe a volume that no longer
-    exists.
+        if self.intensity and self._coin(rng):
+            scale = (1.0 - self.mul_intensity, 1.0 + self.mul_intensity)
+            shift = (-self.add_intensity, self.add_intensity)
+            for key in images:
+                sample[key] = intensity_jitter(rng, sample[key], scale=scale, shift=shift)
 
-    Everything here runs inside the dataloader's worker processes, which is the point: work placed
-    here costs no GPU time and parallelises over `num_workers`, where the same work on the training
-    device would sit on the critical path between the batch arriving and the loss.
-    """
+        if self.noise_scale > 0 and self._coin(rng):
+            for key in images:
+                sample[key] = additive_noise(rng, sample[key], scale=self.noise_scale)
 
-    def __init__(self, source: data.Dataset, transforms: tuple[Any, ...]) -> None:
-        self.source = source
-        self.transforms = transforms
-
-    def __len__(self) -> int:
-        return len(self.source)  # type: ignore[arg-type]
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        sample = self.source[index]
-        for transform in self.transforms:
-            sample = transform(sample)
         return sample

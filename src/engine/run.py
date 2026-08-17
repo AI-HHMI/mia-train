@@ -194,8 +194,19 @@ def build_trainer(
     if config.augment.enabled():
         # The training set only. `val_data` is deliberately never wrapped: validation has to
         # measure the model on the data as it is, and there is no config key that can change that.
+        # `sample_axes` comes from the dataset rather than from `[augment]`: the rotation needs to
+        # know which axis serial sectioning ran along, and the dataset already declares its layout.
+        # A second setting could only ever disagree with it.
+        # Mapped field by field rather than splatted: `[augment]` is this repo's TOML surface and
+        # says "slice", while miao's functions say "sections". Naming one after the other would
+        # either break the configs already written against these keys or bend miao's vocabulary to
+        # a caller's. `output_axes` comes from the dataset, since the rotation needs to know which
+        # axis serial sectioning ran along and a second setting could only disagree with it.
         train_dataset.attach_transform(
-            VolumeAugmentation(**dataclasses.asdict(config.augment))
+            VolumeAugmentation(
+                sample_axes=train_dataset.sample_axes,
+                **dataclasses.asdict(config.augment),
+            )
         )
         print(f"[augment] training data: {config.augment}", flush=True)
     val_dataset = (

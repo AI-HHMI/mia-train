@@ -26,8 +26,7 @@ from algorithms.affinity.targets import (
     relabel_connected,
     relabel_connected_cc3d,
 )
-from data.augment import TransformedDataset
-from data.base import BaseDataset
+from data.base import BaseDataset, TransformedDataset
 
 needs_cc3d = pytest.mark.skipif(not cc3d_available(), reason="needs the 'affinity' extra (cc3d)")
 

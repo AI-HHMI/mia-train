@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# The rotation subgroups `[augment].rotate` selects. Imported rather than restated so the
+# config cannot offer a value the augmentation does not implement.
+from data.augment import ROTATIONS
+
 PRECISIONS = ("fp32", "bf16")
 
 # How the learning rate falls from its post-warmup peak to `min_lr_ratio`. Both reach the same
@@ -53,6 +57,21 @@ class AugmentConfig:
     tell apart from one that asked for it.
     """
 
+    # Axis-aligned rotations and flips. "none", "inplane" or "full" (see `data.augment.ROTATIONS`).
+    #
+    # This was previously the dataset's business -- miao's per-volume `aug_rot` key -- and moved
+    # here when the operations did, so that one section describes a run's whole augmentation
+    # rather than half of it. Two consequences worth knowing: it is now one setting for every
+    # volume in a run rather than per volume, and a data config still carrying `aug_rot` will be
+    # rejected by miao rather than silently ignored.
+    #
+    # "full" draws from all 48 signed permutations of the axes and needs cubic voxels. "inplane"
+    # excludes the sectioning axis, leaving 16, which is what anisotropic serial-section EM needs:
+    # at 9x9x20 nm an exchange of z with x would relabel a 20 nm neighbour relationship as a 9 nm
+    # one and produce object shapes that do not occur in the data. miao asserts the condition each
+    # requires against the sample's own `pixel_size`, so a mismatch fails rather than trains.
+    rotate: str = "none"
+
     drop_slice_prob: float = 0.0
     shift_slice_prob: float = 0.0
     shift_magnitude: int = 10
@@ -61,9 +80,14 @@ class AugmentConfig:
     add_intensity: float = 0.1
     noise_scale: float = 0.0
 
+    def __post_init__(self) -> None:
+        if self.rotate not in ROTATIONS:
+            raise ValueError(f"[augment].rotate must be one of {ROTATIONS}, got {self.rotate!r}")
+
     def enabled(self) -> bool:
         return bool(
-            self.drop_slice_prob > 0.0
+            self.rotate != "none"
+            or self.drop_slice_prob > 0.0
             or (self.shift_slice_prob > 0.0 and self.shift_magnitude > 0)
             or self.intensity
             or self.noise_scale > 0.0
