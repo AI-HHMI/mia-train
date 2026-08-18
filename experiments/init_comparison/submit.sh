@@ -43,15 +43,14 @@ THREADS="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4"
 
 # miao is an editable install pointing at a working tree, so a `git checkout` there rewrites the
 # dataset code under every running job. That is not hypothetical: on 2026-08-13 a switch away from
-# `feature/aug-rot-anisotropic` killed all four live runs within 60 seconds, because these configs
-# ask for `aug_rot: "inplane"` -- a mode only that branch has -- and master reads the string as a
-# plain truthy boolean and then rejects NISB's anisotropic 9x9x20 voxels.
+# `feature/aug-rot-anisotropic` killed all four live runs within 60 seconds.
 #
-# So pin the commit instead of trusting the checkout. A `.pth` editable install is an ordinary
-# sys.path entry appended during site-packages processing, so PYTHONPATH precedes it and wins.
-MIAO_PIN=/nrs/scicompsoft/orhane/mia-train-scratch/miao-pinned/8d41638/src
-[[ -d "$MIAO_PIN" ]] || { echo "missing pinned miao at $MIAO_PIN" >&2; exit 2; }
-PIN="export PYTHONPATH=$MIAO_PIN\${PYTHONPATH:+:\$PYTHONPATH}"
+# These stages no longer pin a miao commit. They used to, because the data configs asked for
+# `aug_rot: "inplane"`, a per-volume key only that branch had. Rotation is now `[augment] rotate`
+# in the run's own .toml and the augmentations are implemented in this repo (src/data/augment.py),
+# so the only miao surface left is the dataset reader -- `MiaoConfig`, `load_config`,
+# `VolumeDataset` -- which master provides. A checkout in miao can still disturb a running job,
+# but no longer changes what augmentation a run applies.
 
 # A trained ViT-L encoder of this exact shape, used only to exercise the phase-2 load path in a
 # smoke run, where none of the run's own predecessors exists yet.
@@ -109,7 +108,6 @@ sed \"s|PREV_CHECKPOINT|\${RUN}checkpoints/step_\$STEP|\" '$cfg' > '$resolved'"
   { echo "#!/usr/bin/env bash"
     echo "set -euo pipefail"
     echo "$THREADS"
-    echo "$PIN"
     echo "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
     [[ -n "$prologue" ]] && echo "$prologue"
     printf '%s --standalone --nproc_per_node=%s src/train.py --config %q %s\n' \

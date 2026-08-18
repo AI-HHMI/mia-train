@@ -74,3 +74,11 @@ seed = 0
 dp_replicate = 1
 dp_shard = 8
 tp = 1
+
+[augment]
+# Rotation moved here from the data YAML's per-volume `aug_rot`, which miao removed. "inplane"
+# draws from the 16 transforms that never exchange z with x or y; the full 48-transform group is
+# refused against this data's 9x9x20 nm voxels, since exchanging axes of unequal size produces
+# object shapes that do not occur in the specimen. Same augmentation as before, stated in the run
+# rather than per volume.
+rotate = "inplane"

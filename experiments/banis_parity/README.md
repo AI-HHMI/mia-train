@@ -50,7 +50,8 @@ physically isotropic (~285–300 nm on every axis) yet spans 32 voxels in x and 
 swapping those axes produces an object shape that never occurs, and relabels a 20 nm neighbour
 relationship as a 9 nm one. `"inplane"` draws from the 16 transforms that never exchange z with x
 or y (8 flips × the x↔y swap), which *is* a genuine symmetry since x and y share a voxel size.
-Added to miao on `feature/aug-rot-anisotropic`.
+Implemented in miao on `feature/aug-rot-anisotropic` at the time; it lives in this repo now
+([`src/data/augment.py`](../../src/data/augment.py)), since that branch never merged.
 
 The three are changed **together**, deliberately. At 300k steps on 5 cubes, augmentation is not a
 confound to isolate — it is what makes the longer run a fair test rather than an overfitting
@@ -64,7 +65,10 @@ same evaluation. So this is head-to-head with the published `base` numbers.
 
 ## A dependency this run has that the run record does not capture
 
-`aug_rot = "inplane"` needs miao commit **8d41638** on branch `feature/aug-rot-anisotropic`.
+In-plane rotation is `[augment] rotate = "inplane"` in the .toml, implemented in
+[`src/data/augment.py`](../../src/data/augment.py). It used to be miao's per-volume
+`aug_rot`, which needed commit 8d41638 on `feature/aug-rot-anisotropic`; no miao pin is
+required now.
 miao is installed **editable**, so a run reads whatever branch is checked out in `~/projects/miao`
 — and mia-train's provenance records its own commit, not miao's. Two consequences:
 

@@ -101,6 +101,8 @@ dp_shard = 8
 tp = 1
 
 [augment]
+# Rotation, moved here from the data YAML\'s per-volume `aug_rot` (removed upstream).
+rotate = "inplane"
 # BANIS' own defaults, on images presented in [0, 1] as theirs are. Training set only -- the engine
 # never wraps [val_data].
 drop_slice_prob = 0.05    # a lost section: the image goes blank, the labels do not

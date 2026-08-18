@@ -1,16 +1,19 @@
 # NISB "base" setting at 256-cube crops, with in-plane rotation/flip augmentation.
 #
 # Same 5 training cubes as configs/data/nisb_base.yaml -- this differs only in patch_size and
-# aug_rot, so a run using it is head-to-head with the published `base` baselines.
+# rotation, so a run using it is head-to-head with the published `base` baselines.
 #
 # 256^3 rather than 512^3: attention is quadratic in tokens, so a 512-cube costs ~24x the time per
 # step for 8x the voxels. BANIS uses 256, and at 256 this repo needs no activation checkpointing
 # either (22 GiB vs 112 GiB), so the same GPU-hours buy far more optimizer steps.
 #
-# aug_rot = "inplane" draws from the 16 transforms that never exchange z with x or y (8 flips x
-# the x<->y swap). The full 48-transform group is invalid here: at 9x9x20 nm an x<->z swap would
-# relabel a 20 nm neighbour relationship as a 9 nm one and produce object shapes that do not occur
-# in the data. miao enforces that distinction; see its `aug_rot` docs.
+# Rotation is configured by the *run*, not here: `[augment] rotate = "inplane"` in the .toml.
+# It draws from the 16 transforms that never exchange z with x or y (8 flips x the x<->y swap).
+# The full 48-transform group is invalid for this data: at 9x9x20 nm an x<->z swap would relabel
+# a 20 nm neighbour relationship as a 9 nm one and produce object shapes that do not occur in
+# the specimen, so `rotate = "full"` is refused against these voxel sizes rather than silently
+# accepted. This file previously said `aug_rot: "inplane"` per volume, a miao key that no longer
+# exists -- miao rejects unknown keys, so an unmigrated copy fails at load rather than drifting.
 #
 # Referenced from a run config with:
 #
@@ -52,7 +55,6 @@ volumes:
     zarr_version: "zarr3"
     weight: 0.2
     normalize: true   # uint8 on disk, so this maps to [0, 1] by dtype max
-    aug_rot: "inplane"
 
   - name: "NISB base seed1"
     path: "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed1.zarr"
@@ -61,7 +63,6 @@ volumes:
     zarr_version: "zarr3"
     weight: 0.2
     normalize: true
-    aug_rot: "inplane"
 
   - name: "NISB base seed2"
     path: "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed2.zarr"
@@ -70,7 +71,6 @@ volumes:
     zarr_version: "zarr3"
     weight: 0.2
     normalize: true
-    aug_rot: "inplane"
 
   - name: "NISB base seed3"
     path: "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed3.zarr"
@@ -79,7 +79,6 @@ volumes:
     zarr_version: "zarr3"
     weight: 0.2
     normalize: true
-    aug_rot: "inplane"
 
   - name: "NISB base seed4"
     path: "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed4.zarr"
@@ -88,4 +87,3 @@ volumes:
     zarr_version: "zarr3"
     weight: 0.2
     normalize: true
-    aug_rot: "inplane"

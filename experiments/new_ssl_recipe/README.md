@@ -209,7 +209,6 @@ volume, which the default `miao` rejects outright (`aug_rot Extra inputs are not
 resolving `[data]` outside a submitted job needs the same pin `submit.sh` exports:
 
 ```bash
-export PYTHONPATH=/nrs/scicompsoft/orhane/mia-train-scratch/miao-pinned/8d41638/src${PYTHONPATH:+:$PYTHONPATH}
 ```
 
 `submit.sh` pins it deliberately rather than tracking `miao`'s main branch: a stray checkout there
