@@ -51,7 +51,18 @@ if [[ ! -f "$CLAIM" ]]; then
 fi
 
 GPUS=8
-SLOTS=96          # 12 slots per GPU, the H100/H200 queues' ratio -- see .claude/rules/cluster.md
+# 96 = 12 slots per GPU x 8 GPUs, the H100/H200 queues' ratio and a whole node. Deliberately the
+# whole node rather than only the cores this job uses, and the reason is measurement quality rather
+# than resource need: at 64 slots another job shares the host, and this stage's `data_wait_frac_max`
+# went from 0.002 with the node to itself to 0.098 with a co-tenant. I/O contention that lands on one
+# arm and not the other is exactly the kind of noise an A/B comparison cannot absorb, so both arms
+# take the whole node.
+#
+# Worth knowing about the cost: LSF turns `-n 96` into `rusage[mem=3932160]` = 3.75 TiB, against
+# ~3.7 T schedulable of 3.9 T physical, so the request sits right at the node's ceiling and dispatch
+# can wait for a fully idle host. Actual use is 129 GB peak and ~37 busy cores. `SLOTS=64` is
+# available as an override when queue time matters more than an uncontended node.
+SLOTS=${SLOTS:-96}
 THREADS="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4"
 
 # miao is an editable install pointing at a working tree, so a `git checkout` there rewrites the

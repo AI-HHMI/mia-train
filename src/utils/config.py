@@ -127,7 +127,16 @@ def flatten_resolved(config: dict[str, Any], prefix: str = "") -> dict[str, Any]
         if isinstance(value, dict):
             flat.update(flatten_resolved(value, f"{path}."))
         else:
-            flat[path] = value
+            # Tuples are normalised to lists because the two sides of a comparison come from
+            # different places: the live config holds tuples (several `__post_init__`s freeze
+            # sequences so a config stays hashable), while a stored `resolved_config.json` read them
+            # back as lists, JSON having no tuple type. Without this the round trip itself looks
+            # like a change, and for a key under `_INCOMPATIBLE_ON_RESUME` that is fatal:
+            # `[lora].targets`
+            # made every LoRA run unresumable, reported as "the architecture changed
+            # (['attn_qkv'] -> ('attn_qkv',))". `[init].skip` had the same shape, harmlessly, and
+            # printed a spurious "continuing with changed settings" line on every resume.
+            flat[path] = list(value) if isinstance(value, tuple) else value
     return flat
 
 

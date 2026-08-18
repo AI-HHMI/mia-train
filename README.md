@@ -1,13 +1,11 @@
 # mia-train
 
-PyTorch-native distributed training for volumetric microscopy. There is a single entrypoint 
-([`train.py`](src/train.py)) for all runs, one config file per run, and everything a config 
-can name lives in a registry.
-
-Core dependencies are `torch`, `tensorboard` and `miao-io`. Optional extras add
-capabilities without touching the core (see [Installing](#installing)).
+PyTorch-native distributed training for volumetric microscopy. 
 
 ## Installing
+
+Core dependencies are `torch`, `tensorboard` and `miao-io`. Optional extras add
+capabilities without touching the core:
 
 ```bash
 pip install -e .                    # core
@@ -18,8 +16,7 @@ pip install -e '.[dev]'             # + pytest, ruff, mypy
 
 `affinity` is worth installing before any serious `affinity_seg` run. Without it the algorithm
 still trains, and to the same targets, but it splits disconnected label components on the training
-device instead of in the dataloader's workers — measured at 107 ms of every 377 ms step at 256³.
-A run that falls back says so on startup.
+device instead of in the dataloader's workers.
 
 Machine-local paths (dataset roots, checkpoint directory, venv, scheduler project) live in
 `configs/cluster/active.toml` (untracked), which can be created by copying 
