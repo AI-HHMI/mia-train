@@ -1,0 +1,170 @@
+# Arm 1 (LoRA) stage 2 of 2: the sub-pixel head, warm-started from 1a_lora_interp's encoder, still
+# adapted rather than fully trained.
+#
+# The [lora] section is identical to 1a's, and that is what makes the adapter *continue*: the model
+# is rebuilt with the same 96 adapters, and `[init]` copies stage a's trained `lora_a`/`lora_b` into
+# them like any other parameter, because promotion preserves every parameter name. This is one
+# 100k LoRA finetune split at the head change, not two.
+#
+# The alternative -- `[init].merge_lora = true`, which folds stage a's delta into the frozen base
+# and re-zeroes the adapter -- would give stage b its full rank budget back for the new head. That
+# is a different experiment and is not what this arm runs.
+#
+# See README.md for what the two arms isolate and for the learning-rate caveat.
+
+experiment_name = "lvf__1b_lora_subpixel"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256            # 16^3 = 4096 tokens at patch 16
+patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
+in_chans = 1
+embed_dim = 1024          # ViT-L/16: 303.2M released params, 306.6M with a 16^3 single-channel stem
+depth = 24
+num_heads = 16            # head_dim 64
+n_storage_tokens = 4      # the released ViTs carry 4 registers
+# Neither of the next two is optional, and both are easy to lose when a config is copied: the
+# released weights were trained with LayerScale gains and a per-block masked key bias. A model
+# built without them has nowhere to put those tensors and computes a different function; `strict`
+# turns that into an error rather than a silent regression.
+layerscale_init = 1.0e-05
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+# Superposition, not vanilla: a released 2D checkpoint says nothing about a third axis, and vanilla
+# rearranges the very channel layout the pretrained attention was fitted against. Superposition
+# keeps the 2D layout and adds a gated depth angle on top, so the weights transfer unchanged.
+#
+# That gate, `rope_embed.depth_scale`, is a single scalar starting at zero, and at zero the
+# positional encoding cannot distinguish one z-slice from another. Under [lora] it is held
+# trainable unconditionally -- the model declares it through `lora_required_trainable()`, and no
+# [lora] switch can freeze it. Arm 2 trains everything, so the question does not arise there.
+pos_embed_rope_type = "superposition"
+
+[lora]
+# Arm 1's entire difference from arm 2. The base weights are frozen and each targeted projection
+# gains a rank-16 delta initialised to exactly zero, so this run starts computing precisely what
+# the released checkpoint computes and can only move within a 16-dimensional subspace per layer.
+#
+# Trainable: 10.65M of 312.9M = 3.4%. Adapters 6.29M, stem 4.20M, norms + LayerScale 0.15M,
+# cls/storage/mask tokens 6.1K, the RoPE depth gate 1. The stem dominates the non-adapter share and
+# is deliberately left open: an inflated RGB kernel now reading single-channel EM has no pretrained
+# answer to preserve, and throttling it cost ~11x nERL in banis_parity.
+rank = 16
+alpha = 32.0              # scaling = alpha/rank = 2.0, stated because a default would let a change
+                          # of rank silently rescale the delta
+# Attention *and* the FFN, which is a departure from LoRA's usual attention-only recipe and is
+# chosen from measurement rather than convention. Weight-space drift over an existing 100k
+# supervised finetune of this exact architecture: mlp.fc1 reaches cosine 0.667 to its initial
+# value while attn.qkv reaches 0.714 -- i.e. this task rewrites the FFN slightly *more* than it
+# rewrites attention. An attention-only adapter would constrain the wrong half. 6.29M params
+# against 2.36M for qkv+proj alone.
+targets = ["attn_qkv", "attn_proj", "mlp"]
+# All three default to true; written out because this file is also the record of what ran.
+train_stem = true
+train_norms = true
+train_tokens = true
+
+[init]
+path = "PREV_CHECKPOINT"
+# `BaseAlgorithm` registers the backbone as `model`, so that is where stage a's encoder sits.
+# Everything outside the prefix -- the interpolating head -- is dropped before the unused-key check,
+# which is what leaves this stage's sub-pixel head at its initialisation.
+prefix = "model."
+# **No `skip` here, deliberately, and this is a correction rather than a copy.** The equivalent
+# stage in new_ssl_recipe carries `skip = ["rope_embed."]`, inherited from the 2D->3D load above
+# where it is necessary. At 3D->3D every rope tensor has the same shape, so the skip transfers
+# nothing and *discards* something: `rope_embed.depth_scale` is a learned parameter, and skipping it
+# resets the depth gate to zero, throwing away whatever stage a learned about the z axis. Verified
+# on 2026-08-18 -- with the skip, stage b starts at depth_scale = 0.0000 where stage a ended at
+# 0.3700. Omitted entirely rather than narrowed to the two buffers, so any genuine disagreement in
+# the rope tensors raises here instead of being silently tolerated.
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+decoder = "subpixel"
+decoder_hidden_dim = 256  # width on the token grid, where positions are 4096x cheaper
+decoder_readout_dim = 16  # width at voxel resolution -- the number that actually costs
+decoder_refine_depth = 2
+# Correct for a warm start and a handicap anywhere cold: zeroing the output convolution makes the
+# head emit a constant, protecting an encoder that already solves the task from a random dense
+# head's gradients. This is the configuration that produced 0.4941 nERL in subpixel_decoder.
+decoder_zero_init_output = true
+
+[data]
+name = "miao_volumes"
+# The five NISB `base` training cubes at 256^3 with the 16 in-plane rotations/flips. Byte-identical
+# to new_ssl_recipe's and init_comparison's copies, so numbers here sit beside theirs.
+config_path = "experiments/lora_vs_fullft/nisb_base_256_aug.yaml"
+samples_per_epoch = 1000  # bookkeeping only; `max_steps` is what ends the run
+
+[val_data]
+name = "miao_volumes"
+# The held-out cube, in no training config. The inline keys below *replace* the YAML's `volumes`
+# rather than extend it, so this is one cube and not a sixth training one.
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [256, 256, 256]
+# 32 crops is a progress readout, not a model selector: in subpixel_decoder the lowest val loss did
+# not pick the best checkpoint (85k won on loss, 100k on nERL). The arms are compared by scoring
+# checkpoints with banis, not by this. 
+samples_per_epoch = 32
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/val/seed100.zarr"
+image_key = "raw"
+label_key = "labels/public_gt-cell-nisb"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+max_steps = 50000
+batch_size = 1            # per rank; 8 ranks -> global batch 8
+# This stage continues the tail of one 100k plan rather than restarting a plan of its own.
+# 1.545e-4 is exactly what a single 100k linear schedule (peak 3e-4, warmup 2000,
+# min_lr_ratio 0.01) reaches at step 50000, and the ratio below lands this stage on that plan's
+# 3e-6 endpoint. Restarting at the full 3e-4 would hand the encoder a rate twice anything it saw in
+# stage a. Both numbers are derived, not copied: the same arithmetic reproduces new_ssl_recipe's
+# 1.53e-4 / 0.0196 for its 100k + 100k split.
+#
+# Caveat inherited from there: stage a declares max_steps = 50000 and so anneals all the way to
+# 3e-6 before stopping, which makes the handoff 3e-6 -> 1.545e-4 rather than genuinely continuous.
+# A smooth one would need stage a to declare 100000 and be stopped early, giving up its checkpoint
+# as a scoreable result. The short warmup softens it.
+lr = 1.545e-4
+warmup_steps = 500
+min_lr_ratio = 0.0194
+lr_schedule = "linear"
+weight_decay = 0.05
+grad_clip_norm = 1.0
+# `zero_weight_decay_on_lora` is left at its default (true), so the adapter's two factors are
+# exempt. They are 2-D and would otherwise take the full weight_decay, and decaying `lora_b` --
+# which starts at zero -- shrinks the *delta*, i.e. an unnamed pull back toward the pretrained
+# weights at a strength this config never states. Arm 1 is meant to test a rank constraint, not a
+# rank constraint plus an accidental L2-SP penalty.
+# One rate for the whole model. The 0.9 x 0.2 pair these keys once carried left patch_embed at an
+# effective 1.4e-6, 696x below the baseline, and it is the layer with the most to relearn. Setting
+# both to 1.0 was worth about 11x nERL in banis_parity.
+layerwise_lr_decay = 1.0
+patch_embed_lr_mult = 1.0
+activation_checkpointing = false  # a ViT-L at 256^3 fits; recomputation is 30% compute for nothing
+precision = "bf16"
+log_every = 100
+val_every = 2500
+checkpoint_every = 2500   # 20 checkpoints per stage, the same granularity 5000 gave a 100k stage
+num_workers = 6
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1
+
+[augment]
+# "inplane" draws from the 16 transforms that never exchange z with x or y. The full 48-transform
+# group is refused against 9x9x20 nm voxels, since exchanging axes of unequal length produces
+# object shapes that do not occur in the specimen.
+rotate = "inplane"

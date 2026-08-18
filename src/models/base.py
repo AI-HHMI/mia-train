@@ -91,6 +91,35 @@ class BaseModel(nn.Module, abc.ABC):
         """
         return ()
 
+    def lora_target_groups(self) -> dict[str, tuple[nn.Linear, ...]]:
+        """Named groups of `nn.Linear` layers a low-rank adapter may be attached to.
+
+        The same division of labour as `checkpointable_modules`: the architecture says *what* can be
+        adapted and under which name, `[lora].targets` says which of those to use, and
+        `engine.lora` does it. Names rather than a flat list because which projections to adapt is
+        the main thing a LoRA run varies -- attention only, attention plus the FFN -- and a config
+        naming a group this model does not offer should fail against the menu declared here rather
+        than silently adapting nothing.
+
+        Empty by default, which makes `[lora]` an error rather than a silent no-op on an
+        architecture that has not declared any targets.
+        """
+        return {}
+
+    def lora_required_trainable(self) -> tuple[str, ...]:
+        """Parameter names that must keep training under LoRA whatever the config says.
+
+        For invariants the engine cannot see. `DinoVisionTransformer3D` with superposition RoPE
+        holds its entire use of the depth axis in one zero-initialised scalar, so freezing it as
+        "part of the backbone" would leave a 3D model whose positional encoding cannot distinguish
+        one z-slice from another -- a run that trains, converges, and is quietly solving a different
+        problem. Which parameters carry a load-bearing initial value is architecture knowledge, so
+        it is answered here rather than pattern-matched in a config.
+
+        Matched as exact `named_parameters()` names, relative to the model.
+        """
+        return ()
+
     def num_parameters(self, trainable_only: bool = False) -> int:
         return sum(p.numel() for p in self.parameters() if not trainable_only or p.requires_grad)
 

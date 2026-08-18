@@ -40,6 +40,7 @@ class LoadReport:
 
     copied: list[str] = field(default_factory=list)
     inflated: list[str] = field(default_factory=list)
+    merged: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     kept_initial: list[str] = field(default_factory=list)
     unused: list[str] = field(default_factory=list)
@@ -49,6 +50,7 @@ class LoadReport:
         parts = [
             f"{len(self.copied)} copied",
             f"{len(self.inflated)} inflated 2D->3D",
+            f"{len(self.merged)} LoRA adapters merged",
             f"{len(self.skipped)} skipped",
             f"{len(self.kept_initial)} kept at initial value",
             f"{len(self.unused)} unused from checkpoint",
@@ -149,6 +151,50 @@ def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size) -> torch.Tensor:
     return (weight.unsqueeze(2).expand(-1, -1, depth, -1, -1) / depth).contiguous()
 
 
+def merge_lora_tensors(
+    checkpoint: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], list[str]]:
+    """Fold every LoRA adapter in a state dict into the weight it adapts. Returns (state, merged).
+
+    An adapted layer stores `<layer>.weight` alongside `<layer>.lora_a`, `<layer>.lora_b` and
+    `<layer>.lora_scaling`; the layer it is equivalent to stores `weight + scaling * B @ A` and
+    nothing else. This performs that substitution on the *checkpoint*, before any of it reaches a
+    model, which is what makes an adapted run's output loadable by a config that knows nothing about
+    LoRA -- and, when the destination model is itself adapted, what re-bases the adaptation into the
+    frozen prior so the new adapter starts from zero again.
+
+    The scaling is read from the checkpoint rather than from the loading run's `[lora].alpha`,
+    because those are not the same number: `alpha` may have changed since the adapter was trained,
+    and using the current one would rescale a delta by the ratio with nothing to indicate it. That
+    is the whole reason `LoRAMixin` registers it as a persistent buffer.
+    """
+    merged: dict[str, torch.Tensor] = dict(checkpoint)
+    folded = []
+    for key in sorted(checkpoint):
+        if not key.endswith(".lora_a"):
+            continue
+        layer = key[: -len(".lora_a")]
+        names = (f"{layer}.lora_a", f"{layer}.lora_b", f"{layer}.lora_scaling", f"{layer}.weight")
+        missing = [name for name in names if name not in merged]
+        if missing:
+            # An adapter is three tensors plus the weight they modify; any subset is a checkpoint
+            # that was assembled by hand or truncated, and folding what is left would produce a
+            # weight that is neither the base nor the adapted one.
+            raise ValueError(
+                f"cannot merge the LoRA adapter at {layer!r}: the checkpoint is missing {missing}. "
+                "A complete adapter is lora_a, lora_b, lora_scaling and the weight they adapt."
+            )
+        lora_a = merged.pop(f"{layer}.lora_a")
+        lora_b = merged.pop(f"{layer}.lora_b")
+        lora_scaling = merged.pop(f"{layer}.lora_scaling")
+        base = merged[f"{layer}.weight"]
+        merged[f"{layer}.weight"] = base + (
+            lora_scaling.to(base.dtype) * (lora_b.to(base.dtype) @ lora_a.to(base.dtype))
+        )
+        folded.append(layer)
+    return merged, folded
+
+
 def load_pretrained(
     model: nn.Module,
     path: str | Path,
@@ -158,6 +204,7 @@ def load_pretrained(
     skip: Sequence[str] = (),
     strict: bool = True,
     allow_unused: bool = False,
+    merge_lora: bool = False,
 ) -> LoadReport:
     """Copy what fits from the checkpoint at `path` into `model`, in place.
 
@@ -187,13 +234,25 @@ def load_pretrained(
         checkpoint = {
             key[len(prefix) :]: value for key, value in checkpoint.items() if key.startswith(prefix)
         }
+    # After the prefix strip, so the adapter keys are named as the model names them, and before
+    # matching, so the folded weights are what gets copied and the adapter tensors never appear as
+    # `unused`.
+    merged_layers: list[str] = []
+    if merge_lora:
+        checkpoint, merged_layers = merge_lora_tensors(checkpoint)
+        if not merged_layers:
+            raise ValueError(
+                f"merge_lora is set but {path} holds no LoRA adapter, so nothing would be merged "
+                "and the option is silently doing nothing. Drop it, or point at a checkpoint from "
+                "a run whose config had a [lora] section."
+            )
 
     # Parameters and buffers together: a model's rotary period tables and masked-bias masks are
     # buffers, and a checkpoint carries them alongside the weights.
     destinations: dict[str, torch.Tensor] = dict(model.named_parameters())
     destinations.update(model.named_buffers())
 
-    report = LoadReport()
+    report = LoadReport(merged=merged_layers)
     with torch.no_grad():
         for name, destination in destinations.items():
             source = checkpoint.pop(name, None)

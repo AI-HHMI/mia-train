@@ -96,7 +96,14 @@ def wd_scale(name: str, parameter: nn.Parameter, config: TrainerConfig) -> float
     the only rule that survives the naming here: `muvit3d` holds a LayerNorm inside an
     `nn.Sequential`, so its gain is called `patch_proj.0.1.weight` with no "norm" anywhere in it,
     and `ViT3D`'s learned rotary frequencies are `blocks.0.rotary.inv_freqs.0`.
+
+    A LoRA adapter's factors are the exception rank alone gets wrong: both are 2-D, but they are
+    factors of a *delta* rather than a weight matrix, so decaying them shrinks the adaptation toward
+    zero and thereby the model toward the weights it was initialised from. See
+    `[trainer].zero_weight_decay_on_lora`, which governs it separately for that reason.
     """
+    if name.endswith((".lora_a", ".lora_b")) and config.zero_weight_decay_on_lora:
+        return 0.0
     if not config.zero_weight_decay_on_norm_and_bias:
         return 1.0
     return 0.0 if parameter.ndim < 2 else 1.0

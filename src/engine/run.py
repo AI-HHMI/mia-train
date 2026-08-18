@@ -20,6 +20,7 @@ from utils.config import RunConfig, as_plain_dict, diff_resolved, load_run_confi
 from utils.pretrained import load_pretrained
 from utils.provenance import write_run_artifacts
 
+from .lora import apply_lora
 from .trainer import Trainer
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -80,7 +81,12 @@ def resolve_output_dir(
 # A different architecture cannot load the checkpoint's parameters at all, so say so up front
 # instead of failing deep inside DCP with a shape mismatch. Everything else — a new learning
 # rate, more steps, a different mask ratio — is a legitimate thing to change on a restart.
-_INCOMPATIBLE_ON_RESUME = ("model.", "algorithm.name")
+# `lora.` sits here with the architecture rather than with the tunable settings: an adapter's rank
+# fixes the shape of `lora_a`/`lora_b`, and its target list fixes which tensors exist at all, so a
+# checkpoint written under one `[lora]` cannot be loaded into a model built from another. DCP would
+# fail on the shape change but *silently ignore* a narrowed target list, resuming with adapters that
+# the checkpoint holds and the model no longer has.
+_INCOMPATIBLE_ON_RESUME = ("model.", "algorithm.name", "lora.")
 
 
 def _report_resumed_config(output_dir: Path, resolved: dict[str, Any]) -> None:
@@ -178,6 +184,48 @@ def _prepare_run_dir(
         dist.barrier()  # no rank may write checkpoints before rank 0 has created the directory
 
 
+def prepare_model(config: RunConfig) -> Any:
+    """Build the encoder, adapt it if `[lora]` asks, then initialise it from `[init]` if asked.
+
+    A named function rather than three statements inside `build_trainer`, because the *order* of the
+    last two is load-bearing and is pinned by `tests/unit/test_lora.py`.
+
+    **LoRA is applied before `[init]`, not after.** Promotion preserves every parameter name, so an
+    adapted model reads a plain checkpoint without any special casing -- which made the order look
+    irrelevant, and it is not. It is only symmetric in one direction:
+
+      * plain checkpoint -> adapted model (a released DINOv3 into stage 1 of a LoRA arm): fine
+        either way, the adapter tensors simply stay at their initial values.
+      * adapted checkpoint -> model not yet adapted (stage 2 of a LoRA arm loading stage 1's
+        encoder): the checkpoint's `lora_a`/`lora_b`/`lora_scaling` have nowhere to go, and
+        `load_pretrained` correctly refuses 288 homeless tensors rather than dropping them.
+
+    The second case is the whole point of a multi-stage LoRA arm, and it was caught by a 20-step
+    smoke run rather than by the unit tests, which had been written in the correct order and so
+    never exercised the wrong one.
+
+    Everything here happens on the bare model, before the algorithm wraps it: a strategy's own
+    parameters -- a masked-autoencoding decoder, an affinity head -- must keep the initialisation
+    they were built with and train at full rank. It is also before any parallelism, so the load and
+    the promotion both see plain unsharded tensors.
+    """
+    model = ModelRegistry.build(config.model.name, **config.model.kwargs)
+    if config.lora.enabled():
+        print(f"[lora] {apply_lora(model, config.lora).summary()}", flush=True)
+    if config.init.path:
+        load_pretrained(
+            model,
+            config.init.path,
+            prefix=config.init.prefix,
+            inflate=config.init.inflate_2d_to_3d,
+            skip=config.init.skip,
+            strict=config.init.strict,
+            allow_unused=config.init.allow_unused,
+            merge_lora=config.init.merge_lora,
+        )
+    return model
+
+
 def build_trainer(
     config: RunConfig,
     output_dir: Path,
@@ -214,20 +262,7 @@ def build_trainer(
         if config.val_data is not None
         else None
     )
-    model = ModelRegistry.build(config.model.name, **config.model.kwargs)
-    if config.init.path:
-        # Before the algorithm wraps it and before any parallelism is applied, so the load sees
-        # plain unsharded tensors and a strategy's own parameters (a decoder, say) keep the
-        # initialisation they were built with.
-        load_pretrained(
-            model,
-            config.init.path,
-            prefix=config.init.prefix,
-            inflate=config.init.inflate_2d_to_3d,
-            skip=config.init.skip,
-            strict=config.init.strict,
-            allow_unused=config.init.allow_unused,
-        )
+    model = prepare_model(config)
     algorithm = AlgorithmRegistry.build(
         config.algorithm.name, model, train_dataset, **config.algorithm.kwargs
     )

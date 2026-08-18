@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from distributed.parallel_dims import ParallelDims
-from engine.config import AugmentConfig, InitConfig, TrainerConfig
+from engine.config import AugmentConfig, InitConfig, LoRAConfig, TrainerConfig
 
 _COMPONENT_SECTIONS = ("model", "algorithm", "data")
 
@@ -33,6 +33,37 @@ class RunConfig:
     val_data: ComponentConfig | None = None
     init: InitConfig = field(default_factory=InitConfig)
     augment: AugmentConfig = field(default_factory=AugmentConfig)
+    lora: LoRAConfig = field(default_factory=LoRAConfig)
+
+    def __post_init__(self) -> None:
+        """Validation that spans sections, and so cannot live in either one's own `__post_init__`.
+
+        `[lora]` and `[trainer].freeze_backbone_steps` are mutually exclusive, and the reason is a
+        measured silent failure rather than a matter of taste. LoRA freezes the base weights before
+        the Trainer is built, so `build_param_groups` -- which skips anything not requiring grad --
+        leaves them out of the optimizer permanently. `Trainer._set_backbone_frozen(False)` at the
+        warm-up boundary then sets `requires_grad = True` on all of them, and the run:
+
+          - reports `[freeze] unfroze 302.1M params`, which is false;
+          - begins allocating gradients for 302M frozen tensors, which are never applied because no
+            param group holds them;
+          - carries on training only the adapters, exactly as before the boundary.
+
+        Nothing raises. The two mechanisms also answer the same question -- how to keep a randomly
+        initialised head from disturbing a pretrained encoder -- and LoRA answers it more strongly,
+        since a zero-initialised delta means the encoder starts as an exact identity to its
+        pretrained self rather than merely being held still for a while.
+        """
+        if self.lora.enabled() and self.trainer.freeze_backbone_steps > 0:
+            raise ValueError(
+                "[lora] and [trainer].freeze_backbone_steps cannot both be set. LoRA freezes the "
+                "base weights before the optimizer is built, so they are never in it; the warm-up "
+                "boundary would then flip requires_grad back on for tensors no param group holds, "
+                "which allocates their gradients, reports a large unfreeze that never happened, "
+                "changes nothing about what trains. Drop freeze_backbone_steps -- a zero-"
+                "initialised adapter already starts the encoder at its pretrained function, which "
+                "is what the warm-up was approximating."
+            )
 
 
 def _component(raw: dict[str, Any], section: str) -> ComponentConfig:
@@ -79,6 +110,7 @@ def load_run_config(path: Path) -> RunConfig:
         augment=_dataclass_from_section(
             AugmentConfig, dict(raw.get("augment", {})), "augment"
         ),
+        lora=_dataclass_from_section(LoRAConfig, dict(raw.get("lora", {})), "lora"),
     )
 
 

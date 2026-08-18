@@ -1,0 +1,85 @@
+# Short GPU validation run for low-rank adaptation: real data, real config path, minutes long.
+#
+# Exists to exercise what the CPU/Gloo tier cannot -- FSDP2 on CUDA sharding a module whose
+# parameters are 98% frozen, bf16 autocast through an adapted Linear, DCP writing and reloading the
+# adapter tensors, and the `[init]` -> `[lora]` ordering in `engine.run.build_trainer` -- before
+# committing to a long adaptation run.
+#
+#   bsub -P <project> -q gpu_h100 -gpu "num=2" -n 24 -W 0:30 ... \
+#     torchrun --standalone --nproc_per_node=2 src/train.py --config configs/dinov3_lora_smoke.toml
+#
+# [parallelism] must multiply to the torchrun world size.
+#
+# Deliberately ViT-S-shaped rather than the ViT-L the real arms use: this validates the *mechanism*,
+# and the mechanism does not care about width. For the released ViT-L settings see
+# experiments/new_ssl_recipe/2a_ssl_twophase.toml and swap its [trainer] freeze keys for a [lora]
+# section -- the two cannot both be set, and the config loader says so.
+
+experiment_name = "dinov3_lora_smoke"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 64
+patch_size = 16           # 4^3 = 64 patch tokens
+in_chans = 1
+embed_dim = 384
+depth = 12
+num_heads = 6
+n_storage_tokens = 4
+# Both are load-bearing for any config descended from a released DINOv3 checkpoint; kept here so
+# this file can be copied as a starting point without silently dropping them.
+layerscale_init = 1.0e-05
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+# Superposition, so `rope_embed.depth_scale` exists -- which is what makes this smoke run cover the
+# `lora_required_trainable` path. Under "vanilla" the model declares nothing required and that
+# branch goes untested.
+pos_embed_rope_type = "superposition"
+
+# No [init]: this run starts from scratch, because what it validates is the adaptation machinery
+# rather than a transfer. A zero-initialised adapter is an exact no-op on *any* starting weights, so
+# the property under test does not need pretrained ones. Add a path here to smoke-test the full
+# released-checkpoint chain as well.
+
+[lora]
+rank = 8
+alpha = 16.0              # scaling = alpha/rank = 2.0, stated rather than defaulted
+targets = ["attn_qkv", "attn_proj"]
+# The three defaults, written out because this file doubles as documentation of the surface:
+train_stem = true         # the patch embedding has no pretrained answer to preserve
+train_norms = true        # LayerNorm gains/biases + LayerScale gammas
+train_tokens = true       # cls/storage/mask tokens; SimMIM shapes the mask token
+
+[algorithm]
+name = "simmim"
+mask_ratio = 0.6
+mask_granularity = 2
+norm_pix_loss = false
+
+[data]
+name = "miao_volumes"
+output_axes = "lcxyz"
+patch_size = [64, 64, 64]
+samples_per_epoch = 200
+
+[[data.volumes]]
+name = "NISB base seed0"
+path = "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed0.zarr"
+image_key = "raw"
+zarr_version = "zarr3"
+normalize = true
+
+[trainer]
+max_steps = 20
+batch_size = 1
+lr = 3.0e-4
+warmup_steps = 2
+precision = "bf16"
+log_every = 1
+checkpoint_every = 10     # exercises DCP save and the resume path over the adapter tensors
+# `freeze_backbone_steps` is deliberately absent and cannot be added: it and [lora] are rejected
+# together, because the freeze would flip requires_grad back on for tensors no param group holds.
+# See RunConfig.__post_init__.
+
+[parallelism]
+dp_shard = 2

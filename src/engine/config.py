@@ -30,10 +30,24 @@ class InitConfig:
     skip: tuple[str, ...] = ()
     strict: bool = True
     allow_unused: bool = False
+    # Fold any LoRA adapter in the checkpoint into the base weight it adapts, and drop it, before
+    # matching against this model. What it is for: a stage that adapted an encoder through LoRA
+    # produces a checkpoint carrying `.lora_a`/`.lora_b`/`.lora_scaling` beside every adapted
+    # `weight`. Merging turns that into a plain checkpoint of the model it is *equivalent to* --
+    # which is what lets the next stage either (a) load it into a model that knows nothing about
+    # LoRA, or (b) load it into a freshly adapted model, where the previous stage's adaptation has
+    # become part of the frozen prior and the new adapter starts from zero again. (b) is the
+    # difference between chaining adapters and re-basing them, and it is one key rather than two
+    # configs because the checkpoint states its own scaling.
+    merge_lora: bool = False
 
     def __post_init__(self) -> None:
         if not self.path and (
-            self.prefix or self.inflate_2d_to_3d or self.skip or self.allow_unused
+            self.prefix
+            or self.inflate_2d_to_3d
+            or self.skip
+            or self.allow_unused
+            or self.merge_lora
         ):
             raise ValueError(
                 "[init] sets loading options but no 'path', so nothing would be loaded and the "
@@ -41,6 +55,81 @@ class InitConfig:
             )
         # TOML gives arrays as lists; freeze so the config stays hashable and immutable.
         object.__setattr__(self, "skip", tuple(self.skip))
+
+
+@dataclass(frozen=True)
+class LoRAConfig:
+    """Adapt a pretrained encoder through low-rank deltas instead of updating it outright.
+
+    Off by default (`rank = 0`), like every other mechanism here that changes what a run trains.
+
+    What this is for: a training stage whose job is to *adapt* a pretrained backbone rather than
+    replace it. The base weights are frozen and each targeted projection gains a rank-`r` delta
+    initialised to exactly zero, so the run starts computing precisely what the pretrained model
+    did and can only move within an `r`-dimensional subspace per layer. It costs almost nothing in
+    memory (the saving is optimizer state and weight gradients, ~450 MB per rank on a ViT-L at
+    dp_shard 8) and *nothing* in compute: backward still traverses the whole stack to reach the
+    adapters. Reach for it for the inductive bias, not for the budget.
+
+    Which parameters stay fully trainable is the other half of the setting. The three `train_*`
+    switches below cover the parts of a 2D-pretrained encoder that genuinely start wrong or cost
+    nothing to open; a model may additionally *require* a parameter to keep training, through
+    `BaseModel.lora_required_trainable`, and no config can override that.
+    """
+
+    # 0 disables. `scaling = alpha / rank` multiplies the delta, so the two numbers are not
+    # independent -- which is why `alpha` has no default. A default would mean that raising `rank`
+    # to buy capacity silently *halved* the scale of the delta, and nothing in the run would say so.
+    rank: int = 0
+    alpha: float = 0.0
+    # Group names from `BaseModel.lora_target_groups()`; a name the model does not offer is an
+    # error naming the menu. Attention only, which is where LoRA was shown to pay best; add "mlp"
+    # to roughly triple the adapter's parameter count.
+    targets: tuple[str, ...] = ("attn_qkv", "attn_proj")
+
+    # The input stem -- `engine.optimizer.is_stem`, the same partition the layerwise learning rate
+    # and the frozen warm-up use. An inflated RGB kernel now reading single-channel EM is the one
+    # layer with no pretrained answer at all, and a rank-`r` correction to a wrong stem is not the
+    # tool for it. 4.2M params on a ViT-L/16 at patch 16.
+    train_stem: bool = True
+    # LayerNorm gains and biases, plus LayerScale gammas: 0.15M params on a ViT-L, and the
+    # parameters that absorb a change in input statistics most directly. Opening them is what
+    # essentially every PEFT recipe does.
+    train_norms: bool = True
+    # CLS, storage and mask tokens -- 6.1K params. The mask token is what a masked-image objective
+    # substitutes for what it hid, so an SSL stage that froze it would be adapting to a fixed
+    # stand-in it cannot shape.
+    train_tokens: bool = True
+
+    def enabled(self) -> bool:
+        return self.rank > 0
+
+    def __post_init__(self) -> None:
+        # TOML gives arrays as lists; freeze so the config stays hashable and immutable.
+        object.__setattr__(self, "targets", tuple(self.targets))
+        if self.rank < 0:
+            raise ValueError(f"[lora].rank must be >= 0, got {self.rank}; 0 disables")
+        if not self.enabled():
+            if self.alpha or not self.targets:
+                raise ValueError(
+                    "[lora] sets options but leaves rank at 0, so no adapter would be built and "
+                    "the run would silently train the whole encoder. Set rank, or drop the section."
+                )
+            return
+        if self.alpha <= 0.0:
+            raise ValueError(
+                f"[lora].alpha must be > 0 when rank is set, got {self.alpha}. The delta is scaled "
+                f"by alpha/rank, so state it explicitly: with rank = {self.rank}, alpha = "
+                f"{2 * self.rank} gives the commonly used scaling of 2."
+            )
+        if not self.targets:
+            raise ValueError(
+                "[lora].targets is empty, so the adapter would attach to nothing while the encoder "
+                "sat frozen. Name at least one group from the model's lora_target_groups()."
+            )
+        duplicates = sorted({name for name in self.targets if self.targets.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"[lora].targets repeats {duplicates}")
 
 
 @dataclass(frozen=True)
@@ -137,6 +226,15 @@ class TrainerConfig:
     # the layer exists to provide. Exempting them is what essentially every transformer recipe
     # does, DINOv3's included, which is why it is the default here rather than an opt-in.
     zero_weight_decay_on_norm_and_bias: bool = True
+    # The same exemption for a LoRA adapter's two factors, and it is on by default for a reason
+    # worth stating. `wd_scale` decides by *rank*, and `lora_a`/`lora_b` are both 2-D, so without
+    # this they receive the full `weight_decay`. Decaying `lora_b` -- which starts at zero --
+    # shrinks the *delta*, not a weight matrix, which is an implicit pull of the adapted model back
+    # toward the pretrained weights it started from. That may well be desirable, but it is a
+    # regularizer toward θ₀ rather than toward the origin, its strength would be set by a key named
+    # for something else, and a run would carry it with nothing to show it. Set this false to opt
+    # into that anchor deliberately.
+    zero_weight_decay_on_lora: bool = True
 
     # Recompute the model's and algorithm's declared regions during backward instead of storing
     # their activations: roughly 30% more compute for most of the activation memory back. What

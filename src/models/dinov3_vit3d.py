@@ -408,6 +408,59 @@ class DinoVisionTransformer3D(BaseModel):
         """The transformer blocks: repeated, sequence-length-sized, and cheap to rerun."""
         return tuple(self.blocks)
 
+    def _self_attention_blocks(self) -> tuple[SelfAttentionBlock, ...]:
+        """`self.blocks` with its element type recovered, which `nn.ModuleList` erases."""
+        blocks = []
+        for block in self.blocks:
+            assert isinstance(block, SelfAttentionBlock)
+            blocks.append(block)
+        return tuple(blocks)
+
+    def lora_target_groups(self) -> dict[str, tuple[nn.Linear, ...]]:
+        """The three sets of projections in this stack worth adapting.
+
+        `attn_qkv` is the *fused* query/key/value projection, one Linear of `dim -> 3 * dim` per
+        block, so an adapter on it shares its down-projection across q, k and v rather than giving
+        each its own. That is the standard treatment of a fused qkv and it is the only one available
+        without splitting the layer, which would change its parameter names and forfeit the
+        checkpoint compatibility this whole mechanism is built on.
+
+        `mlp` is collected by walking the FFN for Linears rather than naming its attributes, because
+        the two feed-forward variants disagree about them -- `Mlp` has `fc1`/`fc2` while `SwiGLUFFN`
+        has `w1`/`w2`/`w3` -- and a group that silently covered only one of them would adapt nothing
+        on a model configured with the other.
+        """
+        blocks = self._self_attention_blocks()
+        return {
+            "attn_qkv": tuple(block.attn.qkv for block in blocks),
+            "attn_proj": tuple(block.attn.proj for block in blocks),
+            "mlp": tuple(
+                module
+                for block in blocks
+                for module in block.mlp.modules()
+                if isinstance(module, nn.Linear)
+            ),
+        }
+
+    def lora_required_trainable(self) -> tuple[str, ...]:
+        """`rope_embed.depth_scale`, under superposition RoPE only.
+
+        Superposition computes `angles_spatial + depth_scale * angles_depth`, and `depth_scale` is a
+        single scalar initialised to zero -- and additionally listed in `[init].skip` by every
+        config that loads a 2D checkpoint, since the 2D rotary buffers have no third axis to
+        transfer. So it arrives at exactly zero, and at zero the positional encoding is
+        *identical* for every z-slice at the same in-plane position: the model can still mix depth
+        through attention values, but it cannot tell where along z anything sits. Freezing it as
+        backbone would train a volumetric encoder with a two-dimensional sense of position, which
+        no metric in the run would flag.
+
+        The vanilla variant gives depth its own third of the rotary channels and has no such gate,
+        so it declares nothing.
+        """
+        if isinstance(self.rope_embed, RopePositionEmbedding3DSuperposition):
+            return ("rope_embed.depth_scale",)
+        return ()
+
     def prepare_input(self, batch: torch.Tensor, axes: str) -> torch.Tensor:
         """(B, *axes) -> (B, C, D, H, W). Single-scale: exactly one level per sample.
 

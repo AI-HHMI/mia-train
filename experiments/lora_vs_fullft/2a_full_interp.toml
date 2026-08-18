@@ -1,0 +1,120 @@
+# Arm 2 (full fine-tune) stage 1 of 2: the control. Supervised affinities on NISB base with the
+# interpolating head, from the released DINOv3 ViT-L/16, training all 306.6M parameters.
+#
+# Byte-identical to 1a_lora_interp.toml except that it has no [lora] section. This is also the
+# recipe new_ssl_recipe's arm 1 runs at 100k rather than 50k, so its curve should track that run's
+# for the first 50k steps up to the schedule difference.
+#
+# See README.md for what the two arms isolate and for the learning-rate caveat.
+
+experiment_name = "lvf__2a_full_interp"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256            # 16^3 = 4096 tokens at patch 16
+patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
+in_chans = 1
+embed_dim = 1024          # ViT-L/16: 303.2M released params, 306.6M with a 16^3 single-channel stem
+depth = 24
+num_heads = 16            # head_dim 64
+n_storage_tokens = 4      # the released ViTs carry 4 registers
+# Neither of the next two is optional, and both are easy to lose when a config is copied: the
+# released weights were trained with LayerScale gains and a per-block masked key bias. A model
+# built without them has nowhere to put those tensors and computes a different function; `strict`
+# turns that into an error rather than a silent regression.
+layerscale_init = 1.0e-05
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+# Superposition, not vanilla: a released 2D checkpoint says nothing about a third axis, and vanilla
+# rearranges the very channel layout the pretrained attention was fitted against. Superposition
+# keeps the 2D layout and adds a gated depth angle on top, so the weights transfer unchanged.
+#
+# That gate, `rope_embed.depth_scale`, is a single scalar starting at zero, and at zero the
+# positional encoding cannot distinguish one z-slice from another. Under [lora] it is held
+# trainable unconditionally -- the model declares it through `lora_required_trainable()`, and no
+# [lora] switch can freeze it. Arm 2 trains everything, so the question does not arise there.
+pos_embed_rope_type = "superposition"
+
+[init]
+path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+inflate_2d_to_3d = true   # (1024,3,16,16) -> (1024,1,16,16,16): RGB averaged, spread over depth
+# The rotary tables are derived from `base` in the model's own init_weights, not learned, and the
+# 2D checkpoint splits its channels over two axes where this model splits over three -- so their
+# lengths disagree and there is nothing to transfer. Skipping costs nothing here.
+skip = ["rope_embed."]
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+# The interpolating head first, in both arms. Three attempts at the sub-pixel head from an encoder
+# that had never seen EM all collapsed onto the trivial "everything is connected" predictor, while
+# this head reached 0.3691 nERL from these same released weights (banis_parity). Stage b then
+# warm-starts the sub-pixel head from the encoder this stage produces -- the sequence that produced
+# the repo's best result, 0.4941 (subpixel_decoder).
+decoder = "interpolate"
+decoder_hidden_dim = 64
+
+[data]
+name = "miao_volumes"
+# The five NISB `base` training cubes at 256^3 with the 16 in-plane rotations/flips. Byte-identical
+# to new_ssl_recipe's and init_comparison's copies, so numbers here sit beside theirs.
+config_path = "experiments/lora_vs_fullft/nisb_base_256_aug.yaml"
+samples_per_epoch = 1000  # bookkeeping only; `max_steps` is what ends the run
+
+[val_data]
+name = "miao_volumes"
+# The held-out cube, in no training config. The inline keys below *replace* the YAML's `volumes`
+# rather than extend it, so this is one cube and not a sixth training one.
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [256, 256, 256]
+# 32 crops is a progress readout, not a model selector: in subpixel_decoder the lowest val loss did
+# not pick the best checkpoint (85k won on loss, 100k on nERL). The arms are compared by scoring
+# checkpoints with banis, not by this. 
+samples_per_epoch = 32
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/val/seed100.zarr"
+image_key = "raw"
+label_key = "labels/public_gt-cell-nisb"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+# 50k + 50k, as one 100k plan split at the head change rather than two plans back to back -- see
+# stage b's learning rate. Half the 100k + 100k that new_ssl_recipe's finetunes use, so these
+# encoders are younger than its and the comparison that matters is arm 1 against arm 2 *here*.
+max_steps = 50000
+batch_size = 1            # per rank; 8 ranks -> global batch 8, matching BANIS and every prior run
+lr = 3.0e-4
+warmup_steps = 2000
+min_lr_ratio = 0.01       # linear to 3e-6, so a run stopped early has still annealed
+lr_schedule = "linear"
+weight_decay = 0.05
+grad_clip_norm = 1.0
+# One rate for the whole model. The 0.9 x 0.2 pair these keys once carried left patch_embed at an
+# effective 1.4e-6, 696x below the baseline, and it is the layer with the most to relearn. Setting
+# both to 1.0 was worth about 11x nERL in banis_parity.
+layerwise_lr_decay = 1.0
+patch_embed_lr_mult = 1.0
+activation_checkpointing = false  # a ViT-L at 256^3 fits; recomputation is 30% compute for nothing
+precision = "bf16"
+log_every = 100
+val_every = 2500
+checkpoint_every = 2500   # 20 checkpoints per stage, the same granularity 5000 gave a 100k stage
+num_workers = 6
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1
+
+[augment]
+# "inplane" draws from the 16 transforms that never exchange z with x or y. The full 48-transform
+# group is refused against 9x9x20 nm voxels, since exchanging axes of unequal length produces
+# object shapes that do not occur in the specimen.
+rotate = "inplane"
