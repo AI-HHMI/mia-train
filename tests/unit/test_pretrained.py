@@ -286,3 +286,40 @@ def test_allow_unused_permits_a_checkpoint_that_holds_more(tmp_path):
 
     report = load_pretrained(plain, path, allow_unused=True)
     assert report.unused and report.copied
+
+
+@pytest.mark.unit
+def test_prefix_filtered_keys_are_reported_not_silently_dropped(tmp_path):
+    """A `prefix` narrow enough to discard tensors must say so.
+
+    This is the one failure mode `load_pretrained` cannot raise on: the filter runs before any
+    matching, so a key it removes is never a candidate to copy and never counts as `unused`
+    either. Every other signal reads healthy -- "copied N, 0 unused" -- while the model trains
+    with part of the checkpoint thrown away.
+
+    It is not hypothetical. A pseudo-labelling arm meant to warm-start from the model that
+    produced its labels ran with `prefix = "model."` against an algorithm checkpoint, which
+    filtered out the trained affinity head and left the run relearning it from random.
+    """
+    path, _ = _released_checkpoint(tmp_path, layerscale_init=1e-5, mask_k_bias=True)
+    model = DinoVisionTransformer(in_chans=3, layerscale_init=1e-5, mask_k_bias=True, **DINO)
+
+    unfiltered = load_pretrained(model, path)
+    assert not unfiltered.filtered_by_prefix
+    assert "filtered out by prefix" not in unfiltered.summary(), (
+        "a load with no prefix must read exactly as it always has"
+    )
+
+    # A prefix that matches only part of the checkpoint: everything else is silently discarded
+    # unless it is reported.
+    nested = tmp_path / "nested.pt"
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    tensors = state["model"] if isinstance(state.get("model"), dict) else state
+    torch.save(
+        {f"enc.{k}": v for k, v in tensors.items()} | {"head.weight": torch.zeros(2, 2)}, nested
+    )
+
+    report = load_pretrained(model, nested, prefix="enc.")
+    assert report.filtered_by_prefix == ["head.weight"]
+    assert "1 filtered out by prefix" in report.summary()
+    assert report.copied, "the prefix should still have matched the encoder"

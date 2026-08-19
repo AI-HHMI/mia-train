@@ -30,6 +30,28 @@ class InitConfig:
     skip: tuple[str, ...] = ()
     strict: bool = True
     allow_unused: bool = False
+    # What the checkpoint is loaded *into*.
+    #
+    # `"model"` (the default, and what every run before this used) loads the bare encoder, before
+    # the algorithm wraps it, so a strategy's own parameters -- a masked-autoencoding decoder, an
+    # affinity head -- keep the initialisation they were built with. That is the right default:
+    # the usual reason to set `[init]` is to start from a pretrained *encoder* and learn a new
+    # head, and silently inheriting a head trained for a different objective would be worse than
+    # useless.
+    #
+    # `"algorithm"` loads into the algorithm instead, so those parameters come from the checkpoint
+    # too. Use it to genuinely continue a previous run's model -- not merely its encoder -- in a
+    # new run with a fresh optimizer and step counter, which `--resume` cannot do because it
+    # restores both. A pseudo-labelling round that warm-starts from the model that produced its
+    # labels is the motivating case: dropping that model's head would throw away trained weights
+    # for no reason and hand the student a random head to rediscover.
+    #
+    # The two need different `prefix` values, because they sit at different depths: an algorithm
+    # checkpoint stores the encoder under `model.` *within* the algorithm, so `target = "model"`
+    # wants `prefix = "model."` to reach past it while `target = "algorithm"` wants `prefix = ""`.
+    # An algorithm that registers one module under two names (`affinity_seg` exposes its encoder
+    # as both `model` and `encoder`) also stores it twice, so the duplicate needs `skip`.
+    target: str = "model"
     # Fold any LoRA adapter in the checkpoint into the base weight it adapts, and drop it, before
     # matching against this model. What it is for: a stage that adapted an encoder through LoRA
     # produces a checkpoint carrying `.lora_a`/`.lora_b`/`.lora_scaling` beside every adapted
@@ -42,12 +64,17 @@ class InitConfig:
     merge_lora: bool = False
 
     def __post_init__(self) -> None:
+        if self.target not in ("model", "algorithm"):
+            raise ValueError(
+                f"[init].target must be 'model' or 'algorithm', got {self.target!r}"
+            )
         if not self.path and (
             self.prefix
             or self.inflate_2d_to_3d
             or self.skip
             or self.allow_unused
             or self.merge_lora
+            or self.target != "model"
         ):
             raise ValueError(
                 "[init] sets loading options but no 'path', so nothing would be loaded and the "

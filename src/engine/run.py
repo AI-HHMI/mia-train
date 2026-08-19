@@ -208,11 +208,15 @@ def prepare_model(config: RunConfig) -> Any:
     parameters -- a masked-autoencoding decoder, an affinity head -- must keep the initialisation
     they were built with and train at full rank. It is also before any parallelism, so the load and
     the promotion both see plain unsharded tensors.
+
+    `[init].target = "algorithm"` opts out of exactly that first property, and is therefore applied
+    in `build_trainer` instead, once the algorithm exists. LoRA still precedes the load either way,
+    so the ordering this function exists to pin is unaffected.
     """
     model = ModelRegistry.build(config.model.name, **config.model.kwargs)
     if config.lora.enabled():
         print(f"[lora] {apply_lora(model, config.lora).summary()}", flush=True)
-    if config.init.path:
+    if config.init.path and config.init.target == "model":
         load_pretrained(
             model,
             config.init.path,
@@ -266,6 +270,20 @@ def build_trainer(
     algorithm = AlgorithmRegistry.build(
         config.algorithm.name, model, train_dataset, **config.algorithm.kwargs
     )
+    # `[init].target = "algorithm"` loads here rather than in `prepare_model`, because only now do
+    # the algorithm's own parameters exist to load into. Still before any parallelism, so the load
+    # sees plain unsharded tensors exactly as the model-level one does.
+    if config.init.path and config.init.target == "algorithm":
+        load_pretrained(
+            algorithm,
+            config.init.path,
+            prefix=config.init.prefix,
+            inflate=config.init.inflate_2d_to_3d,
+            skip=config.init.skip,
+            strict=config.init.strict,
+            allow_unused=config.init.allow_unused,
+            merge_lora=config.init.merge_lora,
+        )
     # After the algorithm exists, because only it knows what it needs, and before the Trainer
     # builds its dataloaders, because `attach_transform` refuses a dataset already materialised.
     #

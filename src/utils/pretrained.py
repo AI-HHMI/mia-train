@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,14 @@ class LoadReport:
     kept_initial: list[str] = field(default_factory=list)
     unused: list[str] = field(default_factory=list)
     mismatched: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = field(default_factory=list)
+    # Checkpoint keys `prefix` removed before any matching happened.
+    #
+    # These are invisible to every other category: the filter runs first, so a key it drops is
+    # never a candidate to be copied and never counts as `unused` either. That is how an [init]
+    # can look completely healthy -- "370 copied, 0 unused" -- while silently discarding a trained
+    # head, which is exactly what happened to a pseudo-labelling arm meant to warm-start from the
+    # model that produced its labels. Recorded so the count appears in the run's log.
+    filtered_by_prefix: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         parts = [
@@ -57,6 +66,9 @@ class LoadReport:
         ]
         if self.mismatched:
             parts.append(f"{len(self.mismatched)} shape mismatches")
+        # Appended only when it happened, so a load without a prefix reads exactly as before.
+        if self.filtered_by_prefix:
+            parts.append(f"{len(self.filtered_by_prefix)} filtered out by prefix")
         return ", ".join(parts)
 
 
@@ -230,7 +242,9 @@ def load_pretrained(
     it costs nothing, so it is skipped rather than treated as a mismatch.
     """
     checkpoint = read_state_dict(path)
+    filtered_by_prefix: list[str] = []
     if prefix:
+        filtered_by_prefix = sorted(key for key in checkpoint if not key.startswith(prefix))
         checkpoint = {
             key[len(prefix) :]: value for key, value in checkpoint.items() if key.startswith(prefix)
         }
@@ -252,7 +266,7 @@ def load_pretrained(
     destinations: dict[str, torch.Tensor] = dict(model.named_parameters())
     destinations.update(model.named_buffers())
 
-    report = LoadReport(merged=merged_layers)
+    report = LoadReport(merged=merged_layers, filtered_by_prefix=filtered_by_prefix)
     with torch.no_grad():
         for name, destination in destinations.items():
             source = checkpoint.pop(name, None)
@@ -309,7 +323,38 @@ def load_pretrained(
             f"configured differently from the one that was trained: {report.unused[:6]}"
             f"{' ...' if len(report.unused) > 6 else ''}\n{_unused_hint(report)}"
         )
+    _log_load(model, path, report)
     return report
+
+
+def _log_load(model: nn.Module, path: Path, report: LoadReport) -> None:
+    """Put what `[init]` actually did into the run's log, on the primary rank.
+
+    A successful load used to say nothing at all, which made the one failure mode that raises no
+    error impossible to notice after the fact: a `prefix` narrow enough to drop tensors you meant
+    to keep. Nothing is wrong from `load_pretrained`'s point of view -- every key it was shown
+    found a home -- so it returns quietly and the run trains on a partly-initialised model.
+
+    The categories that mean "something did not arrive" are therefore named with examples, not
+    just counted. `filtered_by_prefix` is the one worth reading first: a nonzero count next to a
+    `prefix` is either deliberate (lifting an encoder out of an algorithm checkpoint) or the bug.
+    """
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    def examples(names: list[str], limit: int = 4) -> str:
+        return ", ".join(names[:limit]) + (" ..." if len(names) > limit else "")
+
+    print(f"[init] {type(model).__name__} <- {path}", flush=True)
+    print(f"[init]   {report.summary()}", flush=True)
+    for label, names in (
+        ("filtered out by prefix", report.filtered_by_prefix),
+        ("skipped", report.skipped),
+        ("kept at initial value", report.kept_initial),
+        ("unused from checkpoint", report.unused),
+    ):
+        if names:
+            print(f"[init]   {len(names)} {label}: {examples(names)}", flush=True)
 
 
 def _unused_hint(report: LoadReport) -> str:

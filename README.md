@@ -24,7 +24,7 @@ Machine-local paths (dataset roots, checkpoint directory, venv, scheduler projec
 
 ## Running a training job
 
-Always run jobs through `torchrun`, never `python src/train.py` directly:
+Jobs are run through `torchrun`:
 
 ```bash
 torchrun --standalone --nproc_per_node=<gpus> src/train.py --config configs/<run>.toml
@@ -46,7 +46,7 @@ for single-node, multi-node and resume recipes.
 
 ## Configuration
 
-A run is one TOML file with these sections:
+Each run is defined by a `.toml` config file with the following sections:
 
 ```toml
 experiment_name = "my_run"
@@ -61,7 +61,7 @@ experiment_name = "my_run"
 [parallelism]  # dp_replicate, dp_shard, tp; must multiply to the torchrun world size
 ```
 
-`[trainer].batch_size` is **per rank**, so the global batch is `batch_size × dp_replicate × dp_shard`.
+Note that `[trainer].batch_size` is per rank, so the global batch size is `batch_size × dp_replicate × dp_shard`.
 
 See `configs/*.toml` for working examples.
 
