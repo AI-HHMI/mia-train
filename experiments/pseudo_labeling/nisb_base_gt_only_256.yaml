@@ -1,0 +1,52 @@
+# GT-ONLY CONTROL for the pseudo-labelling experiment.
+# The 5 NISB base training cubes with their REAL labels and nothing else. Identical in every
+# other respect to a round-1 arm, so a run against this isolates one question: how much of
+# arm 1's deficit is the pseudo-labels and how much is simply 10k steps being too few to
+# learn a sub-pixel decoder from random initialisation.
+# 5 cubes at weight 0.2 each; patch 256 to match the arms.
+resolutions:
+- - 9
+  - 9
+  - 20
+output_axes: lcxyz
+patch_size:
+- 256
+- 256
+- 256
+samples_per_epoch: 1000
+volumes:
+- name: NISB base seed0
+  path: /groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed0.zarr
+  image_key: raw
+  label_key: labels/public_gt-cell-nisb
+  zarr_version: zarr3
+  weight: 0.2
+  normalize: true
+- name: NISB base seed1
+  path: /groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed1.zarr
+  image_key: raw
+  label_key: labels/public_gt-cell-nisb
+  zarr_version: zarr3
+  weight: 0.2
+  normalize: true
+- name: NISB base seed2
+  path: /groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed2.zarr
+  image_key: raw
+  label_key: labels/public_gt-cell-nisb
+  zarr_version: zarr3
+  weight: 0.2
+  normalize: true
+- name: NISB base seed3
+  path: /groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed3.zarr
+  image_key: raw
+  label_key: labels/public_gt-cell-nisb
+  zarr_version: zarr3
+  weight: 0.2
+  normalize: true
+- name: NISB base seed4
+  path: /groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed4.zarr
+  image_key: raw
+  label_key: labels/public_gt-cell-nisb
+  zarr_version: zarr3
+  weight: 0.2
+  normalize: true

@@ -80,17 +80,12 @@ weight = 1.0
 normalize = true
 
 [trainer]
-# 10k, not the 50k this launched with. Measured on the first run: train `boundary_accuracy` against
-# the pseudo-labels plateaus at ~0.95 by step 2000-3000 and does not move after, while a 50k cosine
-# leaves the LR at 2.92e-4 -- essentially peak -- all the way to step 7400. So the model had
-# converged and was bouncing at high LR for the remaining 43k steps.
-#
-# Worth being clear about what that plateau is and is not. Training accuracy here is measured
-# against the *teacher's own filtered output*, so saturating it means the student has learned to
-# agree with its teacher on the cases the teacher was already confident about. That is the
-# degenerate outcome this experiment is built to detect, not evidence the student is good -- only
-# `val/*`, on real held-out labels, speaks to that. Filtering at logit +7 for precision keeps the
-# easy, confident targets and drops the hard ones, so fast saturation is expected.
+# 100k, not the 10k this ran at before. The 10k came from watching val plateau by step ~3000 --
+# but that was measured on 0.93% coverage, where 80,000 crops had already exhausted a tiny,
+# heavily-overlapping label set. At full coverage there are ~6.8e11 distinct 256^3 crop centres, so
+# 80,000 crops samples about 1e-7 of what exists: the plateau was data exhaustion, not convergence.
+# 100k also matches teacher_0's own budget (100k at global batch 8), which makes student-vs-teacher
+# a like-for-like comparison rather than one confounded by training length.
 max_steps = 10000
 # 4 per rank across 2 ranks -- the same global batch of 8 the teacher's recipe used, on a quarter
 # of the GPUs. Measured against the 8x1 layout on identical data: 16.4 samples/s against 31.5, so
@@ -114,17 +109,23 @@ lr = 3.0e-4
 # The head is randomly initialised in BOTH arms (`prefix = "model."` loads the encoder only), so
 # this is not an arm-specific hazard.
 warmup_steps = 2000
-min_lr_ratio = 0.1
+# 0.001 rather than 0.1: end at 3e-7 instead of 3e-5. With the plateau arriving early, the last
+# steps are worth more as consolidation at a genuinely small rate than as continued movement.
+min_lr_ratio = 0.001
 weight_decay = 0.05
 grad_clip_norm = 1.0
 layerwise_lr_decay = 1.0
 patch_embed_lr_mult = 1.0
-lr_schedule = "cosine"
+# Linear, not cosine. A cosine spends most of its length near the peak and only anneals late,
+# which is the wrong shape here: both arms' val boundary_accuracy saturated by step ~3000 and then
+# drifted sideways or *down* for the remaining 7000, so the useful part of the run is early and the
+# schedule should get out of its way rather than hold a high rate through the flat region.
+lr_schedule = "linear"
 activation_checkpointing = false
 precision = "bf16"
 log_every = 100
 val_every = 1000
-checkpoint_every = 1000
+checkpoint_every = 1000   # 10 ckpts x 4.8 GB = 48 GB; at 5000 a 10k run saves only 2
 num_workers = 10   # 12 cores per rank at 24 slots, against 1.5 at 8 ranks on 96
 seed = 0
 

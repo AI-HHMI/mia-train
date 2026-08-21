@@ -1,0 +1,109 @@
+# Data scaling on NISB base, arm "1 cube", stage A: interpolating decoder, 200k steps.
+#
+# Does NISB `base` still carry information at its fifth cube, or has it saturated below that? The
+# benchmark's own baselines show 100 cubes doing no better than 5, which says the *upper* end is
+# flat; this asks where the flat part starts. Pure supervised finetuning from the released DINOv3
+# weights -- no SSL, no pseudo-labels -- so the only thing separating the arms is 1 cube of
+# labels against 3 and 5.
+#
+# Stage A is the recipe that produced `banis_parity__finetune_256_long`, at 200k rather than 300k
+# because 200k is the checkpoint that lineage actually went on to use. It exists to give stage B a
+# trained encoder: a sub-pixel head has never once trained from a cold encoder here -- three
+# attempts all collapsed onto "everything is connected" (init_comparison/README.md) -- so the two
+# stages are a requirement of the architecture, not a schedule choice.
+experiment_name = "ds__1cube_interp"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256            # 16^3 = 4096 tokens at patch 16
+patch_size = 16           # fixed by the checkpoint: the in-plane kernel transfers as is
+in_chans = 1
+embed_dim = 1024          # ViT-L/16, 303M parameters
+depth = 24
+num_heads = 16
+n_storage_tokens = 4      # the released ViTs carry 4 registers
+layerscale_init = 1.0e-05 # NOT optional -- the released weights were trained with LayerScale
+mask_k_bias = true        # ditto: the checkpoint carries a masked key bias per block
+pos_embed_rope_dtype = "fp32"
+pos_embed_rope_type = "superposition"
+drop_path_rate = 0.1      # as in pseudo_labeling; held equal across arms, so not a confound
+
+[init]
+# The released 2D DINOv3 ViT-L/16, inflated along z. This is the "pretrained checkpoint" baseline
+# the whole comparison is against.
+path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+inflate_2d_to_3d = true
+skip = ["rope_embed."]    # a 2D checkpoint says nothing about a third axis
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder = "interpolate"
+decoder_hidden_dim = 64
+split_disconnected = true
+
+[data]
+name = "miao_volumes"
+config_path = "experiments/data_scaling/nisb_base_1cube_256.yaml"
+samples_per_epoch = 1000
+
+[val_data]
+# The same held-out cube every run in this line of work has been scored on. Untouched by the arm:
+# only the *training* set changes, so val is directly comparable across arms and back to
+# banis_parity / subpixel_decoder / pseudo_labeling.
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [256, 256, 256]
+samples_per_epoch = 32
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/val/seed100.zarr"
+image_key = "raw"
+label_key = "labels/public_gt-cell-nisb"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+max_steps = 200000
+batch_size = 1            # per rank; 8 ranks -> global batch 8
+lr = 3.0e-4
+warmup_steps = 2000       # 500 collapsed both pseudo-labelling arms onto the trivial predictor
+min_lr_ratio = 0.001
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 1.0  # the stem must move: 0.9 x 0.2 put patch_embed 696x below BANIS' LR
+patch_embed_lr_mult = 1.0
+lr_schedule = "linear"
+activation_checkpointing = false
+precision = "bf16"
+log_every = 100
+val_every = 5000
+checkpoint_every = 20000
+num_workers = 6           # as in the 8-rank runs this recipe was measured on
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8              # one full node per arm
+tp = 1
+
+[augment]
+# BANIS' own defaults, as used by the pseudo-labelling arms. "inplane" draws from the 16
+# transforms that never exchange z with x or y; the full 48-transform group is refused against
+# 9x9x20 nm voxels, since exchanging axes of unequal size produces shapes that do not occur in
+# the specimen. This matters more here than usual -- with one cube, augmentation is most of what
+# stands between the run and memorising 8.2e9 crop centres of a single volume -- so it is held
+# identical across the arms rather than tuned per arm.
+rotate = "inplane"
+drop_slice_prob = 0.05
+shift_slice_prob = 0.05
+shift_magnitude = 10
+intensity = true
+mul_intensity = 0.1
+add_intensity = 0.1
+noise_scale = 0.5

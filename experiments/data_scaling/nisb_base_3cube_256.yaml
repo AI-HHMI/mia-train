@@ -1,0 +1,37 @@
+# NISB base, first 3 of the 5 training cubes, real labels, patch 256.
+# One of three configs that differ in NOTHING but which cubes are listed and their weight, so a
+# run against each isolates the effect of labelled-data quantity. Cubes are taken in seed order
+# rather than at random so the 1- and 3-cube sets are nested inside the 5-cube set: the arms then
+# form a chain of subsets, and a difference between them cannot be a difference of *which* cubes.
+resolutions:
+- - 9
+  - 9
+  - 20
+output_axes: lcxyz
+patch_size:
+- 256
+- 256
+- 256
+samples_per_epoch: 1000
+volumes:
+- name: NISB base seed0
+  path: /groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed0.zarr
+  image_key: raw
+  label_key: labels/public_gt-cell-nisb
+  zarr_version: zarr3
+  weight: 0.333333
+  normalize: true
+- name: NISB base seed1
+  path: /groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed1.zarr
+  image_key: raw
+  label_key: labels/public_gt-cell-nisb
+  zarr_version: zarr3
+  weight: 0.333333
+  normalize: true
+- name: NISB base seed2
+  path: /groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/train/seed2.zarr
+  image_key: raw
+  label_key: labels/public_gt-cell-nisb
+  zarr_version: zarr3
+  weight: 0.333333
+  normalize: true

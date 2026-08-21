@@ -41,9 +41,50 @@ TEACHER0_STEP=100000
 
 CUBES=${CUBES:-/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/train_100/train}
 N_CUBES=${N_CUBES:-100}
-BLOCKS=${BLOCKS:-2}          # 384^3 blocks per cube
-BLOCK=${BLOCK:-384}
-GT_WEIGHT=${GT_WEIGHT:-0.3}  # share of training samples drawn from real base labels
+# **The whole cube, not a sample of it.** The original 2-blocks-of-384 budget was inherited from
+# mutex watershed's ~7 us/voxel cost and never revisited after the switch to cc3d, and it left the
+# experiment pseudo-labelling 0.93% of train_100 -- 0.19x the volume of real labels in `base`, with
+# base offering 96x more distinct 256^3 crop centres than all 200 blocks combined. The premise was
+# 20x MORE data than base; it was delivering a fifth as much.
+#
+# Storage was never the obstacle: these labels compress 21.8x (measured, 200x384^3 = 42 GB dense
+# but 1.94 GB on disk), so all 100 cubes at full coverage are ~208 GB, not the 4.4 TB the dense
+# figure suggests. The real cost is GPU prediction, which is why this runs on L4s.
+BLOCKS=${BLOCKS:-2}          # only used when --full-cube is off
+FULL_CUBE=${FULL_CUBE:-1}
+# Max tile edge -> a 2x2x1 partition into 1500x1500x1350 tiles, 4 per cube.
+#
+# The ceiling is not memory, it is cc3d: `color_connectivity_graph` indexes in uint32 and rejects
+# any region of 2^32 voxels or more before doing any work. Measured by bisection -- 1620^3 (4.252e9)
+# passes, 1700^3 (4.913e9) fails; 3000x3000x450 passes, x500 fails. So one tile per whole cube is
+# impossible at 1.215e10 voxels, 2.8x over, no matter how much RAM is thrown at it.
+#
+# 1500 is the best tile under that ceiling on every axis at once: 0.71x of the limit (comfortable
+# margin), 82.3% of the cube's 256^3 crop centres reachable against 50.9% at target 1000, and 5,760
+# patches per cube against 6,912 -- 17% CHEAPER, because fewer tiles means less margin re-prediction.
+# Peak is ~141 GB for the build and ~100 GB for prediction with the slab-wise normalisation.
+BLOCK=${BLOCK:-1500}
+# 128, not 64. The margin has two jobs and they want different sizes: it must exceed the
+# long-range offset (10) for the long-range affinity channels to be computed from real data at
+# all, which 64 already did -- but it must also be at least the patch STRIDE for every voxel of
+# the tile to be central to some patch. At stride 128 a voxel 64 from the read edge is only ever
+# covered by patches where it sits near their edge, which is where the model is least reliable and
+# exactly what the blending weight down-weights. ~8.5% of a cube lies within 64 of an internal
+# seam, weak affinities there drop edges, and dropped edges are splits -- the failure mode that
+# sank round 1. Costs 1440 -> 1690 patches per tile (+17%).
+MARGIN=${MARGIN:-128}
+# 0.2. This went 0.3 -> 0.5 -> 0.2, and the middle value was the wrong reaction to the wrong
+# problem: 0.5 was a hedge against round 1's pseudo-labels being actively harmful, which they were
+# -- but they were harmful because there were almost none of them (0.93% coverage) and they were
+# over-fragmented (+7). With 100% coverage and +5 both fixed, leaning on 5 real cubes for half the
+# gradient caps the contribution of the 107x more data we just generated.
+#
+# 0.2 also matches the method: NoisyStudent trains on 300M unlabelled against 1.3M labelled, with
+# the unlabelled batch several times LARGER, not equal. And 0.2 still oversamples the real labels
+# heavily relative to their number: 5 base cubes at 0.04 each against 100 pseudo cubes at 0.008
+# each (4 tiles x 0.002), so a base cube is drawn 5x more often than any pseudo cube. It was 20x
+# at GT_WEIGHT=0.5.
+GT_WEIGHT=${GT_WEIGHT:-0.2}  # share of training samples drawn from real base labels
 
 # Filter thresholds, from `mia_pseudolabel calibrate` over 6 blocks of seed100 (the benchmark's
 # hyperparameter cube, which teacher_0 never trained on). Override from the environment rather
@@ -55,12 +96,18 @@ GT_WEIGHT=${GT_WEIGHT:-0.3}  # share of training samples drawn from real base la
 #     +7     0.559       0     161      <- first zero-merge threshold
 #     +8     0.486       0     177
 #
-# +7 rather than +6: a merge asserts "same object" across every pair spanning two fused neurons,
-# so zero of them is a qualitatively different regime from one, and the 6.7 points of coverage
-# +6 would add are not worth reintroducing the error class this whole pipeline is built to avoid.
-# Pairwise precision is useless for choosing here -- it saturates at 0.999+ across the entire
-# grid, because it is dominated by within-object pairs. The merge count is what discriminates.
-CC_LOGIT=${CC_LOGIT:-7}
+# **+5, revised down from +7 after round 1 failed.** The original reasoning picked the first
+# zero-merge threshold, on the grounds that a merge corrupts every pair spanning two fused neurons
+# while a split misstates only one seam. That is true of individual targets and wrong about what a
+# model learns from a whole distribution of them: +7's labels rendered a median 62 true objects as
+# 305 fragments, and the student learned that fragmentation as a behaviour, then amplified it --
+# 163 splits against teacher_0's 37 at a matched threshold, and 14.7% worse nERL than the teacher
+# that trained it. Its round-2 labels were worse again, at 656 fragments.
+#
+# +5 has *fewer* splits and more merges than +7 (138/4 against 161/0 on the calibration blocks),
+# and is also where teacher_0's own optimum sat. Trading a handful of merges for far less
+# systematic over-splitting is the bet this round tests.
+CC_LOGIT=${CC_LOGIT:-5}
 TAU_BG=${TAU_BG:-0.40}
 # Measured inert: any voxel CC labelled already exceeds this, so the band can only fire on voxels
 # CC dropped. Kept at its measured value for the record rather than removed.
@@ -93,19 +140,28 @@ QUEUE=${QUEUE:-gpu_h100}
 # ~2.3 h in one job against ~15 min at 10 shards. `%N` caps how many elements run at once, which
 # matters because each holds a GPU: the per-user limit is roughly half the queue, and stranding
 # more than this starves everyone else's work for no gain -- the stage is not latency-critical.
-SHARDS=${SHARDS:-10}
-LABEL_CONCURRENT=${LABEL_CONCURRENT:-10}
-# Labelling runs on a *different* GPU generation than training, deliberately. Both want GPUs, and
-# on one queue they contend with each other: a pending 96-slot training job holds slot
-# reservations on every h100 host (LSF reserves for up to 7200 s so large jobs can eventually
-# run), which starves the small label elements -- measured, they dispatched one at a time and the
-# array bought nothing over the serial job it replaced. A100s have the same 80 GB of VRAM, cost
-# less per hour, and are not what the training stages queue for.
-LABEL_QUEUE=${LABEL_QUEUE:-gpu_a100}
-# 4 rather than the queue's 12-slots-per-GPU ratio: measured peak host memory is 11.3 GB and 4
-# slots carry 160 GB. Over-requesting here would strand two-thirds of a GPU's worth of capacity
-# per element for nothing, which at 10 concurrent elements is most of a node.
-LABEL_SLOTS=${LABEL_SLOTS:-4}
+# One cube per shard. Full-cube labelling is 6,912 patches per cube (32 tiles x 216), ~2.9 h on
+# one L4 at the measured 1.5 s/patch, so 100 shards finish in about the time one cube takes.
+SHARDS=${SHARDS:-100}
+# Back to 100: with the fused `label` path there are no affinity files at all, so scratch usage is
+# ~2 GB of labels per cube instead of 146 GB in flight. Concurrency is bound by GPUs again, which
+# is where it belongs.
+LABEL_CONCURRENT=${LABEL_CONCURRENT:-100}
+# **L4, not A100.** Measured peak VRAM for a 256^3 inference patch is 6.1 GiB of the L4's 22, so
+# the 24 GB card is never the constraint, and an L4 runs ~1.5 s/patch against the A100's ~1.0 --
+# only 1.5x slower, while the L4 queues sit at 0 PEND when A100 and H100 are saturated. Throughput
+# here comes from breadth, not per-card speed: 100 L4s beat 10 A100s by 6x and are actually
+# available.
+#
+# `gpu_l4_16` rather than `gpu_l4`: same 8 L4s per node but 16 slots per GPU instead of 8, so a
+# job gets 240 GB of host RAM rather than 120. That headroom is worth having here -- a 750^3 tile
+# plus its collar needs a 17.3 GB float32 accumulator during blending and cc3d works in ~15 GB on
+# top -- and it is the L4 queue with the deepest pool of running work, i.e. the most turnover.
+#
+# 16 slots is that queue's own per-GPU ratio, so one job per GPU exactly fills a node's 128 slots
+# and strands nothing.
+LABEL_QUEUE=${LABEL_QUEUE:-gpu_l4_16}
+LABEL_SLOTS=${LABEL_SLOTS:-16}
 THREADS="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4"
 
 SMOKE=0
@@ -113,6 +169,8 @@ SMOKE=0
 LABEL_ONLY=""
 [[ "${1:-}" == "--label" ]] && { LABEL_ONLY=$2; shift 2; }
 [[ $SMOKE -eq 1 ]] && { N_CUBES=4; BLOCKS=1; BLOCK=192; SHARDS=2; LABEL_CONCURRENT=2; }
+
+FULL_FLAG=""; [[ "${FULL_CUBE:-0}" == "1" ]] && FULL_FLAG="--full-cube"
 
 jobid () { sed -n 's/^Job <\([0-9]*\)>.*/\1/p'; }
 # One id per stage now that stages are not twinned; the loop is kept so a future twin pair would
@@ -164,14 +222,15 @@ label () {
     echo "for cube in \$MINE; do"
     echo "  name=\$(basename \$cube .zarr)"
     echo "  if [[ -f '$root'/\$name.zarr/pseudolabel.json ]]; then echo \"  \$name done\"; continue; fi"
-    echo "  $VENV/bin/python mia_pseudolabel.py predict \"\$RUN\" --cube \$cube \\"
-    echo "      --out-dir $STAGE/aff_$tag/\$name --step \$STEP \\"
-    echo "      --blocks $BLOCKS --block $BLOCK --margin 64 --patch 256"
-    echo "  $VENV/bin/python mia_pseudolabel.py build --aff-dir $STAGE/aff_$tag/\$name \\"
-    echo "      --cube \$cube --out '$root'/\$name.zarr --label-name pseudo_$tag \\"
+    # One fused call per cube: predict and segment tile by tile, in one process, so a tile's
+    # affinities live only as a numpy array. The old predict-all-then-build-all split held 4 x
+    # 36.5 GB per cube on disk, which at 100 concurrent needed 14.6 TB and filled a shared 40 TB
+    # filesystem on 2026-08-19, killing 67 of 100 jobs.
+    echo "  $VENV/bin/python mia_pseudolabel.py label \"\$RUN\" --cube \$cube \\"
+    echo "      --out '$root'/\$name.zarr --label-name pseudo_$tag --step \$STEP \\"
+    echo "      --block $BLOCK --margin $MARGIN --patch 256 $FULL_FLAG \\"
     echo "      --cc-logit $CC_LOGIT --tau-bg $TAU_BG --tau-fg $TAU_FG \\"
     echo "      --tau-long $TAU_LONG --min-size $MIN_SIZE"
-    echo "  rm -rf $STAGE/aff_$tag/\$name"
     echo "done"
   } > "$worker"
 
@@ -277,12 +336,12 @@ fi
 ARMS=("$@"); [[ ${#ARMS[@]} -gt 0 ]] || ARMS=(1 2)
 for arm in "${ARMS[@]}"; do
   case $arm in
-    1) a=$(stage "$HERE/1a_reset_r1.toml" r1 5:00 "" "$(dep_of $L1)"); report 1a_reset_r1 "$a"
+    1) a=$(stage "$HERE/1a_reset_r1.toml" r1 6:00 "" "$(dep_of $L1)"); report 1a_reset_r1 "$a"
        l=$(label r2_reset "PREV:1a_reset_r1" latest "$(dep_of $a)"); report label_r2_reset "$l"
-       b=$(stage "$HERE/1b_reset_r2.toml" r2_reset 5:00 "" "$(dep_of $l)"); report 1b_reset_r2 "$b" ;;
-    2) a=$(stage "$HERE/2a_warm_r1.toml" r1 5:00 "" "$(dep_of $L1)"); report 2a_warm_r1 "$a"
+       b=$(stage "$HERE/1b_reset_r2.toml" r2_reset 6:00 "" "$(dep_of $l)"); report 1b_reset_r2 "$b" ;;
+    2) a=$(stage "$HERE/2a_warm_r1.toml" r1 6:00 "" "$(dep_of $L1)"); report 2a_warm_r1 "$a"
        l=$(label r2_warm "PREV:2a_warm_r1" latest "$(dep_of $a)"); report label_r2_warm "$l"
-       b=$(stage "$HERE/2b_warm_r2.toml" r2_warm 5:00 2a_warm_r1 "$(dep_of $l)"); report 2b_warm_r2 "$b" ;;
+       b=$(stage "$HERE/2b_warm_r2.toml" r2_warm 6:00 2a_warm_r1 "$(dep_of $l)"); report 2b_warm_r2 "$b" ;;
     *) echo "unknown arm: $arm (expected 1 or 2)" >&2; exit 2 ;;
   esac
 done

@@ -18,7 +18,7 @@ pip install -e '.[dev]'             # + pytest, ruff, mypy
 still trains, and to the same targets, but it splits disconnected label components on the training
 device instead of in the dataloader's workers.
 
-Machine-local paths (dataset roots, checkpoint directory, venv, scheduler project) live in
+Machine-local paths (dataset roots, checkpoint directory, venv, scheduler project) are set in
 `configs/cluster/active.toml` (untracked), which can be created by copying 
 `configs/cluster/template.toml` and filling it in.
 
@@ -41,7 +41,7 @@ Each run writes `<checkpoint_dir>/<experiment_name>_<timestamp>/` containing che
 TensorBoard logs, `resolved_config.json` (every setting expanded), the full git commit hash, 
 and a copy of any referenced data config.
 
-To submit training jobs on a cluster, see [`deploy/lsf/README.md`](deploy/lsf/README.md)
+To submit training jobs on the Janelia cluster, see [`deploy/lsf/README.md`](deploy/lsf/README.md)
 for single-node, multi-node and resume recipes.
 
 ## Configuration
