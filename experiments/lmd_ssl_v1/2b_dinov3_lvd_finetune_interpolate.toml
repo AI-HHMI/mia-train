@@ -1,0 +1,93 @@
+# lmd_ssl_v1 arm 2 stage B: finetune, interpolate head.
+#
+# Stage B of the shared two-stage finetune: interpolating head first.
+#
+# Initialised from the released 2D DINOv3 checkpoint, inflated along z.
+#
+# Peak LR 0.0003, linear to min_lr_ratio, 3000 warmup steps -- identical across all
+# three arms, because the finetune protocol is the thing being held constant.
+#
+# Trains on 4 of the 8 instance-segmentation eval volumes and validates on the other 4, one from
+# each modality pair (see make_splits.py). Every volume keeps the bounding box measured from its
+# label's non-zero extent.
+experiment_name = "lmd1__2b_dinov3_lvd_ft_interpolate"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256            # 16^3 = 4096 tokens at patch 16
+patch_size = 16
+in_chans = 1
+embed_dim = 1024          # ViT-L/16, 303M parameters
+depth = 24
+num_heads = 16            # head_dim 64; 64 % 6 = 4, so axial 3D RoPE leaves 4 channels unrotated
+n_storage_tokens = 4
+layerscale_init = 1.0e-05 # NOT optional: the released weights were trained with LayerScale
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+pos_embed_rope_type = "superposition"
+drop_path_rate = 0.1
+
+[init]
+path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+inflate_2d_to_3d = true
+skip = ["rope_embed."]    # a 2D checkpoint says nothing about z
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder = "interpolate"
+decoder_hidden_dim = 64
+ split_disconnected = true
+
+[data]
+name = "miao_volumes"
+config_path = "experiments/lmd_ssl_v1/lmd_finetune_singlescale.yaml"
+samples_per_epoch = 1000
+
+[val_data]
+name = "miao_volumes"
+config_path = "experiments/lmd_ssl_v1/lmd_val_singlescale.yaml"
+samples_per_epoch = 32
+
+[trainer]
+max_steps = 50000
+batch_size = 1            # per rank; 8 ranks -> global batch 8
+lr = 0.0003
+warmup_steps = 3000
+min_lr_ratio = 0.001
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 1.0  # the stem must move: 0.9 x 0.2 once put patch_embed 696x below BANIS' LR
+patch_embed_lr_mult = 1.0
+lr_schedule = "linear"
+activation_checkpointing = false
+precision = "bf16"
+log_every = 100
+val_every = 2500
+checkpoint_every = 5000
+num_workers = 6
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8              # one full node per stage
+tp = 1
+
+[augment]
+# BANIS' defaults, identical across all three arms so augmentation is not a confound.
+#
+# ARM 3 CAVEAT: `src/data/augment.py` transforms only `img` and `label`, never `bbox`, and MuViT
+# takes its world coordinates from `bbox`. In-plane rotation is safe here only because miao's
+# multi-scale boxes are concentric and isotropic in x/y, so a 90-degree in-plane turn maps the box
+# to itself. `rotate = "full"` -- or anything that moves the crop rather than permuting equal axes
+# -- would leave the coordinates describing data that is no longer there, which the MuViT paper
+# measures as a substantial drop and which nothing downstream can detect.
+rotate = "inplane"
+drop_slice_prob = 0.05
+shift_slice_prob = 0.05
+shift_magnitude = 10
+intensity = true
+mul_intensity = 0.1
+add_intensity = 0.1
+noise_scale = 0.5

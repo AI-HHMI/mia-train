@@ -328,6 +328,35 @@ class MuViT3D(BaseModel):
             tokens = block(tokens, coords)
         return self.norm(tokens)
 
+    def patch_features(
+        self, x: torch.Tensor, bbox: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, tuple[int, ...]]:
+        """Encode a multi-scale sample -> the FINEST level's tokens (B, P, C) and its patch grid.
+
+        `BaseModel.patch_features` declines by default for multi-scale encoders, on the grounds
+        that their sequence spans several grids at once and no single grid is the answer. That is
+        true of the *sequence*; it is not true of the task a dense head performs. A segmentation
+        head predicts into the volume it was given, and exactly one level is co-registered with
+        that volume at its resolution: the finest. So this returns the finest level's tokens and
+        the grid they fill.
+
+        The coarser levels are not discarded. Every block attends jointly over all levels, so by
+        the time the finest tokens come out they already carry the wide-field context the coarser
+        levels supply -- which is the mechanism the architecture exists for. What is dropped is
+        only the coarse tokens' own outputs, which have no home in a fine-resolution prediction:
+        each covers `level**3` times the volume of a fine patch, so folding them into the fine grid
+        would require inventing an upsampling rule that the model never trained under.
+
+        `bbox` is optional and defaults to concentric crops via `default_bbox`, which is correct
+        for miao's multi-scale samples: it draws one centre per sample and reads every scale around
+        it, so level `l` spans exactly `l` times the finest extent in finest-level pixel units.
+        A dataset that places its levels off-centre must pass its own boxes -- wrong coordinates
+        are still well-shaped and nothing downstream can detect them.
+        """
+        tokens, coords = self.embed(x, bbox)
+        tokens = self.encode(tokens, coords)
+        return tokens[:, : self.patches_per_level], self.grid_size
+
     def forward(self, x: torch.Tensor, bbox: torch.Tensor | None = None) -> torch.Tensor:
         """Mean-pooled embedding over all levels' tokens, for downstream heads."""
         tokens, coords = self.embed(x, bbox)

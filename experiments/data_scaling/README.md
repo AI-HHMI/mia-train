@@ -116,3 +116,53 @@ other patch size silently changes every position the encoder sees.
 
 Each whole-cube prediction is ~51 GB, so the scoring job deletes the affinities once its JSON is
 written.
+
+## Results (2026-08-22)
+
+All six stages ran to their full step counts. Final stage-B checkpoints (step 100k) scored on whole
+cubes with `score.sh`.
+
+| arm | `base` seed100 nERL | `slice_perturbed` seed107 nERL | retained | val boundary acc |
+|---|---|---|---|---|
+| 1 cube  | 0.4226 | **0.0816** | **19.3%** | 0.9217 |
+| 3 cubes | **0.4311** | 0.0755 | 17.5% | **0.9228** |
+| 5 cubes | 0.3906 | 0.0650 | 16.6% | 0.9183 |
+
+**More labelled cubes bought nothing, in distribution or out of it.** On `base` the arms span
+0.391-0.431, and the ordering is 3 > 1 > 5 -- not monotone, and 5 cubes is the *worst*. On
+`slice_perturbed` the ordering is strictly 1 > 3 > 5, and the retained fraction falls monotonically
+19.3% -> 17.5% -> 16.6%. Three independent measurements (val boundary accuracy, `base` nERL,
+`slice_perturbed` nERL) all place the 5-cube arm last.
+
+**There is no overfitting to explain it away.** Train boundary accuracy was 0.9058 / 0.9062 / 0.9070
+across the arms -- identical -- and *below* val (0.9217 / 0.9228 / 0.9183), because train is
+augmented and val is not. The 1-cube arm is not memorising its single volume; one cube of NISB
+`base` simply spans what five cubes span. That is a stronger claim than the benchmark authors'
+100-vs-5 null, and it is the reason to stop using NISB to test data-quantity or SSL hypotheses.
+
+Caveat on effect size: n=1 per arm, and the 0.39-0.43 spread on `base` is the same order as the
+differences being read. Treat "5 cubes is worst" as unresolved between a real effect and run-to-run
+noise; treat "more cubes does not help" as established, since it is the one statement all three
+metrics agree on.
+
+### The `slice_perturbed` probe measures augmentation coverage, not data quantity
+
+`slice_perturbed` is brutally harder for every arm -- nERL 0.065-0.082 against 0.391-0.431, a ~5x
+drop -- and the failure is almost entirely fragmentation: 34k-37k splits against ~4k on `base`,
+with `voi_split` rising 1.64 -> 4.0-4.4 while `voi_merge` barely moves.
+
+Measured on seed107 (a 256x256 column, all 1350 sections): **10.4% of sections are completely
+blank** -- 143 of 1350 have exactly zero contrast -- against 0 of 1350 in seed100. Per-section mean
+intensity varies 8.4x more (sd 45.9 vs 5.5), with adjacent-section jumps up to 176 grey levels
+against 17.
+
+That is the same *mechanism* `src/data/augment.py:drop_sections` implements -- it blanks sections to
+0.0 -- so this is not an unseen corruption. But the arms trained at `drop_slice_prob = 0.05` behind
+a 50% coin, and along a **randomly chosen one of the three spatial axes**, so only about a third of
+the applied drops ran along the sectioning axis at all. Against a cube where 10.4% of z-sections are
+always gone, that is roughly an order of magnitude of under-exposure.
+
+So the honest reading of this column is that it tests whether the *augmentation* covers section loss,
+and no quantity of `base` cubes contains section loss to learn it from. If section-loss robustness
+is wanted, the lever is `drop_slice_prob` and restricting the drop axis to the sectioning axis --
+not more cubes.

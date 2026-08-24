@@ -1,0 +1,84 @@
+# lmd_ssl_v1 arm 3 stage A: muvit_mae pretraining. MuViT (multi-scale) from random init, pretrained with MAE, then finetuned.
+#
+# Pretrains on the 91-volume corpus with the 8 evaluation volumes HELD OUT, so this arm never sees
+# them unlabelled. Arm 2 has no pretraining at all, so leaving them in would flatter arms 1 and 3
+# against the baseline for a reason that has nothing to do with the objective.
+#
+# RoPE: Not a config choice: MuViT's rotary embedding is intrinsic and driven by each token's world coordinate, which is the mechanism that lets it relate levels.
+experiment_name = "lmd1__3a_muvit_mae_pretrain"
+
+[model]
+name = "muvit3d"
+levels = [1, 2, 4]        # 1:2:4, matching the data config's 8/16/32 nm ladder
+img_size = [256, 256, 256]
+patch_size = [16, 16, 16]
+in_channels = 1
+embed_dim = 1024
+depth = 24
+num_heads = 16
+mlp_ratio = 4.0           # ViT-L's ratio, not MuViT's default 2.0; see the parameter count above
+# Explicit rather than "auto": auto silently falls back to SDPA when FlashAttention-4 is
+# unavailable, and this arm's 3-level sequence is 12288 tokens, where attention dominates. A silent
+# fallback would make the arm slower with no signal that it happened.
+attention_backend = "flash4"
+
+[algorithm]
+name = "muvit_mae"
+mask_ratio = 0.75
+dirichlet_alpha = 0.5     # how unevenly the mask budget is split across levels
+decoder_embed_dim = 512
+decoder_depth = 4
+decoder_num_heads = 8
+norm_pix_loss = true
+
+[data]
+name = "miao_volumes"
+config_path = "/groups/miaai/miaai/lmd-v0.0.1/configs/lmd_pretraining_multiscale_min1Gvox_noeval_patch256_sizeexp0.4.yaml"
+samples_per_epoch = 1000
+
+[val_data]
+name = "miao_volumes"
+config_path = "/groups/miaai/miaai/lmd-v0.0.1/configs/lmd_pretraining_multiscale_min1Gvox_noeval_patch256_sizeexp0.4.yaml"
+samples_per_epoch = 32
+
+[trainer]
+max_steps = 100000
+batch_size = 1            # per rank; 8 ranks -> global batch 8
+lr = 0.0003
+warmup_steps = 3000
+min_lr_ratio = 0.001
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 1.0  # the stem must move: 0.9 x 0.2 once put patch_embed 696x below BANIS' LR
+patch_embed_lr_mult = 1.0
+lr_schedule = "linear"
+activation_checkpointing = false
+precision = "bf16"
+log_every = 100
+val_every = 5000
+checkpoint_every = 10000
+num_workers = 6
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8              # one full node per stage
+tp = 1
+
+[augment]
+# BANIS' defaults, identical across all three arms so augmentation is not a confound.
+#
+# ARM 3 CAVEAT: `src/data/augment.py` transforms only `img` and `label`, never `bbox`, and MuViT
+# takes its world coordinates from `bbox`. In-plane rotation is safe here only because miao's
+# multi-scale boxes are concentric and isotropic in x/y, so a 90-degree in-plane turn maps the box
+# to itself. `rotate = "full"` -- or anything that moves the crop rather than permuting equal axes
+# -- would leave the coordinates describing data that is no longer there, which the MuViT paper
+# measures as a substantial drop and which nothing downstream can detect.
+rotate = "inplane"
+drop_slice_prob = 0.05
+shift_slice_prob = 0.05
+shift_magnitude = 10
+intensity = true
+mul_intensity = 0.1
+add_intensity = 0.1
+noise_scale = 0.5

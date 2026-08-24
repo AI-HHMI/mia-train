@@ -171,11 +171,24 @@ def test_rejects_a_label_crop_that_does_not_match_the_image():
 
 
 @pytest.mark.unit
-def test_rejects_a_multi_level_label_batch():
+def test_multi_level_labels_supervise_the_finest_level():
+    """A multi-scale batch carries one label array per scale; only level 0 is a target.
+
+    This used to raise. It now selects the finest level, matching what a multi-scale encoder's
+    dense head predicts into. The assertion is that level 0 is what reaches the loss -- the danger
+    is not a crash but a silent one: every level has the same shape, so supervising level 2 would
+    train the model against a 4x larger physical extent and nothing downstream would object.
+    """
     batch = _batch()
-    batch["label"] = batch["label"].repeat(1, 2, 1, 1, 1)
-    with pytest.raises(ValueError, match="single-scale"):
-        _algorithm().training_step(batch)
+    fine = batch["label"]
+    coarse = torch.full_like(fine, 7)                    # a level that must NOT be supervised
+    batch["label"] = torch.cat([fine, coarse], dim=1)
+
+    algorithm = _algorithm()
+    got = algorithm._prepare_labels(batch["label"])
+    assert got.shape == fine.squeeze(1).shape
+    torch.testing.assert_close(got, fine.squeeze(1).long())
+    assert not (got == 7).all(), "supervised the coarse level instead of the finest"
 
 
 @pytest.mark.unit
@@ -209,12 +222,36 @@ def test_dinov3_patch_features_drops_cls_and_storage_tokens():
 
 
 @pytest.mark.unit
-def test_multiscale_encoder_declines_to_produce_one_patch_grid():
+def test_multiscale_encoder_returns_the_finest_level_on_its_own_grid():
+    """MuViT3D used to decline `patch_features` because its sequence spans several grids.
+
+    It now answers with the finest level's tokens, because that is the one level co-registered
+    with the volume a dense head predicts into -- see `MuViT3D.patch_features`. What this pins is
+    that the answer is ONE level's worth of tokens filling the finest grid, not the joint
+    sequence: handing the decoder all `L * P` tokens is still the shape-plausible mistake, and it
+    would be caught only by `test_decoder_rejects_tokens_that_do_not_fill_the_grid` below, and
+    only by luck.
+    """
     encoder = MuViT3D(
         levels=(1, 4), img_size=(CROP, CROP, CROP), patch_size=(PATCH, PATCH, PATCH),
         in_channels=1, embed_dim=32, depth=1, num_heads=4,
     )
-    with pytest.raises(NotImplementedError, match="patch_features"):
+    tokens, grid = encoder.patch_features(
+        torch.randn(2, encoder.num_levels, 1, CROP, CROP, CROP)
+    )
+    assert grid == encoder.grid_size == (2, 2, 2)
+    assert tokens.shape == (2, 8, 32)
+    assert tokens.shape[1] * encoder.num_levels == encoder.num_patches
+
+
+@pytest.mark.unit
+def test_multiscale_encoder_still_rejects_a_single_level_sample():
+    """The level axis is required: a (B, C, D, H, W) sample is a caller error, not a 1-level one."""
+    encoder = MuViT3D(
+        levels=(1, 4), img_size=(CROP, CROP, CROP), patch_size=(PATCH, PATCH, PATCH),
+        in_channels=1, embed_dim=32, depth=1, num_heads=4,
+    )
+    with pytest.raises(ValueError, match="expected input"):
         encoder.patch_features(torch.randn(1, 1, CROP, CROP, CROP))
 
 

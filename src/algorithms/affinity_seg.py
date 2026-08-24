@@ -227,12 +227,19 @@ class AffinitySegmentation(BaseAlgorithm):
 
         level_dim = label_axes.index("l") + 1
         levels = labels.shape[level_dim]
-        if levels != 1:
-            raise ValueError(
-                f"affinity targets are single-scale, but this batch carries {levels} scale levels "
-                f"on axis 'l' (shape {tuple(labels.shape)}). Configure the dataset for one level."
-            )
-        return labels.squeeze(level_dim).long()
+        if levels == 1:
+            return labels.squeeze(level_dim).long()
+
+        # Multi-scale batch: supervise the FINEST level, index 0. miao returns one label array per
+        # scale, and a multi-scale encoder's dense head predicts into the finest grid (see
+        # `MuViT3D.patch_features`), so level 0 is the one co-registered with the logits. The
+        # coarser label levels describe a larger physical extent at the same voxel count and are
+        # not targets -- scoring against one would supervise the model on a different task at a
+        # different scale, and the shapes would not complain.
+        #
+        # miao orders levels fine-to-coarse and MuViT3D enforces that ordering on its `levels`, so
+        # index 0 is the finest by construction rather than by convention.
+        return labels.select(level_dim, 0).long()
 
     def _decode(
         self, tokens: torch.Tensor, grid: tuple[int, ...], size: torch.Size
@@ -282,17 +289,22 @@ class AffinitySegmentation(BaseAlgorithm):
 
         volumes = self.encoder.prepare_input(batch[self.input_key], self.input_axes)
         labels = self._prepare_labels(batch[self.label_key])
-        if labels.shape[0] != volumes.shape[0] or labels.shape[1:] != volumes.shape[2:]:
+        # The last three axes are the spatial ones under both encoder layouts -- (B, C, D, H, W)
+        # from a single-scale encoder and (B, L, C, D, H, W) from a multi-scale one -- so index
+        # from the end. `shape[2:]` is the same thing for the 5-D case and silently picks up the
+        # channel axis for the 6-D one.
+        spatial = volumes.shape[-3:]
+        if labels.shape[0] != volumes.shape[0] or labels.shape[1:] != spatial:
             raise ValueError(
                 f"label crop {tuple(labels.shape)} does not match the image crop "
                 f"{tuple(volumes.shape)} it must be co-registered with (expected "
-                f"{(volumes.shape[0], *volumes.shape[2:])})"
+                f"{(volumes.shape[0], *spatial)})"
             )
 
         with torch.profiler.record_function("encoder"):
             tokens, grid = self.encoder.patch_features(volumes)
         with torch.profiler.record_function("decoder"):
-            logits = self._decode(tokens, grid, volumes.shape[2:])
+            logits = self._decode(tokens, grid, spatial)
         target, mask = self._targets(labels)
 
         # Masked mean rather than a masked tensor: the border slab each offset shifts in from has
