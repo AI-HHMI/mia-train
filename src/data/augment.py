@@ -18,8 +18,8 @@ Its API is young and has changed shape repeatedly -- config-driven, then callabl
 set of operations and their signatures still moving -- and a training repo that tracks it inherits
 every change. Owning ~200 lines of tensor manipulation is the cheaper side of that trade. It also
 removes a compatibility question that would otherwise be permanent: these run on any sample dict
-that declares its axis order, so the same recipe serves `miao_volumes` and `hf_semantic_seg`
-without either dataset's conventions leaking in here.
+that declares its axis order, so one recipe serves any registered dataset without that dataset's
+conventions leaking in here.
 
 **Rank-generic.** Everything below works for 2D and 3D, deriving the spatial rank from the
 dataset's declared axis order rather than assuming three axes. That is what lets a 2D CellMap

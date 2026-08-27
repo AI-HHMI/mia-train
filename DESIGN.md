@@ -29,8 +29,8 @@ mia-train/
 │   ├── data/              # Datasets and loaders (integrating `miao`)
 │   ├── engine/            # Training loop, step orchestration, FSDP/DDP execution
 │   ├── distributed/       # Process groups, 3D parallelism, NCCL/Gloo wrappers
-│   ├── evals/             # Downstream evaluation tasks and benchmarks
 │   ├── utils/             # Logging, memory tracking, metrics, NCCL watchdogs
+│   ├── predict.py          # Run a checkpoint over a volume, write a scoreable artifact
 │   └── train.py           # Single entrypoint for every job (launch via torchrun)
 ├── CLAUDE.md              # AI agent operational guidelines & CLI commands
 ├── DESIGN.md              # Master system blueprint & module invariants
@@ -58,7 +58,16 @@ A decoder is not automatically a layer: a pretraining decoder exists only to ser
 is discarded afterwards, so it belongs to the algorithm that owns it (see `MAE` and `MuViTMAE`). A
 decoder that ships as part of a runnable model belongs in `models/` with it.
 | **Data** | `src/data/` | `BaseDataset` | Wraps data sources (using `miao`) into distributed-aware dataloaders. |
-| **Evaluation** | `src/evals/` | `BaseEvalTask` | Defines downstream zero-shot or fine-tuning evaluation loops. |
+| **Prediction** | `src/predict.py` | — | Runs a checkpoint over a volume and writes an artifact for [`mia-evals`](https://github.com/AI-HHMI/mia-evals) to score. |
+
+**Scoring lives in `mia-evals`, not here.** The boundary is the artifact: this repository runs
+models and writes predictions; that one reads predictions and computes metrics. It is drawn there
+because scoring needs no GPU, no torch and no checkpoint, while training needs all three, and
+because a metric that only ever runs inside a training repo cannot be applied to a prediction
+produced by anything else. `src/evals/` held a `BaseEvalTask` registry whose one entry was
+registered and never built -- no config declared it and the engine never constructed it -- so it
+was deleted rather than maintained; its confusion-matrix computation now lives in
+`mia-evals/src/metrics/semantic.py`.
 
 ---
 

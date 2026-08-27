@@ -166,7 +166,7 @@ def test_layers_do_not_depend_on_models():
 def test_layers_do_not_depend_on_algorithms_or_the_engine():
     # Same argument, one step further out: a building block that knows about training strategy or
     # the run loop is not a building block.
-    forbidden = {"algorithms", "engine", "data", "evals"}
+    forbidden = {"algorithms", "engine", "data"}
     for path in _modules_in("layers"):
         leaked = forbidden & _imported_names(path)
         assert not leaked, f"src/{path.relative_to(SRC)} imports {sorted(leaked)}"

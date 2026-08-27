@@ -10,7 +10,6 @@ capabilities without touching the core:
 ```bash
 pip install -e .                    # core
 pip install -e '.[affinity]'        # + cc3d, for the affinity instance-segmentation task
-pip install -e '.[cellmap]'         # + HuggingFace datasets, for the CellMap tasks
 pip install -e '.[dev]'             # + pytest, ruff, mypy
 ```
 
@@ -92,16 +91,28 @@ See `configs/*.toml` for working examples.
 | name | |
 |---|---|
 | `miao_volumes` | Multi-scale OME-NGFF volumes via `miao`, for data far larger than memory. Configure inline or point `config_path` at a shared YAML (`configs/data/`). |
-| `hf_semantic_seg` | Segmentation datasets from the HuggingFace Hub, read as memory-mapped Arrow. `preset = "cellmap_2d"` or `"cellmap_3d"`; other Hub datasets need only an entry in `PRESETS` or the fields spelled out inline. Needs the `cellmap` extra. |
-
-**Evaluations**
-
-| name | |
-|---|---|
-| `semantic_seg` | Whole-volume scoring with overlap-blended tiled inference, plus `mode = "orthoplane"` to apply a 2D model to a 3D volume by averaging the x, y and z passes. Reports IoU and Dice from one confusion matrix over the whole set. |
 
 Adding a component means writing it and adding one line to `src/components.py`; the engine and the
 registries never change.
+
+## The sister repo `mia-evals` for scoring models
+
+This repository runs models, the sister repo [`mia-evals`](https://github.com/AI-HHMI/mia-evals) scores their
+output. The boundary between the two is the "artifact": `src/predict.py` runs a checkpoint over a volume and
+writes an OME-Zarr prediction that declares its own kind (`affinity`, `class_scores`, `instances`,
+…), and `mia-evals` reads that and computes the corresponding metrics.
+
+```bash
+# mia-train: run the model, write the artifact
+python src/predict.py --config <run>/config.toml --step 50000 --out preds/
+
+# mia-evals: post-process, score, update the leaderboard
+mia-evals score configs/tasks/<task>.toml --test preds/ --val <fit-split>/
+```
+
+The split is worth the extra step: scoring needs no GPU, no torch and no checkpoint, so it can run on
+a CPU queue and can score a prediction produced by anything: a different framework, a released
+model, a hand-drawn segmentation, *etc.* A metric that only runs inside a training loop cannot.
 
 ## Other capabilities
 
