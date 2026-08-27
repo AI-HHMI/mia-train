@@ -50,12 +50,46 @@ THREADS="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4"
 # The limits below keep 2-3x headroom over those figures deliberately: `-r` plus `--resume` makes an
 # over-run a requeue from the last checkpoint, but a `-W` kill does NOT requeue, and losing 12 h of
 # arm 3 to a tight limit costs far more than the scheduling priority a generous one gives up.
-WALL_SSL_D=16:00
+# The SSL walls are set from a MEASURED throughput, and it is not the one above. At global batch
+# 256 over 16 ranks arm 1 ran at 80.1 samples/s with `data_wait_frac = 0.766` -- the GPUs sat idle
+# three quarters of every step waiting on the loader, so this pipeline is I/O bound, not compute
+# bound, and halving the ranks does not halve the per-step time. Expect ~40 samples/s at 8 ranks:
+#
+#   arm 1  100k steps x 128 samples = 12.8M samples / ~40 per s  ~= 89 h
+#   arm 3  unmeasured at this batch, and it reads THREE levels per sample against arm 1's one, so
+#          its I/O per sample is ~3x and it is very unlikely to be faster
+#
+# 168 h therefore, not 48. A `-W` kill does not requeue, and checkpoints land only every 10k steps,
+# so a tight limit trades scheduling priority for lost work. Note the step budget itself is the
+# thing worth revisiting: at this batch 100k steps is 16x the data the original batch-8 plan
+# budgeted, and ~27k steps would give a ~24 h turnaround with 3.5M samples still seen.
+WALL_SSL_D=168:00
 WALL_FT_D=10:00
-WALL_SSL_M=30:00
+WALL_SSL_M=168:00
 WALL_FT_M=20:00
 
 declare -A ARM_QUEUE=( [1]=gpu_h100 [2]=gpu_h100 [3]=gpu_h200 )
+
+# The SSL stage needs a bigger card than the finetune stages, so it gets its own queue. Both SSL
+# arms carry 16 samples per rank, and both measured over an H100's 80 GiB at that batch:
+#
+#   arm 1  SimMIM      peaks at 80.0 GiB of 139.8 on an H200 -- an H100 card is 79.2 GiB usable
+#   arm 3  MuViT-MAE   OOMs on an H100 at 16/rank (max 12 there without checkpointing)
+#
+# The finetune stages run at global batch 8 and are nowhere near either limit, so they stay on
+# whatever ARM_QUEUE says and leave the scarcer H200s free.
+declare -A ARM_SSL_QUEUE=( [1]=gpu_h200 [3]=gpu_h200 )
+for n in 1 3; do
+  var="ARM_SSL_QUEUE_$n"; [[ -n "${!var:-}" ]] && ARM_SSL_QUEUE[$n]="${!var}"
+done
+
+# No stage is multi-node any more. Both SSL arms run at global batch 128 (16/rank x 8 ranks) on ONE
+# node, which takes an ordinary queue rather than a `*_parallel` one and schedules far sooner.
+# The machinery is kept because it is the only thing that would have to come back if the batch is
+# raised again; set MULTINODE_STAGES to e.g. "1a 3a" to re-enable it.
+MULTINODE_STAGES=""
+MN_QUEUE=${MN_QUEUE:-gpu_h200_parallel}
+MN_NODES=2
 for n in 1 2 3; do
   var="ARM_QUEUE_$n"; [[ -n "${!var:-}" ]] && ARM_QUEUE[$n]="${!var}"
 done
@@ -82,6 +116,16 @@ stage () {
   local config=$1 queue=$2 wall=$3 prev=${4:-} dep=${5:-}
   local name; name=$(basename "$config" .toml)
   local cfg="$config" prologue="" procs=$GPUS slots=$SLOTS
+
+  # Decided up front: both the command written into $cmd and the bsub arguments depend on it.
+  # Multi-node stages go through deploy/lsf/launch_multinode.sh, which reads LSF's host list and
+  # starts one torchrun per node under a c10d rendezvous. `blaunch` gives each node a FRESH shell,
+  # so that launcher forwards the environment explicitly -- nothing exported here survives on its
+  # own.
+  local multinode=0
+  [[ " $MULTINODE_STAGES " == *" ${name:0:2} "* ]] && multinode=1
+  # A smoke run is one GPU on one node, so it never takes the multi-node path.
+  [[ $SMOKE -eq 1 ]] && multinode=0
 
   if [[ $SMOKE -eq 1 ]]; then
     wall=0:30; procs=1; slots=12
@@ -118,14 +162,28 @@ sed \"s|PREV_CHECKPOINT|\${RUN}checkpoints/step_\$STEP|\" '$cfg' > '$resolved'"
     echo "$THREADS"
     echo "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
     [[ -n "$prologue" ]] && echo "$prologue"
-    printf '%s --standalone --nproc_per_node=%s src/train.py --config %q %s\n' \
-      "$VENV/bin/torchrun" "$procs" "$cfg" \
-      "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--resume")"
+    local tail_args
+    tail_args="$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--resume")"
+    if [[ $multinode -eq 1 ]]; then
+      printf 'MIA_TRAIN=%q VENV=%q %q %s %q %s\n' \
+        "$REPO" "$VENV" "$REPO/deploy/lsf/launch_multinode.sh" "$procs" "$cfg" "$tail_args"
+    else
+      printf '%s --standalone --nproc_per_node=%s src/train.py --config %q %s\n' \
+        "$VENV/bin/torchrun" "$procs" "$cfg" "$tail_args"
+    fi
   } > "$cmd"
 
-  local args=(-P "$PROJECT" -q "$queue" -gpu "num=$procs" -n "$slots" -W "$wall" -r
-              -J "lmd1_$name" -cwd "$REPO"
-              -o "$LOGS/lmd1_${name}_%J.log" -e "$LOGS/lmd1_${name}_%J.err")
+  local args
+  if [[ $multinode -eq 1 ]]; then
+    args=(-P "$PROJECT" -q "$MN_QUEUE" -app "parallel-96" -gpu "num=$procs:mode=shared"
+          -n "$((slots * MN_NODES))" -W "$wall" -r
+          -J "lmd1_$name" -cwd "$REPO"
+          -o "$LOGS/lmd1_${name}_%J.log" -e "$LOGS/lmd1_${name}_%J.err")
+  else
+    args=(-P "$PROJECT" -q "$queue" -gpu "num=$procs" -n "$slots" -W "$wall" -r
+          -J "lmd1_$name" -cwd "$REPO"
+          -o "$LOGS/lmd1_${name}_%J.log" -e "$LOGS/lmd1_${name}_%J.err")
+  fi
   [[ -n "$dep" && "$dep" != "DRYRUN" ]] && args+=(-w "done($dep)")
 
   if [[ $DRY -eq 1 ]]; then
@@ -147,9 +205,9 @@ for arm in "${ARMS[@]}"; do
 
   prev_name="" prev_job=""
   if [[ -n "$wssl" ]]; then
-    a=$(stage "$HERE/${arm}a_${tag}_pretrain.toml" "$q" "$wssl")
+    a=$(stage "$HERE/${arm}a_${tag}_pretrain.toml" "${ARM_SSL_QUEUE[$arm]:-$q}" "$wssl")
     prev_name="lmd1__${arm}a_${tag}_pretrain"; prev_job="$a"
-    printf "arm %s  %-9s  A(ssl 100k)=%s" "$arm" "$q" "$a"
+    printf "arm %s  %-9s  A(ssl 100k)=%s" "$arm" "${ARM_SSL_QUEUE[$arm]:-$q}" "$a"
   else
     a="-"
     printf "arm %s  %-9s  A(none)     =%s" "$arm" "$q" "$a"

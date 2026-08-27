@@ -12,12 +12,24 @@
 #
 # WHAT TO READ
 #
-#   ssl/loss            Arm 1 is SimMIM (masked voxel regression, norm_pix_loss=false); arm 3 is
-#                       MuViT-MAE (norm_pix_loss=true, and it reconstructs THREE levels). These are
-#                       different objectives on differently-normalised targets over different token
-#                       counts. **The two numbers are not comparable to each other** -- read each
-#                       only for its own shape: falling and then flattening is what a healthy
-#                       pretrain looks like. The comparison happens downstream, in stage C.
+#   ssl/loss            SimMIM's masked-voxel L1 (norm_pix_loss=false), so it is in the same
+#                       units as the data: [0, 1] intensities. **The number to compare it against
+#                       is 0.1004** -- the measured L1 of predicting the crop's visible mean under
+#                       this exact 60% / 32-voxel masking. Above that line the model has learned
+#                       nothing a single scalar did not already know, which is precisely where the
+#                       first (batch 8) attempt sat for its whole life.
+#
+#                       At batch 84 the floor is crossed at ~step 900 and the margin keeps widening
+#                       (+0.0137 by step 4000). At batch 256 expect the crossing sooner in steps,
+#                       though not in samples. Judge the TREND, not a single crossing: a margin
+#                       that stops widening is the stall this experiment was rebuilt to escape.
+#
+#                       Arm 3 (MuViT-MAE) is NOT running -- it collapsed to a positional constant
+#                       and is parked pending the same batch fix. Its killed run IS still plotted,
+#                       pinned at 1.0000: that is its own trivial floor (targets are standardised
+#                       per patch, so predicting zero scores exactly 1.0). Do not read arm 3's
+#                       numbers against arm 1's -- different objective, different normalisation,
+#                       different floor.
 #
 #   boundary_accuracy   The finetune panel. Pooled `affinity_accuracy` sits near the target's
 #                       positive rate whatever the model does, so it looks healthy for a model that
@@ -56,6 +68,11 @@
 # WHAT NOT TO READ: arm 1 vs arm 3 differs in architecture, objective AND scale ladder at once, so
 # a gap between them says "this recipe beat that recipe", not "multi-scale helps". Model size is
 # not one of the confounds -- they are matched to within 3%.
+#
+# And do not rank checkpoints on `val/*` here: it is 32 crops from 4 heterogeneous volumes, and
+# across arm 2's 50k steps it swung 0.62-0.84 between adjacent evaluations with no trend after
+# ~12k. That spread is far larger than any real change it could resolve. Raise
+# `val_data.samples_per_epoch` to ~256 before trusting it to choose anything.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -105,9 +122,11 @@ fi
 
 echo
 echo "arms:"
-echo "  1  DINOv3 ViT-L, random init -> SimMIM 100k          (vanilla 3D RoPE, 8 nm)"
-echo "  2  DINOv3 ViT-L <- LVD-1689M checkpoint, no SSL      (superposition RoPE, 8 nm)  [baseline]"
-echo "  3  MuViT, random init -> MuViT-MAE 100k              (world-coord rotary, 8/16/32 nm)"
+echo "  1  DINOv3 ViT-L, random init -> SimMIM 100k   global batch 128 (16/rank x 8 ranks, 1 H200 node)"
+echo "  2  DINOv3 ViT-L <- LVD-1689M checkpoint, no SSL                    [baseline, batch 8]"
+echo "  3  MuViT multiscale, random init -> MuViT-MAE 100k        global batch 128 (1 H200 node)"
+echo
+echo "  SimMIM trivial floor (predict the crop visible mean): L1 0.1004"
 echo
 echo "finetune split (identical for every arm):"
 for split in finetune val; do

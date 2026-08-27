@@ -241,6 +241,45 @@ class AffinitySegmentation(BaseAlgorithm):
         # index 0 is the finest by construction rather than by convention.
         return labels.select(level_dim, 0).long()
 
+    #: What a prediction over this algorithm's output means, for the artifact a predictor writes.
+    #: Declared here rather than inferred by the predictor: `(6, X, Y, Z)` of floats could equally
+    #: be six class scores, and thresholding those as affinities yields a segmentation rather than
+    #: an error.
+    prediction_kind = "affinity"
+
+    @property
+    def prediction_channels(self) -> int:
+        """Channels the head emits: one per offset, short-range block then long-range."""
+        return len(self.offsets)
+
+    @staticmethod
+    def squash(logits: torch.Tensor) -> torch.Tensor:
+        """Logits -> the stored representation, `sigmoid(0.2 * logit)`.
+
+        BANIS' `scale_sigmoid`. Training uses plain `binary_cross_entropy_with_logits`, so the
+        logits are directly comparable between the two codebases; the 0.2 is only how BANIS stores
+        and thresholds them, and reproducing it is what makes a threshold mean the same thing in
+        both pipelines. A predictor records the convention beside the data.
+        """
+        return torch.sigmoid(0.2 * logits)
+
+    #: How `squash` should be described in an artifact, so a consumer need not guess.
+    squash_convention = "sigmoid(0.2 * logit)"
+
+    def logits(self, volumes: torch.Tensor) -> torch.Tensor:
+        """(B, C, *spatial) input -> (B, n_offsets, *spatial) affinity logits.
+
+        Public for the same reason `semantic_seg.logits` is: prediction over a whole volume drives
+        the model directly and needs scores for a window rather than a loss. Previously a caller had
+        to reach for `encoder.patch_features` and the private `_decode` and reproduce their pairing,
+        which is a copy of `_step`'s middle that could drift from it.
+        """
+        tokens, grid = self.encoder.patch_features(volumes)
+        # The last SPATIAL_RANK axes are the spatial ones under both encoder layouts --
+        # (B, C, D, H, W) from a single-scale encoder and (B, L, C, D, H, W) from a multi-scale
+        # one -- so index from the end, exactly as `_step` does.
+        return self._decode(tokens, grid, volumes.shape[-SPATIAL_RANK:])
+
     def _decode(
         self, tokens: torch.Tensor, grid: tuple[int, ...], size: torch.Size
     ) -> torch.Tensor:
@@ -305,6 +344,8 @@ class AffinitySegmentation(BaseAlgorithm):
             tokens, grid = self.encoder.patch_features(volumes)
         with torch.profiler.record_function("decoder"):
             logits = self._decode(tokens, grid, spatial)
+        # NOTE `logits()` is the same pair of calls without the profiler regions; kept separate so
+        # the training step's annotations stay where the profiler expects them.
         target, mask = self._targets(labels)
 
         # Masked mean rather than a masked tensor: the border slab each offset shifts in from has

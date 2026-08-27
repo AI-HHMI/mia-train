@@ -26,6 +26,12 @@ mask_k_bias = true
 pos_embed_rope_dtype = "fp32"
 pos_embed_rope_type = "superposition"
 drop_path_rate = 0.1
+# On by default here, unlike the model's own `use_fa4 = False`. Note the key differs from MuViT's
+# `attention_backend = "flash4"` -- the two model families have separate switches with no shared
+# base class, which is how arm 1 ran its first attempts on SDPA while arm 3 used FA4 and nothing
+# reported the asymmetry. Unlike `attention_backend = "auto"`, this raises if FA4 is unusable
+# rather than falling back in silence.
+use_fa4 = true
 
 [init]
 path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
@@ -52,7 +58,7 @@ samples_per_epoch = 32
 
 [trainer]
 max_steps = 50000
-batch_size = 1            # per rank; 8 ranks -> global batch 8
+batch_size = 1            # per rank; x 8 ranks -> global batch 8
 lr = 0.0003
 warmup_steps = 3000
 min_lr_ratio = 0.001
@@ -78,11 +84,27 @@ tp = 1
 # BANIS' defaults, identical across all three arms so augmentation is not a confound.
 #
 # ARM 3 CAVEAT: `src/data/augment.py` transforms only `img` and `label`, never `bbox`, and MuViT
-# takes its world coordinates from `bbox`. In-plane rotation is safe here only because miao's
-# multi-scale boxes are concentric and isotropic in x/y, so a 90-degree in-plane turn maps the box
-# to itself. `rotate = "full"` -- or anything that moves the crop rather than permuting equal axes
-# -- would leave the coordinates describing data that is no longer there, which the MuViT paper
-# measures as a substantial drop and which nothing downstream can detect.
+# takes its world coordinates from `bbox`. Two of these settings were checked against that:
+#
+#   rotate="inplane"  SAFE. Measured: the coordinate grid maps onto itself under an x<->y swap and
+#                     under both flips, because miao's boxes are concentric and img_size is cubic,
+#                     so the half-extents are equal on x and y. Augmentation also applies ONE
+#                     transform to the whole (L, C, X, Y, Z) tensor, so every level turns together,
+#                     and world_coords subtracts the crop centre first. A global rotation is a
+#                     relabelling of a frame all levels share.
+#
+#   shift_slice       NOT geometrically clean for MuViT. It displaces content by a fixed number of
+#                     VOXELS, and one voxel is a different physical distance at each level: a
+#                     10-voxel shift is 10 world units at level 0, 20 at level 1, 40 at level 2.
+#                     The levels therefore move by different physical amounts and stop being
+#                     registered with each other -- exactly what the coordinates exist to prevent.
+#                     Kept anyway, because holding augmentation identical across the three arms
+#                     matters more than removing a small, realistic distortion from one of them,
+#                     and dropping it for arm 3 alone would swap a known confound for an unknown
+#                     one. FIRST THING TO ABLATE if arm 3 underperforms.
+#
+#   drop_slice        Fine: it removes data rather than moving it, so the coordinates still
+#                     describe where the remaining data is.
 rotate = "inplane"
 drop_slice_prob = 0.05
 shift_slice_prob = 0.05

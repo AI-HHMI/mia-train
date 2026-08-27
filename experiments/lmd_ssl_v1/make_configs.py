@@ -28,6 +28,31 @@ LR_SUBPIXEL = 1.0e-4         # lower peak rather than a shared schedule: the sub
                              # itself single-stage was the explicit preference.
 MIN_LR_RATIO = 0.001
 
+# Global batch for the SSL stages, and the single most consequential number in this experiment.
+#
+# The first run used 8 (one node, batch 1/rank), inherited from NISB *supervised* finetuning where
+# it works -- arm 2 trains normally on it. Masked reconstruction does not: measured at fixed
+# geometry, SimMIM at batch 84 crosses the trivial crop-mean floor at ~step 900 and keeps widening
+# the margin to +0.0137 by step 4000 (encoder token-std 0.037 -> 0.156), while at batch 8-16 it
+# never beats a single scalar. MuViT-MAE on the same corpus collapses outright below batch 32.
+#
+# 16 per rank x 8 ranks (ONE H200 node) = 128. Memory measured on a real H200 node with FSDP at
+# arm 1's geometry: per-rank 16 peaks at 80.0 GiB of 139.8 (57%), per-rank 24 still fits, so this
+# needs neither activation checkpointing nor gradient accumulation. Arm 3 is the more expensive
+# shape -- measured on an H100, per-rank 16 does NOT fit in 80 GiB without checkpointing -- but it
+# has ~1.7x the headroom on an H200 at the same batch.
+#
+# One node, not the two that global batch 256 needed: a single-node job takes an ordinary queue
+# instead of a `*_parallel` one, needs no c10d rendezvous across the IB fabric, and schedules far
+# sooner. Global 128 is still 16x the batch-8 regime that stalled, and well past the batch-16 ->
+# batch-32 cliff measured for MuViT-MAE.
+SSL_BATCH_PER_RANK = 16
+SSL_DP_SHARD = 8
+# The finetune stages stay at 8, unchanged, so arms 1-3 share one protocol and remain comparable
+# to arm 2 -- which trained fine there, supervised.
+FT_BATCH_PER_RANK = 1
+FT_DP_SHARD = 8
+
 DINOV3_LVD = ("/groups/miaai/miaai/pretrained_models/dinov3/"
               "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth")
 
@@ -47,6 +72,12 @@ mask_k_bias = true
 pos_embed_rope_dtype = "fp32"
 pos_embed_rope_type = "%(rope)s"
 drop_path_rate = %(drop_path)s
+# On by default here, unlike the model's own `use_fa4 = False`. Note the key differs from MuViT's
+# `attention_backend = "flash4"` -- the two model families have separate switches with no shared
+# base class, which is how arm 1 ran its first attempts on SDPA while arm 3 used FA4 and nothing
+# reported the asymmetry. Unlike `attention_backend = "auto"`, this raises if FA4 is unusable
+# rather than falling back in silence.
+use_fa4 = true
 """
 
 # MuViT sized to match ViT-L: 24 x (4 + 2*4) x 1024^2 ~= 302M, against DINOv3's 303M. Left at its
@@ -105,7 +136,7 @@ noise_scale = 0.5
 
 TRAINER = """[trainer]
 max_steps = %(max_steps)d
-batch_size = 1            # per rank; 8 ranks -> global batch 8
+batch_size = %(batch_size)d            # per rank; x %(dp_shard)d ranks -> global batch %(global_batch)d
 lr = %(lr)s
 warmup_steps = %(warmup)d
 min_lr_ratio = %(min_lr_ratio)s
@@ -119,12 +150,12 @@ precision = "bf16"
 log_every = 100
 val_every = %(val_every)d
 checkpoint_every = %(ckpt_every)d
-num_workers = 6
+num_workers = %(workers)d
 seed = 0
 
 [parallelism]
 dp_replicate = 1
-dp_shard = 8              # one full node per stage
+dp_shard = %(dp_shard)d              # %(nodes)s
 tp = 1
 """
 
@@ -185,12 +216,42 @@ SUBPIXEL_OPTS = ("decoder_hidden_dim = 256\n"
                  "decoder_refine_depth = 2\n")
 
 
+# Measured on a full node at arm 1's geometry, 8 ranks through mia-train's real build_dataloader:
+# `samples_per_epoch` is the dominant loader knob, and 1000 was pathological. At global batch 128 it
+# makes an epoch SEVEN STEPS long, and every iterator restart drains the prefetch queue -- 82.1
+# samples/s against 123.2 for the same 6 workers at 100k. Raising workers on top of that is worth a
+# further ~6% (131.1 at 11), and nothing beyond 11 helps: 16/22/32 measured 113.2/129.5/127.3, flat
+# inside a ~8% noise floor even at 264 processes on 96 cores, because the workers block on NFS
+# rather than on CPU. `persistent_workers` and `prefetch_factor` both measured as no-ops.
+SSL_SAMPLES_PER_EPOCH = 100_000
+SSL_WORKERS = 11
+# The finetune stages keep 1000/6: at global batch 8 an epoch is 125 steps, nowhere near the
+# pathology, and arm 2 has already run under exactly these values.
+FT_WORKERS = 6
+
+
 def data_block(path: str, samples: int = 1000) -> str:
     return f'[data]\nname = "miao_volumes"\nconfig_path = "{path}"\nsamples_per_epoch = {samples}\n'
 
 
-def val_block(path: str) -> str:
-    return f'[val_data]\nname = "miao_volumes"\nconfig_path = "{path}"\nsamples_per_epoch = 32\n'
+def val_block(path: str, global_batch: int) -> str:
+    """Validation set, sized so the loader cannot come back empty.
+
+    `Trainer` builds the val loader with the SAME per-rank `batch_size` as training and
+    `drop_last=True`, and `DistributedSampler` hands each rank `samples_per_epoch / ranks`. If that
+    quotient is below the per-rank batch, every rank drops its only partial batch, `validate()`
+    averages over zero batches and returns `{}` -- so the run logs a bare `[val] step N` with no
+    metrics and TensorBoard shows no `val/*` series at all. It is silent: training is unaffected and
+    nothing errors, the validation curve simply never appears.
+
+    Raising the SSL arms to global batch 256 walked straight into this: 32 samples over 16 ranks is
+    2 per rank against a per-rank batch of 16. Sizing to at least the global batch guarantees one
+    full batch per rank. The finetune stages stay at 32 (global batch 8 there), which keeps them
+    byte-identical to the configs arm 2 has already run under.
+    """
+    samples = max(32, global_batch)
+    return (f'[val_data]\nname = "miao_volumes"\nconfig_path = "{path}"\n'
+            f'samples_per_epoch = {samples}\n')
 
 
 def write(name: str, text: str) -> None:
@@ -219,10 +280,13 @@ experiment_name = "lmd1__{n}a_{tag}_pretrain"
 
 {model}
 {SSL_ALGO[arm['ssl']]}
-{data_block(pre)}
-{val_block(pre)}
-{TRAINER % dict(max_steps=SSL_STEPS, lr=LR_SSL, warmup=WARMUP, min_lr_ratio=MIN_LR_RATIO,
-                val_every=5000, ckpt_every=10000)}
+{data_block(pre, SSL_SAMPLES_PER_EPOCH)}
+{val_block(pre, SSL_BATCH_PER_RANK * SSL_DP_SHARD)}
+{TRAINER % dict(max_steps=SSL_STEPS, lr=LR_SSL, warmup=WARMUP, min_lr_ratio=MIN_LR_RATIO, workers=SSL_WORKERS,
+                val_every=5000, ckpt_every=10000,
+                batch_size=SSL_BATCH_PER_RANK, dp_shard=SSL_DP_SHARD,
+                global_batch=SSL_BATCH_PER_RANK * SSL_DP_SHARD,
+                nodes="one full H200 node")}
 {AUGMENT}""")
 
         # ---- stages b and c: the shared two-stage finetune ---------------------------------
@@ -283,9 +347,12 @@ experiment_name = "lmd1__{n}{letter}_{tag}_ft_{decoder}"
 {init}
 {AFFINITY % dict(decoder=decoder, decoder_opts=opts)}
 {data_block(f"{REL}/lmd_finetune_{scale}.yaml")}
-{val_block(f"{REL}/lmd_val_{scale}.yaml")}
-{TRAINER % dict(max_steps=FT_STEPS, lr=lr, warmup=WARMUP, min_lr_ratio=MIN_LR_RATIO,
-                val_every=2500, ckpt_every=5000)}
+{val_block(f"{REL}/lmd_val_{scale}.yaml", FT_BATCH_PER_RANK * FT_DP_SHARD)}
+{TRAINER % dict(max_steps=FT_STEPS, lr=lr, warmup=WARMUP, min_lr_ratio=MIN_LR_RATIO, workers=FT_WORKERS,
+                val_every=2500, ckpt_every=5000,
+                batch_size=FT_BATCH_PER_RANK, dp_shard=FT_DP_SHARD,
+                global_batch=FT_BATCH_PER_RANK * FT_DP_SHARD,
+                nodes="one full node per stage")}
 {AUGMENT}""")
 
 

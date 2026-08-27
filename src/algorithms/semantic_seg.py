@@ -147,6 +147,25 @@ class SemanticSegmentation(BaseAlgorithm):
             )
         return labels.squeeze(level_dim).long()
 
+    #: See `affinity_seg.prediction_kind`. Per-voxel class scores, so a predictor writes them as
+    #: `class_scores` and an argmax -- not a threshold -- turns them into a labelling.
+    prediction_kind = "class_scores"
+
+    @property
+    def prediction_channels(self) -> int:
+        return self.num_classes
+
+    @staticmethod
+    def squash(logits: torch.Tensor) -> torch.Tensor:
+        """Class scores are stored as softmax probabilities, so tiles blend commensurably.
+
+        Blending raw logits across overlapping tiles would average quantities whose scale is
+        arbitrary per tile; probabilities are on a common scale and sum to one.
+        """
+        return torch.softmax(logits, dim=1)
+
+    squash_convention = "softmax over classes"
+
     def logits(self, volumes: torch.Tensor) -> torch.Tensor:
         """(B, C, *spatial) input -> (B, num_classes, *spatial) class scores.
 
