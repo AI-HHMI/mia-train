@@ -12,10 +12,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Connected-components for the affinity task, computed in the dataloader's workers. Optional
-# because `affinity_seg` is correct without it -- it falls back to the torch implementation in
-# `algorithms/affinity/targets.py`, which runs on the training device -- but that fallback costs
-# roughly 107 ms of every 377 ms step at 256^3, so a serious affinity run wants this installed.
 affinity = [
     "connected-components-3d>=3.0",
 ]
@@ -32,9 +28,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# `packages.find` collects packages only, so these three top-level modules would not be installed
-# at all -- `import train` / `import predict` works from a source checkout via pythonpath and fails
-# after `pip install`.
 [tool.setuptools]
 py-modules = ["components", "predict", "train"]
 
@@ -61,12 +54,6 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.11"
 mypy_path = "src"
-# `experiments` is deliberately absent, and adding it back would fail: it holds no Python at all
-# now. It held two scripts, and typechecking them put the core quality gate around code no test
-# covers, one of which reached into a sibling repo by `sys.path` insert -- so a core refactor
-# could be blocked by a plotting script whose dependencies live elsewhere. That one moved to the
-# `banis` repo that owns what it imports; the other was a one-off and was deleted. Experiments are
-# configs, submission scripts and write-ups.
 files = ["src", "tests"]
 ignore_missing_imports = true
 warn_unused_ignores = true

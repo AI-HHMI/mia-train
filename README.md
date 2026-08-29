@@ -2,10 +2,9 @@
 
 PyTorch-native distributed training for volumetric microscopy. 
 
-## Installing
+## Installation
 
-Core dependencies are `torch`, `tensorboard` and `miao-io`. Optional extras add
-capabilities without touching the core:
+`mia-train` is intentionally lightweight and minimalist in its dependencies. Currently, the only core dependencies are `torch`, `tensorboard` (for logging), and `miao` (as the sole dataset interface). You can install `mia-train` in editable mode as follows:
 
 ```bash
 pip install -e .                    # core
@@ -13,17 +12,11 @@ pip install -e '.[affinity]'        # + cc3d, for the affinity instance-segmenta
 pip install -e '.[dev]'             # + pytest, ruff, mypy
 ```
 
-`affinity` is worth installing before any serious `affinity_seg` run. Without it the algorithm
-still trains, and to the same targets, but it splits disconnected label components on the training
-device instead of in the dataloader's workers.
-
-Machine-local paths (dataset roots, checkpoint directory, venv, scheduler project) are set in
-`configs/cluster/active.toml` (untracked), which can be created by copying 
-`configs/cluster/template.toml` and filling it in.
+`affinity` extra (which will install `cc3d` additionally) is worth installing before any serious `affinity_seg` run. Without it the algorithm still trains, and to the same targets, but it will be much more efficient with `cc3d`.
 
 ## Running a training job
 
-Jobs are run through `torchrun`:
+Jobs are always run through `torchrun`:
 
 ```bash
 torchrun --standalone --nproc_per_node=<gpus> src/train.py --config configs/<run>.toml
@@ -36,14 +29,14 @@ Useful flags:
 - `--resume <dir>` continues that exact run directory.
 - `--output-root <dir>` overrides where artifacts go (default: `[environment].checkpoint_dir`).
 
-Each run writes `<checkpoint_dir>/<experiment_name>_<timestamp>/` containing checkpoints,
-TensorBoard logs, `resolved_config.json` (every setting expanded), the full git commit hash, 
+Each run writes to a `<checkpoint_dir>/<experiment_name>_<timestamp>/` directory, containing the checkpoints,
+TensorBoard logs, `resolved_config.json` (with every setting expanded), the full git commit hash, 
 and a copy of any referenced data config.
 
 To submit training jobs on the Janelia cluster, see [`deploy/lsf/README.md`](deploy/lsf/README.md)
 for single-node, multi-node and resume recipes.
 
-## Configuration
+## Configs
 
 Each run is defined by a `.toml` config file with the following sections:
 
@@ -64,7 +57,9 @@ Note that `[trainer].batch_size` is per rank, so the global batch size is `batch
 
 See `configs/*.toml` for working examples.
 
-## What's available
+Machine-local paths common to all runs (dataset roots, checkpoint directory, venv, job scheduler details) are set in `configs/cluster/active.toml` (untracked), which can be created by copying `configs/cluster/template.toml` and filling it in.
+
+## Supported models and algorithms
 
 **Models** (`[model].name`)
 
@@ -86,13 +81,7 @@ See `configs/*.toml` for working examples.
 | `affinity_seg` | Supervised instance segmentation by affinity prediction (e.g. the NISB task). |
 | `semantic_seg` | Supervised per-voxel classification (serves both 2D and 3D). |
 
-**Datasets** (`[data].name`)
-
-| name | |
-|---|---|
-| `miao_volumes` | Multi-scale OME-NGFF volumes via `miao`, for data far larger than memory. Configure inline or point `config_path` at a shared YAML (`configs/data/`). |
-
-Adding a component means writing it and adding one line to `src/components.py`; the engine and the
+Adding a new component simply involves writing it and adding one line to `src/components.py`. The engine and the
 registries never change.
 
 ## The sister repo `mia-evals` for scoring models
