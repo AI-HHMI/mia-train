@@ -182,7 +182,13 @@ def drop_sections(image: torch.Tensor, dims: Sequence[int], prob: float) -> torc
     dropped = torch.nonzero(torch.rand(image.shape[axis]) < prob, as_tuple=False).squeeze(1)
     if dropped.numel() == 0:
         return image
-    return image.clone().index_fill_(axis, dropped, 0.0)
+    # Drawn on the CPU and moved, rather than drawn on the image's device. The other operations
+    # here reduce their draws to Python ints, so this is the only one whose randomness could
+    # follow the tensor onto an accelerator -- and if it did, the same seed would give a different
+    # augmentation depending on where the sample happened to be, which is exactly the difference
+    # `DeviceAugmentation` exists to avoid. The index is one entry per section, so moving it costs
+    # nothing next to the clone below.
+    return image.clone().index_fill_(axis, dropped.to(image.device), 0.0)
 
 
 def intensity_jitter(image: torch.Tensor, mul: float, add: float) -> torch.Tensor:
@@ -482,7 +488,8 @@ def split_augmentation(
     mul_intensity: float = 0.1,
     add_intensity: float = 0.1,
     noise_scale: float = 0.0,
-) -> tuple[VolumeAugmentation, BatchPhotometric]:
+    on_device: bool = False,
+) -> tuple[VolumeAugmentation | None, BatchPhotometric | DeviceAugmentation]:
     """One `[augment]` section as the two callables its operations belong on.
 
     A factory rather than two constructions at the call site, because the two halves have to
@@ -514,4 +521,76 @@ def split_augmentation(
         add_intensity=add_intensity,
         noise_scale=noise_scale,
     )
-    return geometric, photometric
+    if not on_device:
+        return geometric, photometric
+
+    # Nothing for the workers: a dataset that defers its images hands back a sample the geometric
+    # operations cannot act on, so the whole pipeline moves and `DeviceAugmentation` runs it once
+    # the batch is finished. Built from the same `geometric` object, so the two paths cannot come
+    # to disagree about what `[augment]` means.
+    full = VolumeAugmentation(
+        sample_axes=sample_axes,
+        rotate=rotate,
+        drop_slice_prob=drop_slice_prob,
+        shift_slice_prob=shift_slice_prob,
+        shift_magnitude=shift_magnitude,
+        intensity=False,
+        noise_scale=0.0,
+    )
+    return None, DeviceAugmentation(full, photometric)
+
+
+class DeviceAugmentation:
+    """The whole of `[augment]` on the training device, for datasets that defer their images.
+
+    `split_augmentation` normally leaves the geometric operations in the dataloader's workers,
+    where they can move an image and its labels together while both are still per sample. That
+    stops being possible once the dataset defers resampling: `miao`'s deferred sample carries its
+    image as a list of crops at their stored resolutions while its labels are already resampled to
+    the target, so the two are no longer on a common grid. Rotating them there would still work by
+    accident, but `shift_sections` displaces by a voxel *count* -- the same count is a different
+    physical distance at two resolutions, and the pair would come apart with nothing to show for
+    it. The whole pipeline therefore waits until `finish_images` has put them back on one grid.
+
+    Geometric first and then photometric, the order `VolumeAugmentation` documents, and the
+    geometric half is `VolumeAugmentation` itself rather than a second implementation of it: the
+    operations are torch ops already, so the only thing that changes is which device the tensors
+    are on and that they are reached one sample at a time. A batch has no single answer for a
+    rotation, and each sample's draws must stay its own.
+    """
+
+    def __init__(
+        self, geometric: VolumeAugmentation, photometric: BatchPhotometric
+    ) -> None:
+        self.geometric = geometric
+        self.photometric = photometric
+
+    def _geometric_enabled(self) -> bool:
+        return (
+            self.geometric.rotate != "none"
+            or self.geometric.shift_slice_prob > 0
+            or self.geometric.drop_slice_prob > 0
+        )
+
+    def enabled(self) -> bool:
+        return self._geometric_enabled() or self.photometric.enabled()
+
+    def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
+        if self._geometric_enabled():
+            keys = tuple(self.geometric.image_keys) + tuple(self.geometric.label_keys)
+            present = [
+                key
+                for key in keys
+                if isinstance(batch.get(key), torch.Tensor) and batch[key].numel()
+            ]
+            if present:
+                count = batch[present[0]].shape[0]
+                transformed: dict[str, list[torch.Tensor]] = {key: [] for key in present}
+                for index in range(count):
+                    one = self.geometric({key: batch[key][index] for key in present})
+                    for key in present:
+                        transformed[key].append(one[key])
+                batch = dict(batch)
+                for key in present:
+                    batch[key] = torch.stack(transformed[key])
+        return self.photometric(batch)

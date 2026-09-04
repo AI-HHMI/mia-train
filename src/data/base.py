@@ -133,6 +133,36 @@ class BaseDataset(abc.ABC):
         """
         return ()
 
+    def collate_fn(self) -> Any | None:
+        """How to assemble samples into a batch, or None for torch's default.
+
+        A dataset answers here when its samples cannot be stacked as they stand. `miao`'s deferred
+        image path is the case that exists: it hands back crops at their stored resolution, and two
+        samples drawn from different volumes then have different shapes until something resamples
+        them, which is exactly the work being deferred.
+        """
+        return None
+
+    def augments_on_device(self) -> bool:
+        """Whether `[augment]` has to wait until the batch reaches the device.
+
+        True for a dataset that hands its workers' output back unfinished. Geometric augmentation
+        moves an image and its labels together, so it can only run once the two are on a common
+        grid -- which for a deferring dataset is after `finish_batch`, not before.
+        """
+        return False
+
+    def finish_batch(self, batch: Any, device: torch.device) -> Any:
+        """Complete anything the workers deferred, on a batch already moved to `device`.
+
+        Identity for a dataset that defers nothing, which is every dataset here but miao's with
+        `defer_image_ops`. Separate from the transfer rather than folded into it, because the
+        transfer is the thing being made cheaper: the deferred form is what crosses the bus, in the
+        volume's stored dtype, and `move_to_device` already walks the nested structure it arrives
+        in. Calling this afterwards finishes the work with the batch already on the accelerator.
+        """
+        return batch
+
     def build_dataloader(
         self,
         *,
@@ -171,6 +201,7 @@ class BaseDataset(abc.ABC):
             # multi-process path, and asking for it with `num_workers=0` adds a synchronous copy
             # to the main process for no benefit.
             pin_memory=num_workers > 0,
+            collate_fn=self.collate_fn(),
             worker_init_fn=_single_threaded_worker if num_workers > 0 else None,
             # Defaults off; see `TrainerConfig.persistent_workers` for the measurement. Briefly:
             # respawning workers each epoch costs ~4 ms per step amortized, and keeping them alive
