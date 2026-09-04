@@ -4,7 +4,7 @@ PyTorch-native distributed training for volumetric microscopy.
 
 ## Installation
 
-`mia-train` is intentionally lightweight in its direct dependencies. Currently, the only core dependencies are `torch`, `tensorboard` (for logging), `miao` (as the sole dataset interface), and `cc3d` (for connected components computation). You can install `mia-train` in editable mode as follows:
+`mia-train` is intentionally lightweight in its direct dependencies. Currently, the only core dependencies are `torch`, `tensorboard` (for logging), `miao` (as the sole dataset interface), and `cc3d` (for connected components computation). After cloning the repo, you can install `mia-train` in editable mode as follows:
 
 ```bash
 pip install -e .                    # core

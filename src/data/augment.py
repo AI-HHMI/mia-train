@@ -375,3 +375,143 @@ class VolumeAugmentation:
                 sample[key] = additive_noise(sample[key], self.noise_scale)
 
         return sample
+
+
+class BatchPhotometric:
+    """`intensity_jitter` and `additive_noise` for a batch that is already on the training device.
+
+    The same two operations `VolumeAugmentation` applies per sample, moved off the dataloader's
+    workers because that is where they were costing the run. On a 256^3 volume they take 165 ms of
+    a worker's single core -- `additive_noise` alone draws 16.7M Gaussians -- against 0.19 ms per
+    sample batched here, and they were what made the input pipeline's tail: median wait 0.8 ms but
+    p99 1.46 s and worst case 4.6 s, with a different rank stalling each step and eight ranks in
+    lockstep, which cost 27% of wall. Moving them takes the p99 to 2.5 ms.
+
+    Three properties have to survive the move, and each is a way to weaken the augmentation while
+    the config still reads the same:
+
+      - **Every draw is per sample.** `intensity_jitter` is two scalars per volume and
+        `additive_noise` one deviation per volume, so a batched implementation that drew once and
+        broadcast it would give a whole batch the same jitter. The draws are shaped
+        `(batch, 1, 1, ...)` for that reason.
+      - **The coin survives.** Each operation is gated by `APPLY_PROB` before its own parameters
+        apply, so it reaches about half the samples. Here that is a per-sample mask through
+        `torch.where` rather than an early return, since a batch has no single answer.
+      - **Images only.** Labels are never touched, exactly as in `VolumeAugmentation`.
+
+    A second implementation rather than a loop over `intensity_jitter`: calling the per-sample
+    functions once per item would issue a batch's worth of tiny kernels and give back most of what
+    the move buys. `algorithms.dinov3.multicrop.photometric` already does device-side augmentation
+    this way, with the same per-sample broadcast and `torch.where` gate.
+    """
+
+    def __init__(
+        self,
+        *,
+        intensity: bool = False,
+        mul_intensity: float = 0.1,
+        add_intensity: float = 0.1,
+        noise_scale: float = 0.0,
+        image_keys: tuple[str, ...] = ("img",),
+    ) -> None:
+        if noise_scale < 0.0:
+            raise ValueError(f"noise_scale must be >= 0, got {noise_scale}")
+        if not image_keys:
+            raise ValueError("image_keys is empty, so no augmentation could ever apply")
+        self.intensity = intensity
+        self.mul_intensity = mul_intensity
+        self.add_intensity = add_intensity
+        self.noise_scale = noise_scale
+        self.image_keys = tuple(image_keys)
+
+    def enabled(self) -> bool:
+        """Whether either operation would do anything, so the engine can skip the call entirely."""
+        return self.intensity or self.noise_scale > 0.0
+
+    def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
+        if not self.enabled():
+            return batch
+        out = dict(batch)
+        for key in self.image_keys:
+            image = out.get(key)
+            if image is None or not isinstance(image, torch.Tensor) or image.numel() == 0:
+                continue
+            out[key] = self._apply(image)
+        return out
+
+    def _apply(self, image: torch.Tensor) -> torch.Tensor:
+        count = image.shape[0]
+        per_sample = (count,) + (1,) * (image.ndim - 1)
+        kwargs = {"device": image.device, "dtype": image.dtype}
+
+        def draw(low: float, high: float) -> torch.Tensor:
+            return torch.empty(per_sample, **kwargs).uniform_(low, high)
+
+        def gate(chosen: torch.Tensor, skipped: float) -> torch.Tensor:
+            """`chosen` where the coin lands, `skipped` where it does not -- on the *parameters*.
+
+            Both operations are affine in the image, so gating the scalars is exactly gating the
+            result: `where(c, x*s + o, x)` is `x * where(c, s, 1) + where(c, o, 0)`, and
+            `where(c, x + n*d, x)` is `x + n * where(c, d, 0)`. Written this way the `where` runs
+            over a `(batch, 1, 1, ...)` tensor of scalars instead of over the batch itself, which
+            is the difference between selecting among two full copies of a gigabyte and selecting
+            among sixteen floats. The identity is exact, not an approximation.
+            """
+            return torch.where(torch.rand(per_sample, **kwargs) < APPLY_PROB, chosen, skipped)
+
+        if self.intensity:
+            scale = gate(draw(1.0 - self.mul_intensity, 1.0 + self.mul_intensity), 1.0)
+            offset = gate(draw(-self.add_intensity, self.add_intensity), 0.0)
+            image = image * scale + offset
+
+        if self.noise_scale > 0:
+            deviation = gate(draw(0.0, 1.0) * self.noise_scale, 0.0)
+            image = image + torch.randn(image.shape, **kwargs) * deviation
+
+        return image
+
+
+def split_augmentation(
+    *,
+    sample_axes: str | None,
+    rotate: str = "none",
+    drop_slice_prob: float = 0.0,
+    shift_slice_prob: float = 0.0,
+    shift_magnitude: int = 10,
+    intensity: bool = False,
+    mul_intensity: float = 0.1,
+    add_intensity: float = 0.1,
+    noise_scale: float = 0.0,
+) -> tuple[VolumeAugmentation, BatchPhotometric]:
+    """One `[augment]` section as the two callables its operations belong on.
+
+    A factory rather than two constructions at the call site, because the two halves have to
+    partition the operations rather than merely divide them: photometric applied in both places
+    would augment twice, with no error and no symptom beyond a run that trains slightly worse than
+    an identical config elsewhere. Here the worker's half is built with `intensity=False` and
+    `noise_scale=0.0` in the same expression that hands those settings to the device's half, so
+    the two cannot drift apart.
+
+    The split falls on a seam that already existed: `VolumeAugmentation.__call__` runs the
+    geometric operations first because they move image and labels together and must keep them
+    registered, then the image-only ones. Everything up to and including `drop_sections` stays in
+    the worker -- the geometric pair because labels are not on the device yet, `drop_sections`
+    because it is cheap (24.6 ms) and selecting sections per sample does not batch. The order the
+    sample sees is therefore unchanged.
+    """
+    geometric = VolumeAugmentation(
+        sample_axes=sample_axes,
+        rotate=rotate,
+        drop_slice_prob=drop_slice_prob,
+        shift_slice_prob=shift_slice_prob,
+        shift_magnitude=shift_magnitude,
+        intensity=False,
+        noise_scale=0.0,
+    )
+    photometric = BatchPhotometric(
+        intensity=intensity,
+        mul_intensity=mul_intensity,
+        add_intensity=add_intensity,
+        noise_scale=noise_scale,
+    )
+    return geometric, photometric

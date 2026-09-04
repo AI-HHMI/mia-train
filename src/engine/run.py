@@ -11,7 +11,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
 from algorithms.registry import AlgorithmRegistry
-from data.augment import VolumeAugmentation
+from data.augment import BatchPhotometric, split_augmentation
 from data.registry import DataRegistry
 from distributed.setup import destroy_distributed, device_type, init_distributed
 from models.registry import ModelRegistry
@@ -243,6 +243,7 @@ def build_trainer(
     (see `BaseAlgorithm`).
     """
     train_dataset = DataRegistry.build(config.data.name, **config.data.kwargs)
+    photometric = BatchPhotometric()
     if config.augment.enabled():
         # The training set only. `val_data` is deliberately never wrapped: validation has to
         # measure the model on the data as it is, and there is no config key that can change that.
@@ -254,13 +255,21 @@ def build_trainer(
         # either break the configs already written against these keys or bend miao's vocabulary to
         # a caller's. `output_axes` comes from the dataset, since the rotation needs to know which
         # axis serial sectioning ran along and a second setting could only disagree with it.
-        train_dataset.attach_transform(
-            VolumeAugmentation(
-                sample_axes=train_dataset.sample_axes,
-                **dataclasses.asdict(config.augment),
-            )
+        # Split rather than one transform, because the two halves belong in different places: the
+        # geometric operations move image and labels together and must run per sample while the
+        # labels are still beside the image, while intensity and noise are image-only, elementwise
+        # and per sample only in their *draws* -- and cost a worker 165 ms of CPU per 256^3 volume
+        # there against 0.19 ms batched on the device. `split_augmentation` partitions them from
+        # one config so neither can apply twice.
+        geometric, photometric = split_augmentation(
+            sample_axes=train_dataset.sample_axes,
+            **dataclasses.asdict(config.augment),
         )
+        train_dataset.attach_transform(geometric)
         print(f"[augment] training data: {config.augment}", flush=True)
+        if photometric.enabled():
+            print("[augment] intensity/noise run on the training device, not in the workers",
+                  flush=True)
     val_dataset = (
         DataRegistry.build(config.val_data.name, **config.val_data.kwargs)
         if config.val_data is not None
@@ -309,6 +318,7 @@ def build_trainer(
         mesh=mesh,
         val_dataset=val_dataset,
         device=device,
+        photometric=photometric,
     )
 
 

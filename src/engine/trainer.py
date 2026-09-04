@@ -13,6 +13,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, DistributedSampler
 
 from algorithms.base import BaseAlgorithm
+from data.augment import BatchPhotometric
 from data.base import BaseDataset
 from distributed.parallel_dims import ParallelDims
 from distributed.parallelize import parallelize_algorithm
@@ -47,12 +48,21 @@ class Trainer:
         mesh: DeviceMesh | None = None,
         val_dataset: BaseDataset | None = None,
         device: torch.device | None = None,
+        photometric: BatchPhotometric | None = None,
     ) -> None:
         self.config = config
         self.dims = dims or ParallelDims()
         self.mesh = mesh
         self.output_dir = output_dir
         self.device = device or torch.device("cpu")
+        # The half of `[augment]` that runs here rather than in a dataloader worker -- see
+        # `data.augment.split_augmentation`. Held by the trainer rather than wrapped around the
+        # dataset because the point is to apply it *after* the batch reaches the device, and it is
+        # applied only in `train()`: `validate()` must measure the model on the data as it is, and
+        # keeping the call out of that loop makes it so structurally rather than by convention.
+        self.photometric = (
+            photometric if photometric is not None and photometric.enabled() else None
+        )
 
         torch.manual_seed(config.seed)
 
@@ -272,6 +282,13 @@ class Trainer:
 
                 with annotate("h2d"):
                     batch = move_to_device(raw_batch, self.device)
+
+                if self.photometric is not None:
+                    # After the transfer, so the intensity and noise passes run on the device
+                    # instead of costing a worker 165 ms of CPU per sample -- which is what made
+                    # the input pipeline's tail, and with it 27% of a step.
+                    with annotate("augment"):
+                        batch = self.photometric(batch)
 
                 with annotate("forward"), self._autocast():
                     # Through __call__, not training_step: `BaseAlgorithm.forward` aliases it, and
