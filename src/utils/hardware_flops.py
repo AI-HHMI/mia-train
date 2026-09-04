@@ -56,6 +56,15 @@ _T = 1.0e12
 # `torch.cuda.get_device_name()`.
 _DEVICES: tuple[tuple[tuple[str, ...], DevicePeak], ...] = (
     # Blackwell. "B200" before "B100"; both are SXM-only parts.
+    #
+    # B300 (Blackwell Ultra) carries the B200 figures rather than figures of its own, which is a
+    # deliberate choice and not an omission. It reports 148 SMs, the same count as B200, and
+    # Blackwell Ultra's advertised gains are in NVFP4 throughput and HBM capacity (288 GB against
+    # 192 GB) rather than in bf16. The repo's own measurement agrees: a 8192^3 bf16 GEMM reaches
+    # 1706 TFLOP/s on `NVIDIA B300 SXM6 AC`, or 76% of the 2250 below -- the same fraction of peak
+    # cuBLAS reaches on the Hopper parts already tabulated here, which is what a shared rate
+    # predicts and what a materially different one would not.
+    (("B300",), DevicePeak("NVIDIA B300 SXM6", 2250 * _T, 1100 * _T, 80 * _T)),
     (("B200",), DevicePeak("NVIDIA B200", 2250 * _T, 1100 * _T, 80 * _T)),
     # Hopper. H200 shares the H100 SXM compute die — its advantage is 141GB of HBM3e, not FLOPs,
     # which the repo's own benchmark independently found (deploy/lsf/README.md: "H100 and H200

@@ -75,6 +75,20 @@ class Trainer:
             self.algorithm, self.optimizer, output_dir / "checkpoints"
         )
 
+        # Compiled into a handle of its own rather than over `self.algorithm`, and last, once the
+        # optimizer already holds its parameter groups.
+        #
+        # `torch.compile` returns an `OptimizedModule` that renames every parameter to
+        # `_orig_mod.<name>`, and `engine.optimizer` decides what a parameter *is* from its name:
+        # `_depth` treats anything not under the `model.` prefix as sitting above the backbone.
+        # Rebinding `self.algorithm` to the wrapper would therefore make every encoder tensor look
+        # like a head, silently disabling `layerwise_lr_decay` -- and it would disagree with
+        # `is_stem`, which matches by substring and would still fire, which is exactly the split
+        # `is_stem` exists to prevent. Keeping the wrapper separate leaves the optimizer, the
+        # freeze warm-up, the FLOP probe and DCP all reading the real module. The two share their
+        # Parameters, so there is still only one set of weights and nothing to keep in sync.
+        self._forward = torch.compile(self.algorithm) if config.compile else self.algorithm
+
         dp_rank = self.dims.dp_rank(mesh) if mesh is not None else 0
         self.train_loader = train_dataset.build_dataloader(
             batch_size=config.batch_size,
@@ -261,8 +275,10 @@ class Trainer:
 
                 with annotate("forward"), self._autocast():
                     # Through __call__, not training_step: `BaseAlgorithm.forward` aliases it, and
-                    # plain replication only all-reduces gradients from forward hooks.
-                    metrics = self.algorithm(batch)
+                    # plain replication only all-reduces gradients from forward hooks. Through
+                    # `_forward` rather than `self.algorithm`, so that `[trainer].compile` reaches
+                    # the step; the two are the same object unless it is set.
+                    metrics = self._forward(batch)
                 with annotate("backward"):
                     metrics["loss"].backward()
 
@@ -357,6 +373,12 @@ class Trainer:
         with torch.no_grad():
             for batch in self.val_loader:
                 with self._autocast():
+                    # Deliberately the module, not `_forward`: `torch.compile` only wraps a
+                    # module's `__call__`, and `OptimizedModule` proxies every other attribute
+                    # straight through, so `_forward.validation_step` *is* this same method. Naming
+                    # it directly says so, and leaves the all-gather that
+                    # `register_fsdp_forward_method` installed as the only thing standing between
+                    # a sharded parameter and this call.
                     metrics = self.algorithm.validation_step(move_to_device(batch, self.device))
                 for name, value in reduce_metrics(metrics).items():
                     totals[name] = totals.get(name, 0.0) + value

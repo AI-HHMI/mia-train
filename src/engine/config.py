@@ -315,6 +315,48 @@ class TrainerConfig:
     unfreeze_warmup_steps: int = 1000
 
     precision: str = "fp32"
+    # Run the training step under `torch.compile`. Off by default: it costs 30-60 s of compilation
+    # before the first step, which is noise in a 100k-step run and most of the wall clock in a
+    # 20-step smoke test.
+    #
+    # What it buys, measured on one B300 against this repo's eager default (ViT-L/16, 256^3):
+    #
+    #     affinity_seg finetune   279.6 -> 121.5 ms/step   2.30x
+    #     dinov3 multi-crop       380.6 -> 219.7 ms/step   1.73x
+    #     simmim, 8-rank FSDP2    296.6 -> 188.7 ms/step   1.57x
+    #
+    # The gain is fusion, not arithmetic. A step fires roughly two thousand small kernels and over
+    # a quarter of the device time is the rotary embedding alone -- per block, per q *and* k, an
+    # fp32 cast, a prefix slice, a per-axis rotate, two concatenations and a cast back. Eagerly
+    # that leaves a B300 idle about half of every step waiting on kernel launches, which is the
+    # real reason `mfu` reads ~10% rather than ~40%: the matmuls are only 11% of device time and
+    # they are not what is slow. Hopper hides the same launch overhead behind slower kernels, so it
+    # gains correspondingly less -- an H200 is ~99% busy eagerly where a B300 is ~57%.
+    #
+    # Two things this does not do, both measured rather than assumed:
+    #
+    #   - It does not change what the encoder computes. `forward_features` is bit-identical
+    #     compiled and eager, and under FSDP2 every gradient matches an unsharded reference to
+    #     bf16 noise (worst 5.7e-3, on a bias).
+    #   - It does not compile `validation_step`. `OptimizedModule` proxies attribute lookup to the
+    #     module it wraps, so validation keeps running eagerly through the method
+    #     `register_fsdp_forward_method` patched -- the all-gather still fires, and validation is
+    #     too small a share of a run to be worth a second set of graphs.
+    #
+    # It does change RNG, and that is the one behaviour to know about. Inductor gives compiled
+    # regions their own Philox stream, so an algorithm that *samples inside the step* sees
+    # different draws from the same seed and a compiled run will not reproduce an eager one step
+    # for step. `dinov3` is the only one here that does, through its random crops; the draws are
+    # equally valid rather than wrong. Nothing else samples in the step, so `simmim` and
+    # `affinity_seg` track eager to 2.6e-4 and 1.7e-5 respectively.
+    #
+    # That matters only if a comparison spans the flag -- a compiled arm read against an eager
+    # baseline. Arms that agree on it are comparable to each other, which is the usual case here,
+    # so this is deliberately not wired to a knob. If a cross-mode comparison is ever needed,
+    # `torch._inductor.config.fallback_random = True` gives the compiled regions eager's RNG and
+    # closes the koleo gap from 5.0e-2 to 7.6e-4, for 2% of the speedup (1.955x -> 1.915x on
+    # `dinov3`). It does not make the two identical: bf16 fusion differences remain either way.
+    compile: bool = False
     log_every: int = 10
     checkpoint_every: int = 0
     val_every: int = 0
