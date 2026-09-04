@@ -7,7 +7,6 @@ from typing import Any
 import pytest
 import torch
 
-from algorithms.affinity.targets import cc3d_available
 from algorithms.affinity_seg import AffinitySegmentation
 from algorithms.registry import AlgorithmRegistry
 from layers.common.dense_heads import VoxelHead
@@ -363,7 +362,6 @@ def test_an_unsplit_run_would_call_them_one_object():
 
 
 @pytest.mark.unit
-@pytest.mark.skipif(not cc3d_available(), reason="needs the 'affinity' extra (cc3d)")
 def test_delegating_stops_the_algorithm_doing_it_twice(monkeypatch: pytest.MonkeyPatch):
     """Once delegated, `_targets` must not repeat the pass -- that was the entire point.
 

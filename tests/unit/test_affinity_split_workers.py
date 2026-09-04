@@ -1,14 +1,16 @@
 """Moving the connected-components pass into the dataloader's workers must not change targets.
 
-The whole justification for the `affinity` extra is that `cc3d` and the repo's own
+The whole justification for depending on `cc3d` is that it and the repo's own
 `relabel_connected` produce the *same partition* of a crop into components -- neither promises
 particular ids, and `affinities_from_labels` only ever evaluates `a == b` and `a > 0`, so the
 grouping is the entire contract. If that ever stopped holding, an affinity run would train
-against subtly different targets depending on whether an optional dependency happened to be
-installed, and nothing in the loss would say so.
+against subtly different targets depending on where the pass ran, and nothing in the loss would
+say so.
 
-The `cc3d` tests skip when the extra is absent rather than failing, since `affinity_seg` is
-deliberately correct without it.
+Both implementations survive because they occupy different places, not because one is a fallback
+for the other: `cc3d` runs in a dataloader worker, `relabel_connected` on the training device for
+callers that never attach a `sample_transform`. That is exactly why their equivalence is pinned
+here rather than assumed.
 """
 
 from __future__ import annotations
@@ -22,13 +24,10 @@ from algorithms.affinity.targets import (
     SplitDisconnectedLabels,
     affinities_from_labels,
     affinity_offsets,
-    cc3d_available,
     relabel_connected,
     relabel_connected_cc3d,
 )
 from data.base import BaseDataset, TransformedDataset
-
-needs_cc3d = pytest.mark.skipif(not cc3d_available(), reason="needs the 'affinity' extra (cc3d)")
 
 
 def _same_partition(reference: torch.Tensor, candidate: torch.Tensor) -> bool:
@@ -40,7 +39,6 @@ def _same_partition(reference: torch.Tensor, candidate: torch.Tensor) -> bool:
 
 
 @pytest.mark.unit
-@needs_cc3d
 @pytest.mark.parametrize("seed", range(6))
 def test_cc3d_and_torch_agree_on_random_volumes(seed: int) -> None:
     """The property the extra rests on, on the same volumes the torch version is pinned against."""
@@ -56,7 +54,6 @@ def test_cc3d_and_torch_agree_on_random_volumes(seed: int) -> None:
 
 
 @pytest.mark.unit
-@needs_cc3d
 def test_cc3d_splits_a_reentering_object() -> None:
     """The case the pass exists for: one id, two disconnected runs inside the crop."""
     labels = torch.zeros(1, 1, 8, dtype=torch.long)
@@ -69,7 +66,6 @@ def test_cc3d_splits_a_reentering_object() -> None:
 
 
 @pytest.mark.unit
-@needs_cc3d
 def test_cc3d_does_not_merge_touching_different_instances() -> None:
     labels = torch.zeros(1, 1, 4, dtype=torch.long)
     labels[0, 0, 1] = 3
@@ -79,7 +75,6 @@ def test_cc3d_does_not_merge_touching_different_instances() -> None:
 
 
 @pytest.mark.unit
-@needs_cc3d
 def test_split_targets_match_whichever_side_computed_them() -> None:
     """End to end: the affinity target is the same whether the split ran in a worker or on device.
 
@@ -96,7 +91,6 @@ def test_split_targets_match_whichever_side_computed_them() -> None:
 
 
 @pytest.mark.unit
-@needs_cc3d
 def test_transform_handles_the_level_axis_and_keeps_the_dtype() -> None:
     """A sample's label is (L, X, Y, Z) and int32; both must survive, or the H2D cost changes."""
     labels = torch.zeros(1, 1, 1, 8, dtype=torch.int32)

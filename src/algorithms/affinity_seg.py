@@ -30,7 +30,6 @@ from .affinity.targets import (
     SplitDisconnectedLabels,
     affinities_from_labels,
     affinity_offsets,
-    cc3d_available,
     relabel_connected,
 )
 from .base import BaseAlgorithm
@@ -136,25 +135,14 @@ class AffinitySegmentation(BaseAlgorithm):
             )
 
     def sample_transform(self) -> SplitDisconnectedLabels | None:
-        """Hand the connected-components pass to the dataloader's workers, when it can be.
+        """Hand the connected-components pass to the dataloader's workers, when there is one to do.
 
-        `None` -- keeping the work on the training device -- in the two cases where it cannot:
-        when `split_disconnected` is off and there is no work to do at all, and when the optional
-        `affinity` extra is not installed. The second is a fallback rather than an error because
-        the device path is *correct*, only slow: making a missing optional dependency break every
-        existing affinity config would be a worse trade than running them at the speed they
-        already run at. It says so rather than degrading in silence, since the symptom otherwise
-        is a run that is 40% slower than an identical one elsewhere for no visible reason.
+        `None` only when `split_disconnected` is off, since then there is no work at all. cc3d is a
+        core dependency, so the pass always has somewhere to go; `_targets` still keeps its
+        on-device path for callers that never attach a transform -- a test, or `predict.py` -- and
+        that path is a placement difference rather than a fallback.
         """
         if not self.split_disconnected:
-            return None
-        if not cc3d_available():
-            print(
-                "[affinity] splitting disconnected components on the training device: cc3d is "
-                "not installed. This costs ~107 ms per step at 256^3 and reports as zero FLOPs, "
-                "so `mfu` will understate the run. Install it with: pip install -e '.[affinity]'",
-                flush=True,
-            )
             return None
         self._split_delegated = True
         return SplitDisconnectedLabels(self.label_key)

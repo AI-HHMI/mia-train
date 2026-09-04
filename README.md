@@ -4,15 +4,12 @@ PyTorch-native distributed training for volumetric microscopy.
 
 ## Installation
 
-`mia-train` is intentionally lightweight and minimalist in its dependencies. Currently, the only core dependencies are `torch`, `tensorboard` (for logging), and `miao` (as the sole dataset interface). You can install `mia-train` in editable mode as follows:
+`mia-train` is intentionally lightweight in its direct dependencies. Currently, the only core dependencies are `torch`, `tensorboard` (for logging), `miao` (as the sole dataset interface), and `cc3d` (for connected components computation). You can install `mia-train` in editable mode as follows:
 
 ```bash
 pip install -e .                    # core
-pip install -e '.[affinity]'        # + cc3d, for the affinity instance-segmentation task
 pip install -e '.[dev]'             # + pytest, ruff, mypy
 ```
-
-`affinity` extra (which will install `cc3d` additionally) is worth installing before any serious `affinity_seg` run. Without it the algorithm still trains, and to the same targets, but it will be much more efficient with `cc3d`.
 
 ## Running a training job
 
@@ -119,10 +116,9 @@ model, a hand-drawn segmentation, *etc.* A metric that only runs inside a traini
   `<run>/profile/`. See [Profiling a run](#profiling-a-run) below.
 - **Work in the dataloader's workers:** an algorithm may declare per-sample preprocessing via
   `BaseAlgorithm.sample_transform()`, and the engine attaches it to the training *and* validation
-  datasets — unlike `[augment]`, since this builds targets rather than perturbing inputs. It is
+  datasets (unlike `[augment]`), since this builds targets rather than perturbing inputs. It is
   for work that depends only on one sample and would otherwise sit between the batch arriving and
-  the loss. `affinity_seg` uses it for the connected-components pass over its label crop, which
-  needs the `affinity` extra; the profiler section below is how that was found.
+  the loss. `affinity_seg` uses it for the connected-components pass over its label crop.
 - **Augmentation:** `[augment]` adds volumetric EM augmentations: dropped and shifted sections,
   intensity jitter, noise, to the training data. Applied to the training dataset only; the engine
   never wraps `[val_data]`, so no setting can silently change what a validation number means.

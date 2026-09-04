@@ -11,9 +11,10 @@ their own failure modes, and they are far easier to test directly than through a
 
 from __future__ import annotations
 
-import importlib.util
 from typing import Any
 
+import cc3d
+import numpy as np
 import torch
 
 # The NISB baseline's six offsets, in the order it emits them: three short-range (nearest
@@ -108,11 +109,6 @@ def relabel_connected(labels: torch.Tensor) -> torch.Tensor:
     return torch.where(foreground, dense.reshape(spatial_shape) + 1, labels)
 
 
-def cc3d_available() -> bool:
-    """Whether the optional `affinity` extra is installed (`pip install -e '.[affinity]'`)."""
-    return importlib.util.find_spec("cc3d") is not None
-
-
 def relabel_connected_cc3d(labels: torch.Tensor) -> torch.Tensor:
     """`relabel_connected`, computed by `cc3d` on the CPU. Same partition, ~50x faster.
 
@@ -138,9 +134,6 @@ def relabel_connected_cc3d(labels: torch.Tensor) -> torch.Tensor:
     negative label space, so ignore voxels are masked to background before the pass and restored
     after; the mask is what keeps them from being absorbed into a neighbouring component.
     """
-    import cc3d  # imported here: the `affinity` extra is optional, see `cc3d_available`
-    import numpy as np
-
     array = labels.detach().cpu().numpy()
     foreground = array > 0
     # `+ 1` so component ids start at 1: cc3d numbers from 0 for background, and a 0 here would
