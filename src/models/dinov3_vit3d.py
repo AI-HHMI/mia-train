@@ -25,7 +25,10 @@ from typing import Any, Literal
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.parallel import ParallelStyle
 
+from distributed.tensor_parallel import self_attention_stack_plan
 from layers.dinov3.block import SelfAttentionBlock
 from layers.dinov3.config import dtype_dict, ffn_layer_dict, init_weights_vit, norm_layer_dict
 from layers.dinov3.ffn import SwiGLUFFN
@@ -272,7 +275,21 @@ class DinoVisionTransformer3D(BaseModel):
             else:
                 rope_sincos = [None for _ in rope]
             tokens_list = blk(tokens_list, rope_sincos)
-        all_x = tokens_list
+        # Leave sequence parallelism here, rather than in a hook on the last block. Under
+        # `tp > 1` the stream between the first and last block is a `Shard(1)` DTensor (see
+        # `distributed.tensor_parallel`), while everything below -- the norms, the CLS/patch split,
+        # a dense head -- is replicated and expects an ordinary tensor.
+        #
+        # This was a `GatherSequence` forward hook until `torch.compile` was tried on top of
+        # `tp > 1`: **Dynamo does not run a forward hook that replaces a module's output**, so the
+        # stream reached `self.norm` still sharded, met its replicated weights, and the step died
+        # with `aten.native_layer_norm.default got mixed torch.Tensor and DTensor`. Nothing said the
+        # hook had been skipped. The entry into sequence parallelism is a forward *pre*-hook, which
+        # Dynamo does honour, so only the exit had to move.
+        all_x = [
+            tokens.full_tensor() if isinstance(tokens, DTensor) else tokens
+            for tokens in tokens_list
+        ]
         output = []
         for idx, (x, masks) in enumerate(zip(all_x, masks_list, strict=True)):
             if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:
@@ -329,7 +346,12 @@ class DinoVisionTransformer3D(BaseModel):
                 rope_sincos = None
             x = blk(x, rope_sincos)
             if i in blocks_to_take:
-                output.append(x)
+                # Under tensor parallelism the stream between the first and last block is sharded
+                # along the token axis, so a layer taken from the middle of the stack comes back as
+                # this rank's slice. Everything downstream -- the norms, a linear probe -- is
+                # replicated, so the slice is gathered here rather than leaking a DTensor out of
+                # the model. The final block's output is already gathered and passes through.
+                output.append(x.full_tensor() if isinstance(x, DTensor) else x)
         assert len(output) == len(blocks_to_take), (
             f"only {len(output)} / {len(blocks_to_take)} blocks found"
         )
@@ -407,6 +429,20 @@ class DinoVisionTransformer3D(BaseModel):
     def checkpointable_modules(self) -> tuple[nn.Module, ...]:
         """The transformer blocks: repeated, sequence-length-sized, and cheap to rerun."""
         return tuple(self.blocks)
+
+    def fsdp_units(self) -> tuple[nn.Module, ...]:
+        """The transformer blocks, so a sharded run gathers one block's weights at a time."""
+        return tuple(self.blocks)
+
+    def tensor_parallel_plan(self) -> dict[str, ParallelStyle] | None:
+        """Megatron tensor parallelism over the block stack, with the token axis sharded between.
+
+        Only the blocks. The patch embedding, the CLS/storage/mask tokens, the rotary tables and
+        the output norms stay replicated: together they are 0.3% of this architecture's parameters
+        at 7B, they are not on the sequence-parallel stream (the plan gathers before the final
+        norm), and sharding them would buy nothing for the collectives it would add.
+        """
+        return self_attention_stack_plan(self._self_attention_blocks())
 
     def _self_attention_blocks(self) -> tuple[SelfAttentionBlock, ...]:
         """`self.blocks` with its element type recovered, which `nn.ModuleList` erases."""

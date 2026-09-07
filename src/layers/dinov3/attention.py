@@ -116,8 +116,12 @@ class SelfAttention(nn.Module):
         self.use_fa4 = use_fa4
 
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+        # Kept as an attribute, not a local, because `compute_attention` splits heads by *width*
+        # rather than by count: under tensor parallelism this layer's fused projection holds only
+        # this rank's share of the heads, so the head count varies with the mesh while the head
+        # dimension -- which sets `scale` and which the rotary tables are built for -- does not.
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
 
         linear_class = LinearKMaskedBias if mask_k_bias else nn.Linear
         self.qkv = linear_class(dim, dim * 3, bias=qkv_bias, device=device)
@@ -172,9 +176,15 @@ class SelfAttention(nn.Module):
     def compute_attention(self, qkv: torch.Tensor, attn_bias=None, rope=None) -> torch.Tensor:
         assert attn_bias is None
         B, N, _ = qkv.shape
-        C = self.qkv.in_features
+        # Read off the projection's *output* rather than from `self.qkv.in_features` and
+        # `self.num_heads`, which describe the whole layer. Under tensor parallelism the fused
+        # projection is sharded by head (`distributed.tensor_parallel.FusedQKVParallel`), so this
+        # tensor holds `num_heads / tp` heads' worth of q, k and v while both of those attributes
+        # still report the unsharded model. The two agree exactly when tp = 1.
+        C = qkv.shape[-1] // 3
+        heads = C // self.head_dim
 
-        qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        qkv = qkv.reshape(B, N, 3, heads, self.head_dim)
         q, k, v = torch.unbind(qkv, 2)
 
         q, k = (t.transpose(1, 2) for t in [q, k])

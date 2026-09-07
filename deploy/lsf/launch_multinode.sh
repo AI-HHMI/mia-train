@@ -3,6 +3,11 @@
 #
 #   MIA_TRAIN=... VENV=... launch_multinode.sh <gpus_per_node> <config.toml> [extra train.py args]
 #
+# `ENTRYPOINT` overrides the script torchrun runs. It defaults to `src/train.py`, which stays the
+# only thing a *training* job launches (DESIGN.md 4); the override is for a job that is not a run.
+# `experiments/b300_capability_run` uses it for a measurement harness that takes the same
+# `--config` but trains nothing.
+#
 # Lives in deploy/ rather than src/ because it is scheduler-specific: it reads LSF's host list.
 # `src/` stays scheduler-agnostic (DESIGN.md §6) and learns the topology only through the
 # environment torchrun sets.
@@ -16,6 +21,7 @@
 # node without colliding on a fixed port.
 set -euo pipefail
 
+ENTRYPOINT=${ENTRYPOINT:-src/train.py}
 GPUS_PER_NODE=${1:?usage: launch_multinode.sh <gpus_per_node> <config.toml> [extra args]}
 CONFIG=${2:?usage: launch_multinode.sh <gpus_per_node> <config.toml> [extra args]}
 shift 2
@@ -40,6 +46,7 @@ echo "multi-node launch: $NNODES node(s) x $GPUS_PER_NODE GPU(s) = $((NNODES * G
 echo "  hosts      : ${HOSTS[*]}"
 echo "  rendezvous : $MASTER:$PORT (c10d, id $LSB_JOBID)"
 echo "  config     : $CONFIG"
+echo "  entrypoint : $ENTRYPOINT"
 
 # Threads are per *process*, and there is one process per GPU, so this is slots-per-GPU budget
 # rather than the node's core count -- see the hint sheet on layered threading.
@@ -60,7 +67,7 @@ export PYTHONPATH='${PYTHONPATH:-}'
 exec '$VENV/bin/torchrun' \
   --nnodes=$NNODES --nproc_per_node=$GPUS_PER_NODE \
   --rdzv_backend=c10d --rdzv_id=$LSB_JOBID --rdzv_endpoint=$MASTER:$PORT \
-  src/train.py --config '$CONFIG' $*
+  '$ENTRYPOINT' --config '$CONFIG' $*
 EOF
 )
 

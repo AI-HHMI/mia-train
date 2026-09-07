@@ -15,8 +15,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 from algorithms.base import BaseAlgorithm
 from data.augment import BatchPhotometric
 from data.base import BaseDataset
+from distributed.grad_norm import clip_grad_norm_
 from distributed.parallel_dims import ParallelDims
-from distributed.parallelize import parallelize_algorithm
+from distributed.parallelize import apply_tensor_parallel, shard_algorithm
 from utils.device import move_to_device
 from utils.hardware_flops import peak_flops
 from utils.metrics import MetricLogger, reduce_metrics
@@ -66,17 +67,29 @@ class Trainer:
 
         torch.manual_seed(config.seed)
 
+        # Tensor parallelism, then activation checkpointing, then sharding — in that order, and
+        # each boundary is load-bearing.
+        #
+        # TP comes first because `checkpoint_wrapper` re-parents a block under
+        # `_checkpoint_wrapped_module`, and a parallel plan's paths are resolved through
+        # `named_children()`; applied afterwards it would match nothing, silently, and the run
+        # would train fully replicated (see `distributed.parallelize.apply_tensor_parallel`).
+        #
+        # Sharding comes last because FSDP2 hooks a module's forward to gather its parameters, so
+        # checkpointing afterwards would put the recomputation outside the gather. Memory pressure
+        # is per-GPU and exists on one device as much as on eight, which is why the middle step
+        # does not depend on there being a mesh at all.
+        if mesh is not None:
+            apply_tensor_parallel(algorithm.model, mesh, self.dims)
+
         if config.activation_checkpointing:
-            # Before sharding, and independent of it: FSDP2 hooks a module's forward to gather
-            # its parameters, so wrapping afterwards would put the recomputation outside the
-            # gather. Memory pressure is per-GPU and exists on one device as much as on eight.
             apply_activation_checkpointing(algorithm)
 
         if mesh is not None:
             # The algorithm, not just its model: an algorithm's own parameters (MAE's decoder)
             # have to be sharded alongside the model's, or grad clipping mixes DTensors with
             # plain tensors.
-            parallelize_algorithm(algorithm, mesh, self.dims)
+            shard_algorithm(algorithm, mesh, self.dims)
         self.algorithm = algorithm.to(self.device)
 
         self.optimizer = build_optimizer(self.algorithm, config)
@@ -301,7 +314,10 @@ class Trainer:
 
                 if self.config.grad_clip_norm is not None:
                     with annotate("grad_clip"):
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                        # `distributed.grad_norm`, not torch's: under tensor parallelism the
+                        # gradients span two device meshes and torch's takes one norm over all of
+                        # them at once. Identical to torch's when they do not.
+                        grad_norm = clip_grad_norm_(
                             self.algorithm.parameters(), self.config.grad_clip_norm
                         )
                     metrics["grad_norm"] = grad_norm

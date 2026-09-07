@@ -11,7 +11,9 @@ from typing import Any
 
 import pytest
 import torch
+import torch.nn as nn
 
+from distributed.tensor_parallel import ScatterSequence
 from models.dinov3_vit import DinoVisionTransformer
 from models.dinov3_vit3d import DinoVisionTransformer3D
 from models.registry import ModelRegistry
@@ -376,8 +378,39 @@ def test_flops_reject_a_channel_count_the_model_could_not_run(cls):
 
 @pytest.mark.unit
 @BOTH
-def test_no_tensor_parallel_plan(cls):
-    assert _model(cls).tensor_parallel_plan() is None
+def test_tensor_parallel_plan_covers_every_projection_in_every_block(cls):
+    """A path a plan does not name is left replicated, and `parallelize_module` does not complain.
+
+    So the plan is checked against the module tree rather than against a count: every `nn.Linear`
+    under `blocks` must appear, or a tp run would quietly shard part of a block and replicate the
+    rest -- which still trains, at more memory than tp = 1 and with an extra collective per layer.
+    """
+    model = _model(cls)
+    plan = model.tensor_parallel_plan()
+    assert plan is not None
+
+    linears = {
+        f"blocks.{name}"
+        for name, module in model.blocks.named_modules()
+        if isinstance(module, nn.Linear)
+    }
+    assert linears <= set(plan), f"unsharded projections: {sorted(linears - set(plan))}"
+    # Sequence parallelism is entered here and left in the model's own `forward_features_list`,
+    # never in a hook -- Dynamo does not run forward hooks that replace a module's output, and the
+    # exit used to be one.
+    assert isinstance(plan["blocks.0"], ScatterSequence)
+    entries = [key for key, style in plan.items() if isinstance(style, ScatterSequence)]
+    assert entries == ["blocks.0"]
+
+
+@pytest.mark.unit
+@BOTH
+def test_tensor_parallel_plan_refuses_stochastic_depth(cls):
+    # `drop_path > 0` drives attention and the FFN through `forward_list`, which is called as a
+    # method and so bypasses every hook the plan installs -- each rank would attend over its own
+    # slice of the heads as though it were all of them.
+    with pytest.raises(ValueError, match="stochastic depth"):
+        _model(cls, drop_path_rate=0.1).tensor_parallel_plan()
 
 
 # ---------------------------------------------------------------- prepare_input

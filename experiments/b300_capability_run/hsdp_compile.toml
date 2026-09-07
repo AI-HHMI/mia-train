@@ -1,0 +1,82 @@
+# Capability run, arm 1: DINOv3 ViT-7B/16 affinity fine-tune under HSDP alone, on 8 B300 nodes.
+#
+# `capability_sweep.py` reads this, overrides `[model].img_size` with the crop size it is
+# measuring, and feeds synthetic batches -- so `[data]` is not read by the sweep. It is here, and
+# correct, because the point of the sweep is to say what a *real* run can do: set `patch_size` to
+# the size that fitted and this file trains through `src/train.py` unchanged.
+#
+# The architecture is read off the released checkpoint
+# (`dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth`): embed_dim 4096 x depth 40 x 32 heads, SwiGLU
+# with w1/w2 8192 wide (ffn_ratio 3.0 -> 2/3 of 12288), LayerScale on both branches, 4 storage
+# tokens, no qkv bias. Two deliberate departures:
+#
+#   in_chans = 1                          EM is single channel. This *grows* the model: the 3D stem
+#                                         is 4096 x 1 x 16^3 = 16.8M against the 2D stem's 3.1M.
+#   untie_global_and_local_cls_norm off   that norm is reached only by DINOv3's multi-crop SSL
+#                                         path, so a supervised fine-tune would carry 8K parameters
+#                                         that never receive a gradient.
+#
+# To start from the released weights, add an [init] section as configs/dinov3_nisb_finetune.toml
+# does; the sweep measures a from-scratch model because initialisation costs no memory or time.
+
+experiment_name = "b300cap__hsdp_compile"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 512            # overridden per trial by capability_sweep.py --size
+patch_size = 16
+in_chans = 1
+embed_dim = 4096
+depth = 40
+num_heads = 32
+ffn_ratio = 3.0
+ffn_layer = "swiglu64"
+qkv_bias = false
+proj_bias = true
+ffn_bias = true
+layerscale_init = 1.0e-5
+n_storage_tokens = 4
+norm_layer = "layernorm"
+untie_global_and_local_cls_norm = false
+
+# Axial rotary embedding: depth gets its own third of the rotary channels, rather than the
+# superposition variant's zero-gated overlay onto the 2D layout. The right choice when the depth
+# axis is trained rather than adapted from a 2D checkpoint.
+pos_embed_rope_type = "vanilla"
+pos_embed_rope_dtype = "bf16"
+drop_path_rate = 0.0      # tensor parallelism refuses stochastic depth; see self_attention_stack_plan
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder = "subpixel"      # the cheaper head; see README for what the interpolating one costs
+input_axes = "lcxyz"      # stated because the sweep builds the algorithm without a dataset
+split_disconnected = true # forced off inside the sweep, which has no dataloader workers to run it
+
+[data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [512, 512, 512]
+samples_per_epoch = 1000
+
+[trainer]
+max_steps = 100000
+batch_size = 1            # per data-parallel rank; the crop is the variable, not the batch
+lr = 1.0e-4
+warmup_steps = 500
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+activation_checkpointing = true
+# The other lever this repo has already measured at 2.30x on `affinity_seg` at 256^3 on a
+# B300. Orthogonal to `decoder_readout_dim`, hence the 2x2.
+compile = true
+num_workers = 8
+log_every = 50
+
+[parallelism]
+# 8 nodes: replicate across nodes, shard within one. Sharding stays on NVLink and only the
+# gradient all-reduce crosses InfiniBand.
+dp_replicate = 8
+dp_shard = 8
+tp = 1

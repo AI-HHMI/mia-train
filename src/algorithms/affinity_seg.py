@@ -20,6 +20,7 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from data.base import BaseDataset
 from layers.common.dense_heads import SubPixelHead, VoxelHead
@@ -38,6 +39,10 @@ from .registry import AlgorithmRegistry
 SPATIAL_RANK = 3
 DECODERS = ("interpolate", "subpixel")
 
+#: Label dtypes `_prepare_labels` passes through untouched. Signed, because `ignore_index` is
+#: negative; integer, because a float label cannot be trusted to have kept its ids distinct.
+SIGNED_INTEGER = (torch.int8, torch.int16, torch.int32, torch.int64)
+
 
 @AlgorithmRegistry.register("affinity_seg")
 class AffinitySegmentation(BaseAlgorithm):
@@ -51,6 +56,36 @@ class AffinitySegmentation(BaseAlgorithm):
     rather than treated as background. NISB itself has none -- every voxel is either background
     (0) or an instance -- but the reference pipeline reserves -1 for it and datasets with partial
     annotation need it.
+
+    `decode_chunks` splits everything downstream of the patch grid into that many slabs along the
+    first spatial axis, each decoded and scored inside its own checkpoint, so only one slab's
+    voxel-resolution activations are live at a time. 1 (the default) is the undivided path,
+    unchanged.
+
+    It is worth having because this half of the algorithm is proportional to *voxels* -- the crop
+    cubed -- while the encoder is proportional to tokens, so past a certain crop the head is the
+    whole cost. Measured on a 7B DINOv3 at a 512-cube on B300s
+    (`experiments/b300_capability_run`): 72% of the step's time was `convolution_backward` in this
+    head, and the memory frontier was set by its voxel-resolution tensors rather than by the 6.7B
+    parameters in front of them.
+
+    Two things make the slabs exact rather than approximate, and both are pinned by
+    `tests/unit/test_affinity_chunked.py` against the undivided path:
+
+      * each slab is decoded with a halo wide enough for `SubPixelHead.refine`'s convolutions and
+        cropped afterwards, so seam voxels see the context they would have seen, and
+      * each slab's targets are built from labels reaching `long_range` past its end, because the
+        affinity offsets are positive and a slab's last voxels are compared against the next
+        slab's first.
+
+    Metrics accumulate as ratios of sums, never as means of means, so uneven slabs weight
+    correctly. The halo costs roughly 1.25-1.5x the head's arithmetic depending on slab width, and
+    tends to buy more than it costs: a slab's tensors are small enough to stay under cuDNN's 2^31
+    element limit, where the same convolutions stop falling back to its int64 direct kernels.
+
+    Only the sub-pixel head can be chunked. The interpolating one resizes the whole patch grid in a
+    single `F.interpolate`, whose scale factor comes from the sizes it is handed -- a slab plus halo
+    would sample at a different rate, and the seams would be wrong with no shape to catch it.
     """
 
     def __init__(
@@ -68,12 +103,24 @@ class AffinitySegmentation(BaseAlgorithm):
         decoder_zero_init_output: bool = True,
         ignore_index: int = -1,
         split_disconnected: bool = True,
+        decode_chunks: int = 1,
     ) -> None:
         super().__init__(model, dataset)
         if long_range < 1:
             raise ValueError(f"long_range must be at least 1 voxel, got {long_range}")
         if decoder not in DECODERS:
             raise ValueError(f"decoder must be one of {DECODERS}, got {decoder!r}")
+        if decode_chunks < 1:
+            raise ValueError(f"decode_chunks must be at least 1, got {decode_chunks}")
+        if decode_chunks > 1 and decoder != "subpixel":
+            # The interpolating head resizes the *whole* patch grid in one `F.interpolate`, and a
+            # chunk of that resize is not a resize of the chunk: the scale factor is derived from
+            # the sizes it is given, so a slab plus halo would sample at a different rate and the
+            # seams would be wrong in a way no shape check catches. The sub-pixel head decodes each
+            # token into its own disjoint block, which is what makes slabs exact.
+            raise ValueError(
+                f"decode_chunks > 1 needs decoder = 'subpixel', got {decoder!r}"
+            )
 
         self.input_axes = self._resolve_input_axes(input_axes, dataset)
         self.input_key = input_key
@@ -82,6 +129,8 @@ class AffinitySegmentation(BaseAlgorithm):
         self.split_disconnected = split_disconnected
         self.offsets = affinity_offsets(SPATIAL_RANK, long_range)
         self.decoder_kind = decoder
+        self.decode_chunks = decode_chunks
+        self.long_range = long_range
         self.encoder = model
         # Set by `sample_transform` when the engine takes the connected-components pass off this
         # algorithm's hands and into the dataloader's workers. Until then `_targets` does it
@@ -198,11 +247,30 @@ class AffinitySegmentation(BaseAlgorithm):
         return axes
 
     def _prepare_labels(self, labels: torch.Tensor) -> torch.Tensor:
-        """(B, *label axes) -> (B, X, Y, Z) int64.
+        """(B, *label axes) -> (B, X, Y, Z), in a signed integer type.
 
         Labels arrive without the channel axis the image carries (miao returns `(L, X, Y, Z)` for
         a 3D label group beside a `cxyz` image), so the level axis is located against the axis
         string with `c` removed rather than reusing the model's `prepare_input`.
+
+        **The dtype is preserved when it is already a signed integer, and widened to int64
+        otherwise.** This used to widen unconditionally, and at a large crop that made it the
+        biggest tensor in the step: `.long()` on an int32 label volume cannot be a view, so it
+        allocates a second copy at twice the size while the caller's batch still holds the first.
+        At a 1600-cube the pair is 45.8 GiB of a ~265 GiB step, 30.5 GiB of which is the copy --
+        an order of magnitude more than any parallelism setting moved
+        (`experiments/b300_capability_run`).
+
+        Nothing downstream reads the width. `affinities_from_labels` and `relabel_connected` only
+        ever evaluate `labels > 0`, `labels != ignore_index` and `a == b`: membership and sign,
+        which mean the same thing in any signed integer type.
+
+        What the widening *was* worth is kept. A label that arrives as a float cannot be trusted to
+        have preserved its own ids -- this repo has already lost 64-bit segment ids to a trip
+        through float32, distinct neurons merging into one while the dtype still read as integral
+        afterwards -- and an unsigned label cannot represent `ignore_index`. Both are still
+        converted, because for those the conversion carries information. A signed integer is left
+        alone, because for it the conversion carries none.
         """
         label_axes = self.input_axes.replace("c", "")
         expected_dims = len(label_axes) + 1
@@ -216,7 +284,7 @@ class AffinitySegmentation(BaseAlgorithm):
         level_dim = label_axes.index("l") + 1
         levels = labels.shape[level_dim]
         if levels == 1:
-            return labels.squeeze(level_dim).long()
+            return self._as_signed_integer(labels.squeeze(level_dim))
 
         # Multi-scale batch: supervise the FINEST level, index 0. miao returns one label array per
         # scale, and a multi-scale encoder's dense head predicts into the finest grid (see
@@ -227,7 +295,12 @@ class AffinitySegmentation(BaseAlgorithm):
         #
         # miao orders levels fine-to-coarse and MuViT3D enforces that ordering on its `levels`, so
         # index 0 is the finest by construction rather than by convention.
-        return labels.select(level_dim, 0).long()
+        return self._as_signed_integer(labels.select(level_dim, 0))
+
+    @staticmethod
+    def _as_signed_integer(labels: torch.Tensor) -> torch.Tensor:
+        """`labels` unchanged if it is already a signed integer, else a int64 copy of it."""
+        return labels if labels.dtype in SIGNED_INTEGER else labels.long()
 
     #: What a prediction over this algorithm's output means, for the artifact a predictor writes.
     #: Declared here rather than inferred by the predictor: `(6, X, Y, Z)` of floats could equally
@@ -306,6 +379,89 @@ class AffinitySegmentation(BaseAlgorithm):
             target, mask = affinities_from_labels(labels, self.offsets, self.ignore_index)
             return target.float(), mask
 
+    def _refine_reach(self) -> int:
+        """Voxels of context the head's full-resolution convolutions read on each side.
+
+        `SubPixelHead.refine` is `refine_depth` convolutions of width 3, so each one reaches one
+        voxel; `project`, the expansion and `out` are all per-token or 1x1 and reach none. A slab
+        decoded with this much halo, then cropped, is elementwise identical to the same slab of an
+        undivided decode -- which is what `tests/unit/test_affinity_chunked.py` pins.
+        """
+        return sum(
+            1
+            for module in self.decoder_out.modules()
+            if isinstance(module, nn.Conv3d) and max(module.kernel_size) > 1
+        )
+
+    def _chunk_spans(self, extent: int) -> list[tuple[int, int]]:
+        """`decode_chunks` contiguous spans of the patch grid's first axis, near-equal in size.
+
+        The first axis and not another, because patch tokens arrive in row-major grid order: a
+        contiguous *range of tokens* is exactly a slab along that axis, so a chunk is a slice
+        rather than a gather. Remainders go to the earliest chunks.
+        """
+        chunks = min(self.decode_chunks, extent)
+        base, extra = divmod(extent, chunks)
+        spans, start = [], 0
+        for index in range(chunks):
+            stop = start + base + (1 if index < extra else 0)
+            spans.append((start, stop))
+            start = stop
+        return spans
+
+    def _chunk_terms(
+        self,
+        tokens: torch.Tensor,
+        grid: tuple[int, ...],
+        labels: torch.Tensor,
+        span: tuple[int, int],
+        halo: int,
+        patch: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """One slab's contribution to every metric, as unnormalized sums.
+
+        Sums rather than means because that is what composes: each reported metric is a ratio of
+        two of these, so a run split into slabs reports exactly what an undivided one does
+        regardless of how the slabs are sized.
+        """
+        lo, hi = span
+        # Halo tokens on each side feed the refine convolutions the context they would have had
+        # in an undivided decode; the volume's own faces have none, which is also what an
+        # undivided decode sees there.
+        token_lo, token_hi = max(lo - halo, 0), min(hi + halo, grid[0])
+        plane = grid[1] * grid[2]
+        slab = tokens[:, token_lo * plane : token_hi * plane, :]
+        slab_grid = (token_hi - token_lo, grid[1], grid[2])
+
+        logits = self._decode(slab, slab_grid, torch.Size(s * patch for s in slab_grid))
+        # Back to the slab's own voxels, dropping the halo the convolutions have now consumed.
+        keep_lo, keep_hi = (lo - token_lo) * patch, (hi - token_lo) * patch
+        logits = logits[:, :, keep_lo:keep_hi]
+
+        # Labels reach `long_range` further than the slab, because the affinity offsets are
+        # positive: the last voxels of a slab are compared against the first of the next. Past the
+        # volume's end there is nothing to reach for, and `affinities_from_labels` masks those out
+        # exactly as it does for an undivided volume.
+        label_hi = min(hi * patch + self.long_range, labels.shape[1])
+        target, mask = self._targets(labels[:, lo * patch : label_hi])
+        width = keep_hi - keep_lo
+        target, mask = target[:, :, :width], mask[:, :, :width]
+
+        per_voxel = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        loss_sum = (per_voxel * mask).sum()
+        with torch.no_grad():
+            correct = ((logits > 0) == (target > 0.5)) & mask
+            cut = mask & (target <= 0.5)
+            terms = (
+                mask.sum(),
+                correct.sum(),
+                (target * mask).sum(),
+                cut.sum(),
+                (correct & cut).sum(),
+                torch.tensor(float(mask.numel()), device=mask.device),
+            )
+        return (loss_sum, *(term.float() for term in terms))
+
     def _step(self, batch: Any) -> dict[str, torch.Tensor]:
         if self.label_key not in batch:
             raise KeyError(
@@ -330,37 +486,77 @@ class AffinitySegmentation(BaseAlgorithm):
 
         with torch.profiler.record_function("encoder"):
             tokens, grid = self.encoder.patch_features(volumes)
+
+        if self.decode_chunks == 1:
+            with torch.profiler.record_function("decoder"):
+                logits = self._decode(tokens, grid, spatial)
+            # NOTE `logits()` is the same pair of calls without the profiler regions; kept separate
+            # so the training step's annotations stay where the profiler expects them.
+            target, mask = self._targets(labels)
+
+            # Masked mean rather than a masked tensor: the border slab each offset shifts in from
+            # has no neighbour, and scoring it would train the network on invented targets.
+            per_voxel = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+            denominator = mask.sum().clamp_min(1.0)
+            loss = (per_voxel * mask).sum() / denominator
+
+            with torch.no_grad():
+                correct = ((logits > 0) == (target > 0.5)) & mask
+                accuracy = correct.sum() / denominator
+                positive_rate = (target * mask).sum() / denominator
+                # Accuracy restricted to the voxel/offset pairs that a boundary separates. Pooled
+                # accuracy is a poor guide on this task -- the target is ~83% positive, so
+                # predicting "same object" everywhere already scores 0.83 and says nothing -- and
+                # it is precisely the negatives that decide whether objects come apart, since a
+                # missed cut merges two objects and a spurious one fragments one. Reported
+                # separately so that a head getting sharper is visible as a number rather than only
+                # in a figure.
+                cut = mask & (target <= 0.5)
+                cut_total = cut.sum().clamp_min(1.0)
+                cut_accuracy = (correct & cut).sum() / cut_total
+            return {
+                "loss": loss,
+                "affinity_accuracy": accuracy,
+                "boundary_accuracy": cut_accuracy,
+                "target_positive_rate": positive_rate,
+                "masked_fraction": mask.float().mean(),
+            }
+
+        # Chunked: decode and score one slab of the volume at a time, each inside its own
+        # checkpoint, so only one slab's full-resolution activations are ever live. What that buys
+        # is the whole reason this exists -- everything downstream of the patch grid is
+        # proportional to *voxels*, which is the crop cubed, and on a 7B encoder at a 512-cube it
+        # was 72% of the step's time and most of its memory. It is also why the chunks are cheaper
+        # than the sum of their parts: a slab's tensors drop back under cuDNN's 2^31 element limit,
+        # where its convolutions stop falling back to the int64 direct kernels.
+        patch = spatial[0] // grid[0]
+        halo = -(-self._refine_reach() // patch)  # ceil, in whole tokens
+        totals: list[torch.Tensor] | None = None
         with torch.profiler.record_function("decoder"):
-            logits = self._decode(tokens, grid, spatial)
-        # NOTE `logits()` is the same pair of calls without the profiler regions; kept separate so
-        # the training step's annotations stay where the profiler expects them.
-        target, mask = self._targets(labels)
+            for span in self._chunk_spans(grid[0]):
+                terms = checkpoint(
+                    self._chunk_terms,
+                    tokens,
+                    grid,
+                    labels,
+                    span,
+                    halo,
+                    patch,
+                    use_reentrant=False,
+                )
+                totals = list(terms) if totals is None else [
+                    running + term for running, term in zip(totals, terms, strict=True)
+                ]
 
-        # Masked mean rather than a masked tensor: the border slab each offset shifts in from has
-        # no neighbour, and scoring it would train the network on invented targets.
-        per_voxel = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-        denominator = mask.sum().clamp_min(1.0)
-        loss = (per_voxel * mask).sum() / denominator
-
-        with torch.no_grad():
-            correct = ((logits > 0) == (target > 0.5)) & mask
-            accuracy = correct.sum() / denominator
-            positive_rate = (target * mask).sum() / denominator
-            # Accuracy restricted to the voxel/offset pairs that a boundary separates. Pooled
-            # accuracy is a poor guide on this task -- the target is ~83% positive, so predicting
-            # "same object" everywhere already scores 0.83 and says nothing -- and it is precisely
-            # the negatives that decide whether objects come apart, since a missed cut merges two
-            # objects and a spurious one fragments one. Reported separately so that a head getting
-            # sharper is visible as a number rather than only in a figure.
-            cut = mask & (target <= 0.5)
-            cut_total = cut.sum().clamp_min(1.0)
-            cut_accuracy = (correct & cut).sum() / cut_total
+        assert totals is not None  # `_chunk_spans` never returns an empty list
+        loss_sum, mask_sum, correct_sum, positive_sum, cut_sum, cut_correct, elements = totals
+        denominator = mask_sum.clamp_min(1.0)
         return {
-            "loss": loss,
-            "affinity_accuracy": accuracy,
-            "boundary_accuracy": cut_accuracy,
-            "target_positive_rate": positive_rate,
-            "masked_fraction": mask.float().mean(),
+            "loss": loss_sum / denominator,
+            "affinity_accuracy": correct_sum / denominator,
+            "boundary_accuracy": cut_correct / cut_sum.clamp_min(1.0),
+            "target_positive_rate": positive_sum / denominator,
+            "masked_fraction": mask_sum / elements,
         }
 
     def training_step(self, batch: Any) -> dict[str, torch.Tensor]:

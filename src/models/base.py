@@ -91,6 +91,26 @@ class BaseModel(nn.Module, abc.ABC):
         """
         return ()
 
+    def fsdp_units(self) -> tuple[nn.Module, ...]:
+        """Submodules to shard as FSDP units of their own, inside the unit the whole model forms.
+
+        FSDP2 all-gathers a unit's parameters for the duration of that unit's forward. With the
+        model as the only unit, that is *every* parameter for the whole forward pass, so a sharded
+        7B model still materializes 27 GB of fp32 weights on each rank and 27 GB of gradients
+        beside them — the optimizer state is sharded and nothing else is. Naming the transformer
+        blocks makes each one its own unit, so a block's weights are gathered when it runs and
+        resharded when it finishes, and the resident cost falls to roughly one block's worth.
+
+        The same division as `checkpointable_modules`, and for a related reason: a repeated,
+        self-contained region is what both mechanisms want. They are separate methods because they
+        answer different questions — one is about recomputing activations, the other about when
+        parameters exist — and an architecture may have a good answer to one and not the other.
+
+        Empty by default, which leaves the current behaviour (the model as a single unit) in place
+        for architectures that have not declared a split.
+        """
+        return ()
+
     def lora_target_groups(self) -> dict[str, tuple[nn.Linear, ...]]:
         """Named groups of `nn.Linear` layers a low-rank adapter may be attached to.
 
