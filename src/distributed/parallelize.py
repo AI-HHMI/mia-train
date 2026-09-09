@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed._composable.replicate import replicate
@@ -44,13 +45,34 @@ def apply_tensor_parallel(model: nn.Module, mesh: DeviceMesh, dims: ParallelDims
     parallelize_module(model, mesh["tp"], plan)
 
 
+# Fraction of device memory that one FSDP unit's gathered parameters may occupy when
+# `fsdp_unit_budget_gb` is "auto". Deliberately small: the gathered weights sit alongside their
+# gradients and the activations, and this only has to be loose enough that a model whose whole
+# parameter set is a rounding error on the device stays a single unit.
+_AUTO_UNIT_BUDGET_FRACTION = 0.05
+_BYTES_PER_GIB = 1024**3
+
+
 def _shard(module: nn.Module, mesh: DeviceMesh, dims: ParallelDims) -> bool:
     """FSDP-shard `module` over the data-parallel mesh. False if no sharding was requested.
 
-    The module's declared `fsdp_units` become units of their own inside it. FSDP2 all-gathers a
-    unit's parameters for the whole of that unit's forward, so a single root unit leaves a sharded
-    model materializing every parameter at once -- the optimizer state is sharded and nothing else
-    is. Nested units are gathered and resharded block by block instead.
+    The module's declared `fsdp_units` are packed into groups, each its own FSDP unit inside the
+    unit the module itself forms. FSDP2 all-gathers a unit's parameters for the whole of that
+    unit's forward and reduce-scatters its gradients in one collective, so the grouping is a
+    direct trade: fewer, larger units issue fewer collectives and hold more weights resident.
+
+    Both ends of that trade are real, which is why this is a budget and not a boolean. One unit
+    per block on ViT-L (303M parameters, 24 blocks) issues ~72 collectives a step against ~3, and
+    measured 114.3 +/- 2.1 samples/s over four runs of the production SimMIM arm against
+    123.8 +/- 0.3 without it -- 7.7% -- to save ~1.2 GB of resident weights on a 141 GB device.
+    The same per-block split at 7B saves ~28 GB and is what makes the run fit. Packing to a byte
+    budget gets both: a small model collapses to a single group, a large one keeps the split it
+    needs.
+
+    The cost only shows up when the host is contended, which is the other half of why it went
+    unnoticed: the collectives are cheap on device but each carries host-side launch work, and
+    `defer_image_ops=false` leaves the dataloader workers saturating the cores. The `defer=true`
+    arm leaves them ~90% idle and measured no difference at all (166.7 against 166.8).
     """
     if dims.hsdp_enabled:
         dp_mesh = mesh["dp_replicate", "dp_shard"]
@@ -59,8 +81,14 @@ def _shard(module: nn.Module, mesh: DeviceMesh, dims: ParallelDims) -> bool:
     else:
         return False
 
-    for unit in _fsdp_units(module):
-        fully_shard(unit, mesh=dp_mesh)
+    # Bottom-up, as FSDP2 requires: a group claims the parameters not already claimed by a group
+    # made from a submodule, so the root call last picks up whatever the groups left.
+    for group in _fsdp_unit_groups(module, dims, dp_mesh.device_type):
+        # The list form makes the whole group ONE unit -- one all-gather, one reduce-scatter --
+        # without a container module to hold it, so the module tree and therefore every
+        # state_dict key is unchanged. A per-module loop here would instead make len(group)
+        # units and defeat the point.
+        fully_shard(list(group), mesh=dp_mesh)
     fully_shard(module, mesh=dp_mesh)
     return True
 
@@ -73,6 +101,76 @@ def _fsdp_units(module: nn.Module) -> tuple[nn.Module, ...]:
     reach the model's blocks a second time after they were already made units.
     """
     return module.fsdp_units() if isinstance(module, BaseModel) else ()
+
+
+def unit_budget_bytes(dims: ParallelDims, device_type: str = "cpu") -> int:
+    """`fsdp_unit_budget_gb` in bytes, resolving "auto" against a mesh of `device_type`.
+
+    Public so a caller can report the budget it will be sharded under.
+
+    `device_type` comes from the mesh rather than from `torch.cuda.is_available()`, because
+    `torch.cuda.get_device_properties` *initialises a CUDA context* and this is reached from
+    `_shard`, which on the Gloo path runs inside each forked rank. A CPU mesh has no business
+    creating a CUDA context per rank -- on a node whose GPUs are in exclusive-process mode that
+    is a device contended for no reason -- so a non-CUDA mesh does not touch CUDA at all, not
+    even to ask whether it exists. (`tests/distributed` does fail with
+    `CUDA-capable device(s) is/are busy or unavailable` in a one-GPU job, but master fails it
+    identically, so that is the job's GPU count and not this.)
+
+    For a non-CUDA mesh there is no device memory to take a fraction of, so this falls back to a
+    figure larger than any model such a test builds: the fallback degenerates to the
+    single-root-unit case rather than splitting a test model at some arbitrary point, and it is
+    deliberately close to what a real device yields (5% of an H200's 141 GB is ~7 GiB) so CPU and
+    GPU runs do not group differently for small models.
+    """
+    budget = dims.fsdp_unit_budget_gb
+    if budget != "auto":
+        return int(float(budget) * _BYTES_PER_GIB)
+    if device_type == "cuda" and torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        return int(total * _AUTO_UNIT_BUDGET_FRACTION)
+    return 8 * _BYTES_PER_GIB
+
+
+def _fsdp_unit_groups(
+    module: nn.Module, dims: ParallelDims, device_type: str = "cpu"
+) -> tuple[tuple[nn.Module, ...], ...]:
+    """The declared units packed into consecutive groups, each under the byte budget.
+
+    Consecutive rather than best-fit: FSDP2 prefetches the next unit while the current one
+    computes, and that only overlaps if a unit's members run together. Packing blocks 0-5 into
+    one group preserves that; packing 0, 7 and 19 into one would gather weights long before two
+    of them are needed and stall on the third.
+
+    A unit larger than the budget on its own becomes its own group, because there is nothing
+    smaller to split it into -- the budget bounds what this can choose, not what the model
+    declared.
+    """
+    units = _fsdp_units(module)
+    if not units:
+        return ()
+    budget = unit_budget_bytes(dims, device_type)
+
+    groups: list[tuple[nn.Module, ...]] = []
+    current: list[nn.Module] = []
+    current_bytes = 0
+    for unit in units:
+        unit_bytes = sum(p.numel() * p.element_size() for p in unit.parameters())
+        if current and current_bytes + unit_bytes > budget:
+            groups.append(tuple(current))
+            current, current_bytes = [], 0
+        current.append(unit)
+        current_bytes += unit_bytes
+    if current:
+        groups.append(tuple(current))
+
+    # One group holding every declared unit is the same set of parameters the root call would
+    # have claimed anyway, so making it a nested unit buys a redundant collective. Drop it and
+    # let the root be the only unit -- which is exactly the pre-budget behaviour for a model
+    # small enough not to need splitting.
+    if len(groups) == 1:
+        return ()
+    return tuple(groups)
 
 
 def _entry_points(model: nn.Module) -> tuple[str, ...]:
