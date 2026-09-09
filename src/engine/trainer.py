@@ -135,6 +135,12 @@ class Trainer:
             else None
         )
 
+        # Per dataset, not one shared hook: `[data]` and `[val_data]` are separate sections and may
+        # disagree about deferring, and finishing a validation batch with the training set's rules
+        # would be silent. Identity unless a dataset deferred work to the device.
+        self._finish_train = train_dataset.finish_batch
+        self._finish_val = val_dataset.finish_batch if val_dataset is not None else None
+
         self.is_primary = not dist.is_initialized() or dist.get_rank() == 0
         self.logger = MetricLogger(
             log_dir=output_dir / "tensorboard",
@@ -261,7 +267,9 @@ class Trainer:
             # does not consume one. `_build_throughput_meter` restores the RNG, and together those
             # make the probe invisible: the run sees the same batches in the same order with the
             # same random draws whether or not it is enabled.
-            probe_batch = move_to_device(next(batches), self.device)
+            probe_batch = self._finish_train(
+                move_to_device(next(batches), self.device), self.device
+            )
             batches = itertools.chain([probe_batch], batches)
             meter = self._build_throughput_meter(probe_batch)
             meter.start()
@@ -294,7 +302,12 @@ class Trainer:
                 data_seconds += time.perf_counter() - wait_start
 
                 with annotate("h2d"):
-                    batch = move_to_device(raw_batch, self.device)
+                    # Moved first, then finished: what crosses the bus is the deferred form, which
+                    # for `miao`'s deferred images is the crop in its stored dtype rather than a
+                    # normalized float four times its size.
+                    batch = self._finish_train(
+                        move_to_device(raw_batch, self.device), self.device
+                    )
 
                 if self.photometric is not None:
                     # After the transfer, so the intensity and noise passes run on the device
@@ -412,7 +425,10 @@ class Trainer:
                     # it directly says so, and leaves the all-gather that
                     # `register_fsdp_forward_method` installed as the only thing standing between
                     # a sharded parameter and this call.
-                    metrics = self.algorithm.validation_step(move_to_device(batch, self.device))
+                    assert self._finish_val is not None  # implied by val_loader
+                    metrics = self.algorithm.validation_step(
+                        self._finish_val(move_to_device(batch, self.device), self.device)
+                    )
                 for name, value in reduce_metrics(metrics).items():
                     totals[name] = totals.get(name, 0.0) + value
                 batches += 1
