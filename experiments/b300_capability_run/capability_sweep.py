@@ -96,6 +96,13 @@ def parse_args() -> argparse.Namespace:
         "SequenceParallel input_fn and this repo's sequence entry/exit -- then sits outside "
         "any traced region. Only meaningful with [trainer].compile set",
     )
+    parser.add_argument(
+        "--trace",
+        default="",
+        help="with --profile, also export rank 0's chrome trace here. The op table sums "
+        "kernel durations and so cannot say whether collectives overlapped compute or "
+        "serialised against it; only the stream timeline can",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument(
@@ -271,6 +278,9 @@ def main() -> int:
             ) as prof:
                 one_step()
                 torch.cuda.synchronize(device)
+            if primary and args.trace:
+                prof.export_chrome_trace(args.trace)
+                print(f"[trace] wrote {args.trace}", flush=True)
             if primary:
                 print(
                     prof.key_averages().table(

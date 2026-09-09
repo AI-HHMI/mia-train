@@ -258,6 +258,30 @@ A widely-quoted "compile saves ~17 GiB" figure from earlier in this experiment w
 memory at every size past 256³. Compilation itself costs ~135 s per input shape, which is nothing
 in a 100k-step run and most of the wall clock in a sweep.
 
+**Why it doubles the memory**, since "Inductor's buffers are bigger" is not an answer. A 2x2
+against activation checkpointing at 512³ decomposes it exactly:
+
+| 512³, `dp_shard 2 x tp 4` | AC **on** | AC **off** | AC saves |
+|---|---|---|---|
+| eager | 3.30 s / **30.0 GiB** | 2.61 s / 107.2 GiB | **77.2 GiB** |
+| compile | 2.47 s / **58.0 GiB** | 2.18 s / 118.3 GiB | **60.3 GiB** |
+| compile costs | **+28.0 GiB** | **+11.1 GiB** | |
+
+Checkpointing is *not* being defeated -- turning it off under compile costs a further 60 GiB. The
++28 GiB is two effects that happen to sum:
+
+  * **~11 GiB is compile's own footprint**, visible in the AC-off column where checkpointing is not
+    in play at all.
+  * **~17 GiB is checkpointing being less effective under compile** -- AC recovers 77.2 GiB eager
+    against 60.3 GiB compiled, about 78% as much. AOTAutograd's min-cut partitioner re-decides
+    save-versus-recompute across the forward/backward boundary and keeps more than the checkpoint
+    alone would. That is also why compile+AC (2.47 s) beats eager with *no* checkpointing at all
+    (2.61 s): it is buying speed with the memory it declines to give back.
+
+One practical consequence: **`compile` + AC dominates eager without AC** -- 2.47 s / 58.0 GiB against
+2.61 s / 107.2 GiB, faster and half the memory. If the temptation is to disable checkpointing for
+speed, enabling compile and leaving it on is strictly better.
+
 **One caveat, unresolved.** At 64 ranks across 8 nodes (`dp_shard 8 x tp 8`) a compiled step
 **hangs** in a collective -- CPU time frozen, GPUs at 100% utilisation with 0% memory activity and
 idle power, the signature of NCCL spin-waiting. The same configuration at 8 ranks on one node runs
@@ -334,6 +358,68 @@ buy *context*, and the price is quadratic. If ~1M-voxel context is genuinely wan
 sub-quadratic attention -- windowed over the 3D grid, or a hierarchical encoder like the `muvit3d`
 already in this repo -- not more hardware and not more parallelism.
 
+### Is communication overlapped with computation?
+
+Half of it is, and the exposed half costs 12.4% of the step.
+
+The op table above cannot answer this and should not be read as if it could. `Self CUDA` is a
+*sum of kernel durations*: two runs with identical tables can have every collective perfectly
+hidden or every one fully exposed. In this table it is worse than merely uninformative, because
+`record_param_comms`, `nccl:_reduce_scatter_base` and `ncclDevKernel_ReduceScatter...` are three
+views of one kernel, so even "sum of kernel time vs. wall clock" has a multiply-counted
+denominator. Overlap lives on the timeline: NCCL kernels occupy their own CUDA streams, so the
+question is how much of the time a collective is resident a compute kernel is resident too.
+`overlap.py` unions per-class kernel intervals and intersects them. Measured at 1024^3,
+`dp_shard 8 x tp 8`, one profiled step:
+
+| | |
+| :--- | ---: |
+| profiled window | 38.567 s |
+| gpu busy (either class) | 38.327 s (99.4%) |
+| compute kernels | 33.555 s |
+| collective kernels | 10.094 s (26.2% of window) |
+| ...overlapped with compute | 5.322 s (52.7% of collectives) |
+| ...**exposed** | **4.772 s (12.4% of window)** |
+| idle (neither) | 0.240 s |
+
+**So collectives cost 12.4% of the step, not the 22-26% the table's `Self CUDA` share suggests.**
+The GPU is idle 0.24 s in 38.6 -- this step is not launch-bound or input-bound. Perfect overlap
+would put the floor at ~33.8 s, so the whole prize here is **1.14x**.
+
+Which collectives fail to hide is the useful part, and it is not a tuning accident:
+
+| collective | calls | total | exposed | |
+| :--- | ---: | ---: | ---: | ---: |
+| ReduceScatter | 202 | 6.674 s | 2.214 s | 33.2% |
+| AllGather | 325 | 2.745 s | 1.882 s | 68.6% |
+| AllReduce | 363 | 1.745 s | 1.745 s | **100.0%** |
+
+The call counts identify them. 202 reduce-scatters is 42 FSDP gradient reductions -- one per FSDP
+unit, 40 blocks plus root -- plus **exactly 160** tensor-parallel ones: 40 blocks x 2
+`RowwiseParallel` outputs (`attn.proj`, the MLP down-projection) x forward and backward. The two
+populations behave completely differently, for a structural reason:
+
+- **FSDP2's collectives are overlappable by construction** and are being overlapped -- its
+  reduce-scatter is two-thirds hidden, because the next unit's compute is already queued and a
+  whole transformer block's work is available to hide behind.
+- **Synchronous tensor parallelism's are not overlappable at all.** The gather feeding `attn`/`mlp`
+  and the reduce-scatter leaving them sit on the critical path: the very next op consumes the
+  tensor, so there is nothing to prefetch into. `AllReduce` at 100% exposed is that definition
+  made visible, not a misconfiguration.
+
+The consequence for tuning: exposed communication is bought almost entirely by `tp`, and the only
+two ways to reduce it are to lower `tp` (see below -- the head no longer forces `tp = 8`) or to
+adopt async-TP (Inductor's `_micro_pipeline_tp` with symmetric memory), which decomposes
+all-gather-matmul and matmul-reduce-scatter into pipelined chunks. Async-TP requires
+`torch.compile`, which still hangs at 64 ranks, so it is gated on that. Note also that
+per-collective exposed times sum to 5.841 s against a union of 4.772 s: comm on different streams
+is sometimes exposed simultaneously, so the per-row figures cannot simply be added.
+
+One caveat on reading any of these numbers: an NCCL kernel's *duration* includes waiting for the
+slowest rank, so part of a collective's time is rank skew rather than wire time. Exposed time
+bounds what better overlap could recover; it does not attribute it between bandwidth and
+imbalance.
+
 ## Reproducing
 
 
@@ -348,6 +434,13 @@ NODES=1 SIZES="128 256" DIMS=2,4,1 WALL=1:00 WARMUP=2 STEPS=4 \
 # regenerate the tables above
 python experiments/b300_capability_run/table.py \
   /nrs/scicompsoft/orhane/mia-train-scratch/b300_capability/*.jsonl
+
+# the overlap measurement: profile one step, export rank 0's timeline, intersect the streams
+STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/b300_capability
+NODES=8 SIZES=1024 WARMUP=1 STEPS=1 WALL=1:30 PROFILE=1 \
+  TRACE=$STAGE/overlap_1024_tp8.json RESULTS=$STAGE/overlap_probe.jsonl \
+  bash experiments/b300_capability_run/submit.sh fsdp_tp8_chunked
+python experiments/b300_capability_run/overlap.py $STAGE/overlap_1024_tp8.json
 ```
 
 `FLOPS=1` adds `--measure-flops`, which counts the step's real arithmetic — affinity head and

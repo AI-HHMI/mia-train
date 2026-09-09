@@ -48,6 +48,8 @@ DIMS=${DIMS:-}
 FLOPS=${FLOPS:-}
 # Trace one step and print the op breakdown. For answering where a step goes.
 PROFILE=${PROFILE:-}
+# With PROFILE, also export rank 0's chrome trace here, for overlap analysis.
+TRACE=${TRACE:-}
 # Compile each transformer block instead of the whole algorithm; see the driver's --compile-blocks.
 COMPILE_BLOCKS=${COMPILE_BLOCKS:-}
 
@@ -76,7 +78,7 @@ for arm in "${ARMS[@]}"; do
       echo "  $VENV/bin/torchrun --standalone --nproc_per_node=$GPUS \\"
       echo "    experiments/b300_capability_run/capability_sweep.py \\"
       echo "    --config $cfg --size \$size --results $results \\"
-      echo "    --warmup $WARMUP --steps $STEPS ${DIMS:+--dims $DIMS} ${FLOPS:+--measure-flops} ${PROFILE:+--profile} ${COMPILE_BLOCKS:+--compile-blocks}"
+      echo "    --warmup $WARMUP --steps $STEPS ${DIMS:+--dims $DIMS} ${FLOPS:+--measure-flops} ${PROFILE:+--profile} ${TRACE:+--trace $TRACE} ${COMPILE_BLOCKS:+--compile-blocks}"
     else
       # launch_multinode.sh reads LSF's host list and starts one torchrun per node under a c10d
       # rendezvous; ENTRYPOINT points it at the sweep instead of src/train.py.
@@ -84,7 +86,7 @@ for arm in "${ARMS[@]}"; do
       echo "  MIA_TRAIN=$REPO VENV=$VENV \\"
       echo "    $REPO/deploy/lsf/launch_multinode.sh $GPUS $cfg \\"
       echo "    --size \$size --results $results --warmup $WARMUP --steps $STEPS \\"
-      echo "    ${DIMS:+--dims $DIMS} ${FLOPS:+--measure-flops} ${PROFILE:+--profile} ${COMPILE_BLOCKS:+--compile-blocks}"
+      echo "    ${DIMS:+--dims $DIMS} ${FLOPS:+--measure-flops} ${PROFILE:+--profile} ${TRACE:+--trace $TRACE} ${COMPILE_BLOCKS:+--compile-blocks}"
     fi
     echo "  after=\$(wc -l < $results 2>/dev/null || echo 0)"
     echo "  if [ \"\$after\" -le \"\$before\" ]; then"
