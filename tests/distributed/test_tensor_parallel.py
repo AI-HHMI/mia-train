@@ -281,19 +281,51 @@ def test_tp_refuses_stochastic_depth(run_distributed):
     assert all(run_distributed(_stochastic_depth_refused_worker, world_size=2))
 
 
-def _fsdp_units_worker(rank: int, world_size: int) -> bool:
-    """Each block is its own FSDP unit, so a forward gathers one block's weights at a time."""
+def _one_block_gb() -> float:
+    """One block's parameters in GiB, so a budget can be expressed relative to the model rather
+    than as a constant that silently stops meaning anything if MODEL changes."""
+    block = _build().blocks[0]
+    return sum(p.numel() * p.element_size() for p in block.parameters()) / 1024**3
+
+
+def _fsdp_units_worker(
+    rank: int, world_size: int, budget_gb: float | str
+) -> tuple[int, int, bool]:
+    """Blocks that became FSDP units of their own, block count, and whether gradients flow."""
     from torch.distributed.fsdp import FSDPModule
 
-    dims = ParallelDims(dp_shard=world_size)
+    dims = ParallelDims(dp_shard=world_size, fsdp_unit_budget_gb=budget_gb)
     mesh = dims.build_mesh("cpu")
     model = _build()
     parallelize_model(model, mesh, dims)
-    every_block_is_a_unit = all(isinstance(block, FSDPModule) for block in model.blocks)
+    own_units = sum(isinstance(block, FSDPModule) for block in model.blocks)
     model.patch_features(_volume())[0].square().mean().backward()
-    return every_block_is_a_unit and model.blocks[0].attn.qkv.weight.grad is not None
+    return own_units, len(model.blocks), model.blocks[0].attn.qkv.weight.grad is not None
 
 
 @pytest.mark.cpu_dist
-def test_transformer_blocks_become_their_own_fsdp_units(run_distributed):
-    assert all(run_distributed(_fsdp_units_worker, world_size=2))
+def test_a_tight_budget_gives_each_block_its_own_fsdp_unit(run_distributed):
+    """One block's worth of budget is the per-block split: a forward gathers one block at a time.
+
+    This is the regime `fsdp_unit_budget_gb` exists to keep reachable -- it is what makes a 7B
+    model fit, where a single unit would materialise every parameter for the whole forward.
+    """
+    results = run_distributed(_fsdp_units_worker, world_size=2, args=(_one_block_gb(),))
+    for own_units, n_blocks, grads_flow in results:
+        assert own_units == n_blocks, f"{own_units}/{n_blocks} blocks are their own unit"
+        assert grads_flow
+
+
+@pytest.mark.cpu_dist
+def test_a_generous_budget_leaves_the_blocks_to_the_root_unit(run_distributed):
+    """When every block fits one group, there are no nested units and the root is the only one.
+
+    The other half of the trade: a nested group holding every block claims exactly the parameters
+    the root would have claimed, so it buys a redundant collective per step. On the production
+    SimMIM arm at ViT-L that redundancy measured 7.7% (114.3 against 123.8 samples/s), which is
+    why the budget collapses this case rather than always splitting.
+    """
+    results = run_distributed(_fsdp_units_worker, world_size=2, args=("auto",))
+    for own_units, _n_blocks, grads_flow in results:
+        assert own_units == 0, f"{own_units} blocks became their own unit under a generous budget"
+        assert grads_flow
