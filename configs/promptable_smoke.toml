@@ -1,0 +1,85 @@
+# Short supervised run: promptable ("segment this") instance segmentation on the lmd corpus.
+#
+#   bsub -P <project> -q gpu_h100 -gpu "num=2" -n 24 -W 0:30 ... \
+#     torchrun --standalone --nproc_per_node=2 src/train.py --config configs/promptable_smoke.toml
+#
+# What this trains is a model you *ask* for an object rather than one that labels every voxel. A
+# click, a box or a previous mask goes in; one object comes out, with a predicted IoU so several
+# candidates can be ranked. That is the interface whole-volume mask generation, proofreading and
+# sparse annotation all need, and it is the reason to prefer it here over `affinity_seg`: instance
+# identity in EM/ExM is unbounded, so there is no fixed vocabulary to predict into.
+#
+# [parallelism] must multiply to the torchrun world size.
+
+experiment_name = "promptable_smoke"
+
+[model]
+name = "vit3d"
+img_size = [128, 128, 128]
+patch_size = [8, 8, 8]   # 16^3 = 4096 tokens, the same sequence length the reference decodes
+                         # against for a 1024-pixel image -- so the decoder's cost here is its cost
+                         # there, and 8 divides evenly by `mask_upscale`
+in_channels = 1
+embed_dim = 384
+depth = 6
+num_heads = 6
+attention_backend = "auto"
+
+[algorithm]
+name = "promptable_seg"
+# Axis order comes from the dataset, so it is not restated here. Unlike `affinity_seg` this
+# strategy imposes no order on the spatial axes: a prompt is a position in whatever frame the crop
+# arrived in, and the labels arrive in the same frame.
+prompt_dim = 256
+decoder_depth = 2
+decoder_heads = 8
+num_multimask_outputs = 3   # whole / part / subpart, the nesting depth a single click is ambiguous over
+
+# Masks come out at patch_size / mask_upscale = 2 voxels, and the targets are area-pooled to meet
+# them. Predicting at full voxel resolution instead would multiply the largest tensor in the step
+# by 8 for no change to what the encoder learns -- and the reference itself trains at stride 4.
+# This is the first knob to sweep: these objects are thinner than natural-image ones.
+mask_upscale = 4
+mask_feature_dim = 32
+
+masks_per_sample = 8        # objects drawn per crop, decoded against ONE encoder pass
+min_object_voxels = 64      # below this an object has no interior to click in
+rounds = 3                  # round 0 clicks or boxes; each later round corrects the last mistake
+box_prob = 0.5
+
+[data]
+name = "miao_volumes"
+config_path = "configs/data/lmd_instances.yaml"
+# Stated here rather than inherited. The referenced file's own `patch_size` is the LARGEST crop
+# every volume in it can supply, and it moves when the corpus does; a run whose crop silently
+# followed it would stop matching `[model].img_size` the next time a volume was added.
+patch_size = [128, 128, 128]
+samples_per_epoch = 1000
+
+[val_data]
+# A different specimen, not another crop of a training one, and deliberately the volume whose
+# annotation is an offset sub-box -- so a mistake in the `bounding_box` handling shows up as a
+# collapse here rather than as a quiet degradation.
+name = "miao_volumes"
+config_path = "configs/data/lmd_instances_val.yaml"
+patch_size = [128, 128, 128]
+
+[trainer]
+max_steps = 50
+batch_size = 1
+lr = 1.0e-4
+warmup_steps = 5
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+log_every = 5
+val_every = 25
+checkpoint_every = 25
+num_workers = 4
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 2
+tp = 1

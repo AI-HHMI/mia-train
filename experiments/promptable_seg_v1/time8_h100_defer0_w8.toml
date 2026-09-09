@@ -1,0 +1,180 @@
+# DEFER x WORKERS: H100, defer=False, 8 workers/rank
+#
+# `miao`'s `defer_image_ops` leaves the image at its stored resolution in the worker and does the
+# resample/normalize/cast on the training device instead. The docstring on
+# `MiaoVolumeDataset.finish_batch` puts the worker-side cost it removes at 235 ms of one core per
+# 256^3 sample, 47% of that in the trilinear interpolation alone.
+#
+# Why it might matter here even though `data_wait_frac` is already ~0.001: this step is HOST-bound
+# (GPU ~60% busy on H100, ~30% on B300), and the 20 workers used to keep the loader ahead are
+# 20 x 2 ranks = 40 processes on a 24-slot allocation. `data/base.py` documents exactly this
+# failure -- "CPU taken from that process is CPU the GPU waits for" -- and
+# `distributed/parallelize.py` records that `defer_image_ops=false` leaves the workers saturating
+# the cores. So the question is not whether the loader keeps up (it does) but whether it is
+# stealing the cores that launch kernels.
+#
+# TIMING ARM (v2, realistic scale): H100, torch SDPA, eager
+#
+# v1 measured a from-scratch 11M-parameter ViT3D at a 128-cube. That is the wrong regime to draw a
+# device conclusion from: with a tiny encoder the step is dominated by the decoder's many small
+# kernels, which is precisely the launch-bound case a Blackwell device is worst at, so the answer
+# was decided by the part of the workload that scales *least* with a real model. These arms use the
+# production config -- DINOv3 ViT-L/16 (~300M) at a 256-cube, 4096 patch tokens -- changing only
+# device, attention kernel and torch.compile.
+#
+# Wall clock on these nodes drifts up to 16% between identical runs, so treat a difference under
+# ~20% as unresolved.
+#
+# Promptable instance segmentation on the lmd corpus, from a released 2D DINOv3 checkpoint.
+#
+# Run this on H100, not B300. Measured on this algorithm: a B300 delivers 0.47x an H100's
+# throughput despite 2.27x the peak bf16 FLOPs, and a compiled B300 still loses to an eager H100.
+# The step is launch-bound, so a device whose advantage is arithmetic has nothing to sell here.
+# See experiments/promptable_seg_v1/RESULTS.md -- and note that the opposite recommendation is
+# correct for simmim/affinity_seg, so re-measure rather than carrying either across.
+#
+#   bsub -P <project> -q gpu_h100 -gpu "num=4" -n 48 -W 24:00 ... \
+#     torchrun --standalone --nproc_per_node=4 src/train.py --config configs/promptable_lmd.toml
+#
+# The training half of "segment anything" for volumes: a click, a box or a previous mask goes in,
+# one object comes out, with a predicted IoU so candidates can be ranked. Whole-volume mask
+# generation -- prompting a grid of points and reconciling the results into a labelling -- is a
+# separate inference procedure and is not part of this run.
+#
+# See configs/promptable_smoke.toml for the same thing at smoke scale on a from-scratch encoder.
+
+experiment_name = "psv8_h100_defer0_w8"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256           # 16^3 = 4096 patch tokens -- exactly the sequence length the reference
+                         # decodes against for a 1024-pixel image, so the decoder's cost here is
+                         # its cost there. It costs three of the corpus's eight instance-labelled
+                         # volumes, which cannot supply a 256-cube; see
+                         # configs/data/lmd_instances.yaml for the capacity table and the trade.
+patch_size = 16          # must match the checkpoint's: the in-plane kernel transfers as is, only
+                         # the new depth axis is synthesised
+in_chans = 1
+embed_dim = 1024         # ViT-L/16, ~300M parameters. ViT-B/16 (768 / 12 / 12, ~86M) is the
+depth = 24               # cheaper option and loads from `dinov3_vitb16_pretrain_lvd1689m`; L is
+num_heads = 16           # the default here because it is the scale the profiling arms in
+                         # experiments/promptable_seg_v1 were measured at, and a device or kernel
+                         # recommendation taken at a smaller encoder does not transfer -- at ViT-B
+                         # and below the step is dominated by the decoder's many small kernels
+                         # rather than by the encoder's matmuls.
+n_storage_tokens = 4
+pos_embed_rope_dtype = "fp32"
+
+# Both are OFF by default in this model and ON in every released DINOv3 checkpoint, so omitting
+# them makes `[init].strict` reject the load with 72 tensors that "have no home" -- the LayerScale
+# gammas and the masked key bias. They are architecture, not hyperparameters: a checkpoint trained
+# with LayerScale cannot be loaded into a model without it.
+layerscale_init = 1.0e-5
+mask_k_bias = true
+
+# "superposition" keeps the 2D rotary channel layout and adds a zero-gated depth angle, so the
+# encoder starts out behaving exactly like its 2D self and learns how much depth to mix in -- the
+# right choice when adapting a 2D checkpoint rather than training from scratch.
+#
+# It comes with one hazard worth stating, because nothing checks it: the model's entire use of the
+# depth axis is that single `depth_scale` scalar. `[trainer].freeze_backbone_steps` would hold it
+# at its zero initialisation for the whole warm-up, and a promptable model that cannot distinguish
+# one z-slice from another trains, converges, and is solving a 2D problem. So this config does not
+# use a backbone freeze; if you add one, switch to `pos_embed_rope_type = "vanilla"` as well.
+pos_embed_rope_type = "superposition"
+
+# The ENCODER's attention kernel. Note the two knobs have different names and different homes:
+# `[model].use_fa4` is the DINOv3 encoder's (a bool, defaulting to SDPA) and
+# `[algorithm].attention_backend` below is the mask decoder's. Both are set to SDPA here, for two
+# measured reasons (experiments/promptable_seg_v1): FlashAttention-4 buys nothing at these shapes,
+# and it CANNOT be combined with `[trainer].compile` -- inductor emits an undefined symbol inside
+# flash-attn's CuTeDSL wrapper and the run dies at step 1. Since compilation pays, SDPA is not a
+# compromise.
+use_fa4 = false
+
+[init]
+path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+# The 2D patch embedding is a (1024, 3, 16, 16) kernel; this model wants (1024, 1, 16, 16, 16). It is
+# averaged over RGB and spread over the new depth axis, divided by its length so a z-constant volume
+# reproduces the 2D response exactly.
+inflate_2d_to_3d = true
+# `rope_embed` buffers are recomputed from `base` in the model's own init_weights and carry no
+# learned information; 2D and 3D split their channels differently, so their lengths disagree.
+skip = ["rope_embed."]
+strict = true
+
+[algorithm]
+name = "promptable_seg"
+attention_backend = "sdpa"   # the mask decoder's kernel; see `use_fa4` above
+prompt_dim = 256
+decoder_depth = 2
+decoder_heads = 8
+num_multimask_outputs = 3
+
+# Masks come out at patch_size / mask_upscale = 4 voxels, which is the reference's own ratio, and
+# the targets are area-pooled to meet them rather than the masks being upsampled to meet the
+# targets. THIS IS THE FIRST THING TO SWEEP. The reference's objects are ~100 pixels across in a
+# 1024-pixel image; a neurite process here can be five voxels across in a 192-cube, and at stride 4
+# an area-pooled target of one is barely distinguishable from background. `mask_upscale = 8` (stride
+# 2) costs 8x on the decoder's output tensors and is the alternative to measure against.
+mask_upscale = 4
+mask_feature_dim = 32
+
+masks_per_sample = 16    # objects drawn per crop, all decoded against ONE encoder pass -- the
+                         # amortisation the architecture exists for. A 256-cube here holds tens to
+                         # thousands of objects (measured, sam3d/instance_census.txt), so this
+                         # samples a fraction of them and the sampler's size stratification is what
+                         # keeps that fraction from being all fragments.
+min_object_voxels = 64
+rounds = 3               # the reference uses 11, affordable because its decoder is under 1% of its
+                         # encoder; in 3D the mask head runs at voxel scale and that does not hold
+box_prob = 0.5
+
+[data]
+name = "miao_volumes"
+config_path = "configs/data/lmd_instances.yaml"
+defer_image_ops = false
+patch_size = [256, 256, 256]
+samples_per_epoch = 1000
+
+[val_data]
+name = "miao_volumes"
+config_path = "configs/data/lmd_instances_val.yaml"
+defer_image_ops = false
+patch_size = [256, 256, 256]
+
+[trainer]
+max_steps = 120
+batch_size = 1
+lr = 1.0e-4              # lower than a from-scratch run: the encoder arrives already trained
+warmup_steps = 10
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+
+# Fine-tuning a pretrained backbone: hold the early layers back so the general features near the
+# input survive while the layers nearest the objective adapt. DINOv3's own values.
+layerwise_lr_decay = 0.9
+# The patch embedding has the most to re-learn (an inflated 2D kernel meeting a new modality) yet
+# sits deepest in the layerwise schedule, so it is scaled separately.
+patch_embed_lr_mult = 0.2
+
+precision = "bf16"
+
+# Worth 1.42x on this algorithm (measured, experiments/promptable_seg_v1/RESULTS.md). The step is
+# launch-bound -- 4% MFU, because a two-way decoder runs once per prompt per round, which is many
+# small kernels -- and inductor's fusion is the direct answer to that. Requires the SDPA backend
+# selected above.
+compile = false
+activation_checkpointing = true   # the head's expansion to mask resolution, which is where this
+                                  # strategy's memory goes
+log_every = 10
+val_every = 0
+checkpoint_every = 0
+num_workers = 8
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 2
+tp = 1

@@ -14,10 +14,77 @@ axis-wise RoPE means.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+
+NORMALIZE_MODES = ("separate", "max", "min")
+
+
+def _unit_extent(extent: Sequence[int], mode: str) -> torch.Tensor:
+    """The denominator each axis is divided by, as a (rank,) tensor.
+
+    `"separate"` divides each axis by its own extent, so a non-cubic crop is stretched to a cube in
+    coordinate space. `"max"` and `"min"` divide every axis by one shared extent, which preserves
+    the crop's aspect ratio and leaves the short axes covering less than the full [-1, 1] range.
+    DINOv3's own default is `"separate"`, and the choice must match whatever the backbone was
+    trained with -- a decoder positioned under one convention and an encoder under the other
+    disagree about where a voxel is, by an amount that grows with how anisotropic the crop is.
+    """
+    if mode not in NORMALIZE_MODES:
+        raise ValueError(f"normalize mode must be one of {NORMALIZE_MODES}, got {mode!r}")
+    sizes = torch.tensor(list(extent), dtype=torch.float32)
+    if mode == "separate":
+        return sizes
+    return sizes.new_full(sizes.shape, float(sizes.max() if mode == "max" else sizes.min()))
+
+
+def voxel_coords(
+    voxels: torch.Tensor, extent: Sequence[int], mode: str = "separate"
+) -> torch.Tensor:
+    """Voxel indices -> coordinates in [-1, 1], with the half-voxel offset applied.
+
+    `voxels` is `(..., rank)`, integral or fractional; the result has the same shape. Voxel `i` on
+    an axis of extent `E` lands at `2 * (i + 0.5) / E - 1`, so index 0 sits just inside the near
+    face and `E - 1` just inside the far one.
+
+    This exists as a named function, beside `patch_grid_coords`, because the two have to agree
+    exactly: a promptable segmenter's whole positional story is that a point prompt and the patch
+    token containing it rotate identically. Two callers each writing out `2 * x / E - 1` would
+    agree until one of them dropped the half-voxel, and the symptom -- prompts landing half a patch
+    off, worse at coarse patch sizes -- is a quality regression with no shape to catch it.
+    """
+    denominator = _unit_extent(extent, mode).to(device=voxels.device, dtype=torch.float32)
+    return 2.0 * (voxels.float() + 0.5) / denominator - 1.0
+
+
+def patch_grid_coords(
+    grid: Sequence[int],
+    patch_size: Sequence[int],
+    extent: Sequence[int],
+    mode: str = "separate",
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Patch-token centres as `(prod(grid), rank)` coordinates in [-1, 1], row-major.
+
+    Row-major because that is the order every patch embedding in this repo emits tokens in, and
+    what `BaseModel.patch_features` promises alongside the grid.
+
+    The centre of patch `j` is voxel `(j + 0.5) * patch`, which `voxel_coords` would offset by
+    another half voxel -- so the half is subtracted back out here rather than calling it. `extent`
+    is the crop's true voxel extent, not `grid * patch`: an encoder reaches its grid by floor
+    division, so a crop that is not a whole number of patches has a rim, and normalising by
+    `grid * patch` would place every token slightly outside the frame the prompts use.
+    """
+    axes = [
+        (torch.arange(count, dtype=torch.float32, device=device) + 0.5) * float(step) - 0.5
+        for count, step in zip(grid, patch_size, strict=True)
+    ]
+    centres = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).flatten(0, -2)
+    return voxel_coords(centres, extent, mode)
 
 
 def split_rope_dims(head_dim: int, spatial_rank: int) -> tuple[int, ...]:
@@ -78,23 +145,71 @@ class RotaryTables:
 class AxialRotaryEmbedding(nn.Module):
     """Turns per-token coordinates into rotation tables.
 
-    Frequencies are learnable and initialised to the usual geometric progression, matching MuViT:
-    every layer owns its own copy, so a layer can widen or narrow the range of distances its
-    attention is sensitive to instead of inheriting one fixed schedule.
+    Frequencies are learnable and initialised to a geometric progression: every layer owns its own
+    copy, so a layer can widen or narrow the range of distances its attention is sensitive to
+    instead of inheriting one fixed schedule. That is MuViT's design.
+
+    **Two ways to set the initial schedule, and which one is right depends on what a coordinate
+    means.** `base` is the usual transformer form, `theta_k = coordinate / base^(2k/d)`, and it
+    assumes coordinates are integer sequence indices -- the natural reading when a coordinate is a
+    patch index. `min_period`/`max_period` instead says directly which wavelengths the rotation
+    should span, `theta_k = 2*pi * coordinate / period_k` with the periods geometric between the
+    two. That is the parametrisation DINOv3 uses, and it is the one that makes sense when
+    coordinates are *normalised* to a fixed range such as [-1, 1]: there, `base` would put every
+    angle in the first fraction of a turn and the whole schedule would collapse onto one
+    slowly-varying frequency.
+
+    Exactly one of the two must be given, since they are alternative descriptions of the same
+    tensor and a caller supplying both has an expectation that cannot be met.
     """
 
-    def __init__(self, head_dim: int, spatial_rank: int, base: float = 10000.0) -> None:
+    def __init__(
+        self,
+        head_dim: int,
+        spatial_rank: int,
+        base: float | None = 10000.0,
+        min_period: float | None = None,
+        max_period: float | None = None,
+    ) -> None:
         super().__init__()
-        if base <= 1.0:
+        both_periods = min_period is not None and max_period is not None
+        if (base is None) == (not both_periods):
+            raise ValueError(
+                "set exactly one of `base` or `min_period`+`max_period`; got "
+                f"base={base}, min_period={min_period}, max_period={max_period}"
+            )
+        if base is not None and base <= 1.0:
             raise ValueError(f"rotary base must be greater than 1, got {base}")
+        if both_periods:
+            assert min_period is not None and max_period is not None  # narrowed for the checker
+            if not 0 < min_period < max_period:
+                raise ValueError(
+                    f"need 0 < min_period < max_period, got {min_period} and {max_period}"
+                )
+
         self.axis_dims = split_rope_dims(head_dim, spatial_rank)
         self.spatial_rank = spatial_rank
-        # theta_k = coordinate / base^(2k/d), stored as the reciprocal so the forward pass is a
-        # multiply. One Parameter per axis, since axes may have different widths.
+        # Stored as the reciprocal of the period (times 2*pi) so the forward pass is a multiply.
+        # One Parameter per axis, since axes may have different widths.
         self.inv_freqs = nn.ParameterList(
-            nn.Parameter(1.0 / (base ** (torch.arange(0, width, 2).float() / width)))
+            nn.Parameter(self._initial_inv_freq(width, base, min_period, max_period))
             for width in self.axis_dims
         )
+
+    @staticmethod
+    def _initial_inv_freq(
+        width: int, base: float | None, min_period: float | None, max_period: float | None
+    ) -> torch.Tensor:
+        """`width // 2` reciprocal wavelengths, geometrically spaced, for one axis."""
+        if base is not None:
+            return 1.0 / (base ** (torch.arange(0, width, 2).float() / width))
+        assert min_period is not None and max_period is not None
+        # Geometric from min_period at index 0 to max_period at the last index, matching
+        # `layers.dinov3.rope`, so a decoder positioned this way rotates under the same law as a
+        # DINOv3 backbone rather than merely a similar-looking one.
+        exponents = torch.linspace(0.0, 1.0, width // 2)
+        periods = min_period * (max_period / min_period) ** exponents
+        return 2.0 * math.pi / periods
 
     @property
     def rotary_dim(self) -> int:

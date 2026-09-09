@@ -1,0 +1,129 @@
+# lmd-v0.0.1 volumes with instance (cell / neurite) annotation, for promptable segmentation.
+#
+# THE TRAINING SPLIT. See configs/data/lmd_instances_val.yaml for what is held out.
+#
+# Referenced from a run config with:
+#
+#   [data]
+#   name = "miao_volumes"
+#   config_path = "configs/data/lmd_instances.yaml"
+#
+# Generated and verified by
+# /nrs/scicompsoft/orhane/mia-train-scratch/sam3d/make_instances_config.py -- every path below was
+# opened, and its image and label groups read, at generation time.
+#
+# THREE THINGS THIS FILE ENCODES THAT ARE EASY TO GET WRONG.
+#
+# `bounding_box`. Four of the instance-labelled volumes annotate an offset sub-box rather than the
+# whole crop: a centred 256-cube of `em-hydra-zhang2025`, `exm-mouse-liconn-DG` or
+# `exm-mouse-liconn-hippocampus` contains ZERO objects (measured -- see
+# sam3d/instance_census.txt). Without a box, most crops would be pure background and the model
+# would be trained on the claim that there is nothing to segment there. The boxes are in the
+# IMAGE's level-0 voxels in xyz order, which is what miao wants; they come from
+# lmd_census/eval_bboxes.py, which handles the label-pyramid ratio and axis permutation.
+#
+# `resolutions`, per volume rather than global. These span 6 nm EM to 10 nm expansion microscopy,
+# and each entry asks for that volume's own stored level-0 voxel size, so miao stays on level 0 and
+# resamples nothing. The consequence is that a fixed `patch_size` covers a different physical
+# extent per volume. That is deliberate for a promptable model -- prompt coordinates are normalised
+# by the crop, so what the model sees is a consistent frame containing objects at varying scale --
+# but it is NOT the right setting for a model that has to reason about absolute size. Harmonising
+# on physical scale needs each ExM volume's `exp_factor`, which this corpus does not record
+# uniformly.
+#
+# `output_axes = "lcxyz"`. Volumes are stored both xyz and zyx; miao reorders them. Unlike the
+# affinity task there is no channel convention to violate here -- a prompt is a position in
+# whatever frame the crop arrives in, and the labels arrive in the same frame -- but the boxes
+# above are written in xyz and would be transposed under any other order.
+#
+# CROP CAPACITY. `patch_size` and the volume list are coupled: miao refuses at startup if a
+# volume's box cannot contain the requested window, so raising the crop means dropping volumes.
+# Measured over the ten candidates:
+#
+#     cube  64 / 96 : 10 volumes
+#     cube 128 - 192:  8 volumes  (loses both Kasthuri15 crops, 100 slices deep)
+#     cube 256      :  6 volumes  (also loses the two 192-deep LICONN volumes)
+#
+# 256 is the setting here, and it is the LARGEST crop every listed volume can supply -- a run
+# config may lower `patch_size` freely (the smoke run uses 128), but raising it past 256 makes
+# miao refuse at startup. To change it, edit CUBE in sam3d/make_instances_config.py and
+# regenerate; the volume list and the held-out split both follow from it.
+#
+# Excluded at this crop: em-mouse-Kasthuri15-ac3ac4-cortex/crop-001_ac3_100slices
+#   (annotated box is 100 deep, at or under the 256 crop)
+#
+# Excluded at this crop: em-mouse-Kasthuri15-ac3ac4-cortex/crop-002_ac4_100slices
+#   (annotated box is 100 deep, at or under the 256 crop)
+#
+# Excluded at this crop: exm-mouse-liconn-DG-20250809_ExPID19-02_2ndGel_C5_Atto488_40XW_002/crop-001
+#   (annotated box is 193 deep, at or under the 256 crop)
+#
+# Excluded at this crop: exm-mouse-liconn-hippocampus-202507013_ExPID10-02_2percentAA_S2_Atto488_40XW_004/crop-001
+#   (annotated box is 192 deep, at or under the 256 crop)
+
+output_axes: "lcxyz"
+patch_size: [256, 256, 256]
+samples_per_epoch: 1000
+
+# miao requires a global resolution setting even when every volume overrides it, which every volume
+# below does. Nothing reads this value; it is here to satisfy that check, and a run that somehow
+# did fall through to it would be reading an 8 nm isotropic level that several of these stores do
+# not have.
+resolutions: [[8, 8, 8]]
+
+volumes:
+  # 5,363 instances; stored xyz, 2000x2000x1364 at 8,8,7.5 nm
+  - name: "em-zebrafish-fish2/crop-003_quadcube1_x23908_y18314_z0"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish2/crop-003_quadcube1_x23908_y18314_z0.zarr"
+    image_key: "raw"
+    label_key: "labels/proofread-cell-seg230927"
+    zarr_version: "zarr3"
+    resolutions: [[8.0, 8.0, 7.5]]
+    bounding_box: [[0, 2000], [0, 2000], [0, 1364]]
+    weight: 1.0
+    normalize: true
+
+  # 11,690 instances; stored xyz, 2000x2000x2120 at 8,8,7.5 nm
+  - name: "em-zebrafish-fish2/crop-001_doublecube1_x52000_y42500_z0"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish2/crop-001_doublecube1_x52000_y42500_z0.zarr"
+    image_key: "raw"
+    label_key: "labels/proofread-cell-seg230927"
+    zarr_version: "zarr3"
+    resolutions: [[8.0, 8.0, 7.5]]
+    bounding_box: [[0, 2000], [0, 2000], [0, 2112]]
+    weight: 1.0
+    normalize: true
+
+  # 297 instances; stored xyz, 2304x2304x277 at 9.999,9.999,25 nm
+  - name: "exm-mouse-liconn-cortex-20250822_ExPID09_2ndGel_30percentSucrose-Glycerol_40XW_003/crop-001"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/data/exm-mouse-liconn-cortex-20250822_ExPID09_2ndGel_30percentSucrose-Glycerol_40XW_003/crop-001.zarr"
+    image_key: "raw"
+    label_key: "labels/manual_gt-cell-final"
+    zarr_version: "zarr3"
+    resolutions: [[9.999, 9.999, 25.0]]
+    bounding_box: [[0, 1744], [0, 1760], [0, 277]]
+    weight: 1.0
+    normalize: true
+
+  # 184 instances; stored zyx, 735x2304x2304 at 25,10.16,10.16 nm
+  - name: "exm-drosophila-flyliconn-FlyID10-20250923_2ndGel_PBS_MES_B1_Atto488_40XW_002/crop-001_normalized"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID10-20250923_2ndGel_PBS_MES_B1_Atto488_40XW_002/crop-001_normalized.zarr"
+    image_key: "raw"
+    label_key: "labels/manual_gt-cell-combined"
+    zarr_version: "zarr2"
+    resolutions: [[10.16, 10.16, 25.0]]
+    bounding_box: [[224, 2248], [320, 2264], [96, 735]]
+    weight: 1.0
+    normalize: true
+
+  # 244,143 instances; stored xyz, 8192x8192x1024 at 8,8,40 nm
+  - name: "em-mouse-MICrONS-minnie65/crop-001"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MICrONS-minnie65/crop-001.zarr"
+    image_key: "raw"
+    label_key: "labels/proofread-cell-seg_m1300"
+    zarr_version: "zarr3"
+    resolutions: [[8.0, 8.0, 40.0]]
+    bounding_box: [[0, 8192], [0, 8192], [0, 1024]]
+    weight: 1.0
+    normalize: true
+

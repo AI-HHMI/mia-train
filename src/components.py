@@ -12,6 +12,7 @@ import algorithms.affinity_seg  # noqa: F401  (imported for its registration sid
 import algorithms.dinov3_ssl  # noqa: F401  (imported for its registration side effect)
 import algorithms.mae  # noqa: F401  (imported for its registration side effect)
 import algorithms.muvit_mae  # noqa: F401  (imported for its registration side effect)
+import algorithms.promptable_seg  # noqa: F401  (imported for its registration side effect)
 import algorithms.semantic_seg  # noqa: F401  (imported for its registration side effect)
 import algorithms.simmim  # noqa: F401  (imported for its registration side effect)
 import data.miao_dataset  # noqa: F401  (imported for its registration side effect)
