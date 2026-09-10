@@ -11,6 +11,29 @@ pip install -e .                    # core
 pip install -e '.[dev]'             # + pytest, ruff, mypy
 ```
 
+## Configs
+
+Each run is defined by a `.toml` config file with the following sections:
+
+```toml
+experiment_name = "my_run"
+
+[model]        # name = a registered model, plus its constructor kwargs
+[init]         # optional: start from weights trained elsewhere (path, prefix, inflate_2d_to_3d, ...)
+[algorithm]    # name = a registered algorithm, plus its kwargs
+[data]         # name = a registered dataset; or config_path = a shared data config
+[val_data]     # optional: same shape as [data]
+[trainer]      # steps, batch size, lr, schedule, precision, checkpointing cadence
+[augment]      # optional: training-data augmentation (never applied to [val_data])
+[parallelism]  # dp_replicate, dp_shard, tp; must multiply to the torchrun world size
+```
+
+Note that `[trainer].batch_size` is per rank, so the global batch size is `batch_size × dp_replicate × dp_shard`.
+
+See `configs/*.toml` for working examples.
+
+Machine-local paths common to all runs (dataset roots, checkpoint directory, venv, job scheduler details) are set in `configs/cluster/active.toml` (untracked), which can be created by copying the template `configs/cluster/template.toml` and filling it in.
+
 ## Running a training job
 
 Jobs are always run through `torchrun`:
@@ -33,29 +56,6 @@ and a copy of any referenced data config.
 To submit training jobs on the Janelia cluster, see [`deploy/lsf/README.md`](deploy/lsf/README.md)
 for single-node, multi-node and resume recipes.
 
-## Configs
-
-Each run is defined by a `.toml` config file with the following sections:
-
-```toml
-experiment_name = "my_run"
-
-[model]        # name = a registered model, plus its constructor kwargs
-[init]         # optional: start from weights trained elsewhere (path, prefix, inflate_2d_to_3d, ...)
-[algorithm]    # name = a registered algorithm, plus its kwargs
-[data]         # name = a registered dataset; or config_path = a shared data config
-[val_data]     # optional: same shape as [data]
-[trainer]      # steps, batch size, lr, schedule, precision, checkpointing cadence
-[augment]      # optional: training-data augmentation (never applied to [val_data])
-[parallelism]  # dp_replicate, dp_shard, tp; must multiply to the torchrun world size
-```
-
-Note that `[trainer].batch_size` is per rank, so the global batch size is `batch_size × dp_replicate × dp_shard`.
-
-See `configs/*.toml` for working examples.
-
-Machine-local paths common to all runs (dataset roots, checkpoint directory, venv, job scheduler details) are set in `configs/cluster/active.toml` (untracked), which can be created by copying `configs/cluster/template.toml` and filling it in.
-
 ## Supported models and algorithms
 
 **Models** (`[model].name`)
@@ -77,7 +77,7 @@ Machine-local paths common to all runs (dataset roots, checkpoint directory, ven
 | `dinov3` | The DINOv3 self-supervised objective: teacher/student EMA, DINO + iBOT losses, Sinkhorn centring, KoLeo. Rank-agnostic. |
 | `affinity_seg` | Supervised instance segmentation by binary affinity prediction. |
 | `semantic_seg` | Supervised per-voxel classification (serves both 2D and 3D). |
-| `promptable_seg` | Supervised *promptable* instance segmentation, Segment Anything-style, supporting point, box, mask, or class token prompts. |
+| `promptable_seg` | Supervised promptable instance segmentation, Segment Anything-style, supporting point, box, mask, or class token prompts. |
 
 Adding a new component simply involves writing it and adding one line to `src/components.py`. The engine and the
 registries never change.
