@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
+from prediction.types import VolumePredictor
+
 if TYPE_CHECKING:  # annotation only: algorithms must not depend on data/ at runtime
     from data.base import BaseDataset
 
@@ -36,10 +38,8 @@ class BaseAlgorithm(nn.Module, abc.ABC):
 
         `None` for most strategies. A strategy answers with a callable when it derives something
         from a sample that is expensive, depends only on that sample, and would otherwise sit on
-        the critical path between the batch arriving and the loss -- affinity prediction's
-        connected-components pass over the label crop being the case this exists for. Measured
-        there: 107 ms of every 377 ms step on the training device, against ~98 ms in a worker
-        where six of them run concurrently against a 2.5 samples/s demand.
+        the critical path between the batch arriving and the loss, e.g affinity prediction's
+        connected-components pass over the label crop.
 
         The engine attaches the result to the training *and* validation datasets, which is what
         separates this from `[augment]`: augmentation deliberately never touches validation,
@@ -49,6 +49,27 @@ class BaseAlgorithm(nn.Module, abc.ABC):
 
         Returning a callable is a promise that the algorithm no longer does this work itself, so a
         strategy must decide once, at construction, rather than per call.
+        """
+        return None
+
+    def volume_predictor(self) -> VolumePredictor | None:
+        """How to run this strategy over a whole volume, or `None` for the dense default.
+
+        `None` -- the default, and the right answer for any strategy whose output is a fixed number
+        of channels per voxel -- lets the entrypoint fall back to the dense default,
+        `prediction.dense.DensePredictor`: tile, run `logits`, `squash`, blend overlapping tiles
+        by weighted average. That path needs `logits`,
+        `prediction_kind`, `prediction_channels`, `squash` and `squash_convention` on the strategy,
+        which is what `affinity_seg` and `semantic_seg` provide.
+
+        A strategy whose whole-volume output is not a dense field answers with its own predictor,
+        anything satisfying `prediction.types.VolumePredictor`.
+        Promptable segmentation is the case this exists for: its prediction is a *search* over
+        prompts that yields a set of masks, reconciled across tiles by overlap rather than by
+        averaging, and forcing that through `logits()` would mean a search procedure impersonating
+        a field. Returning a predictor here keeps the procedure in `src/algorithms/`, where the
+        strategy lives, rather than in a second entrypoint that would have to be duplicated for
+        every strategy with a non-dense output.
         """
         return None
 

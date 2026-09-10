@@ -1,6 +1,6 @@
-"""Enforces the layout of `models/`, `layers/`, `algorithms/` and `experiments/`.
+"""Enforces the layout of `models/`, `layers/`, `algorithms/`, `prediction/` and `experiments/`.
 
-Three rules, the first two about being able to answer a question by listing a directory.
+Four rules, the first two about being able to answer a question by listing a directory.
 
 **`ls src/models/`** answers "what can I train?" -- every file there registers something a config
 can name, plus the two that define the contract. Reusable pieces that no config ever names --
@@ -11,6 +11,13 @@ registers a strategy. A strategy's own supporting code goes in a subpackage name
 (`algorithms/dinov3/`, `algorithms/affinity/`), which keeps the top level a menu rather than a
 pile. Note the subpackage cannot share a name with the module that registers the strategy, since
 one would shadow the other -- hence `affinity_seg.py` beside `affinity/`.
+
+**`src/prediction/` imports nothing of the repo's own, and nothing imports `predict.py` or
+`train.py`.** The library every whole-volume prediction shares -- the lattice, the reads, the
+predictor contract, the dense default -- sits below both the strategies and the entrypoint that
+drives them, so a strategy can build a predictor on it at runtime. An entrypoint imported as a
+library is either a circular import or, when it is the running script, a second copy of every
+class it defines.
 
 **`experiments/` stays text.** Configs, submission scripts and write-ups belong in git; checkpoints,
 TensorBoard events and predictions do not. That separation is what keeps the directory cheap to
@@ -170,6 +177,43 @@ def test_layers_do_not_depend_on_algorithms_or_the_engine():
     for path in _modules_in("layers"):
         leaked = forbidden & _imported_names(path)
         assert not leaked, f"src/{path.relative_to(SRC)} imports {sorted(leaked)}"
+
+
+ENTRYPOINTS = {"predict", "train"}
+
+
+@pytest.mark.unit
+def test_prediction_is_a_leaf_package():
+    """`prediction/` may import numpy, torch and miao; nothing of this repo's own.
+
+    It holds what every whole-volume prediction shares, and both `algorithms/` and `predict.py`
+    import it at runtime. The moment it imports either of them back, the cycle that once kept this
+    code inside the entrypoint -- reachable from a strategy only through a `TYPE_CHECKING` import
+    -- is back.
+    """
+    forbidden = {"algorithms", "models", "layers", "engine", "data", "components"} | ENTRYPOINTS
+    modules = _modules_in("prediction")
+    assert modules, "src/prediction/ holds no modules; this check is not looking at anything"
+    for path in modules:
+        leaked = forbidden & _imported_names(path)
+        assert not leaked, f"src/{path.relative_to(SRC)} imports {sorted(leaked)}"
+
+
+@pytest.mark.unit
+def test_nothing_imports_an_entrypoint():
+    """`predict.py` and `train.py` are the top of the graph; no module may import them.
+
+    Not even under `TYPE_CHECKING`: `_imported_names` reads every import statically, so a
+    type-only import fails this too. Such an import hides the dependency instead of removing it --
+    the shared code belongs in `prediction/`. A runtime import is worse: it either fails as a
+    circular import or, when the entrypoint is the running script, executes it a second time under
+    its module name and hands the importer different class objects from the ones `__main__` holds.
+    """
+    for path in sorted(SRC.rglob("*.py")):
+        if path.parent == SRC and path.stem in ENTRYPOINTS:
+            continue
+        leaked = ENTRYPOINTS & _imported_names(path)
+        assert not leaked, f"src/{path.relative_to(SRC)} imports entrypoint {sorted(leaked)}"
 
 
 # No test that layers/ is non-empty. It was tried and removed: a layer going missing already fails

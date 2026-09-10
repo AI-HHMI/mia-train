@@ -1,13 +1,14 @@
 # Promptable instance segmentation on the lmd corpus, from a released 2D DINOv3 checkpoint.
 #
-# Run this on H100, not B300. Measured on this algorithm: a B300 delivers 0.47x an H100's
-# throughput despite 2.27x the peak bf16 FLOPs, and a compiled B300 still loses to an eager H100.
-# The step is launch-bound, so a device whose advantage is arithmetic has nothing to sell here.
-# See experiments/promptable_seg_v1/RESULTS.md -- and note that the opposite recommendation is
-# correct for simmim/affinity_seg, so re-measure rather than carrying either across.
+# EITHER queue, provided `compile = true`. Measured on this algorithm at this scale
+# (experiments/promptable_seg_v1/RESULTS.md): compiled, H100 and B300 come out within 4% of each
+# other (5.740 vs 5.527 samples/s on 2 GPUs), so take whichever is free. Do NOT run either eager --
+# the step is host-bound, not GPU-bound, and compilation is the only setting measured to move it
+# (1.30x on H100, 1.66x on B300). A first pass at a much smaller encoder reached the opposite
+# conclusion; do not trust a device recommendation taken below production scale.
 #
-#   bsub -P <project> -q gpu_h100 -gpu "num=4" -n 48 -W 24:00 ... \
-#     torchrun --standalone --nproc_per_node=4 src/train.py --config configs/promptable_lmd.toml
+#   bsub -P miaai -q gpu_b300 -gpu "num=8" -n 96 -W 12:00 ... \
+#     torchrun --standalone --nproc_per_node=8 src/train.py --config configs/promptable_lmd.toml
 #
 # The training half of "segment anything" for volumes: a click, a box or a previous mask goes in,
 # one object comes out, with a predicted IoU so candidates can be ranked. Whole-volume mask
@@ -16,7 +17,7 @@
 #
 # See configs/promptable_smoke.toml for the same thing at smoke scale on a from-scratch encoder.
 
-experiment_name = "promptable_lmd"
+experiment_name = "promptable_lmd_v2"
 
 [model]
 name = "dinov3_vit3d"
@@ -98,7 +99,14 @@ masks_per_sample = 16    # objects drawn per crop, all decoded against ONE encod
                          # thousands of objects (measured, sam3d/instance_census.txt), so this
                          # samples a fraction of them and the sampler's size stratification is what
                          # keeps that fraction from being all fragments.
-min_object_voxels = 64
+# 512 input voxels, not 64. Masks are emitted at `patch_size / mask_upscale` = 4, so a 64-voxel
+# object pools down to ONE output voxel -- there is no shape there to segment, and the size-
+# stratified sampler deliberately over-samples the smallest octave, so those unlearnable targets
+# would take slots from real objects. Measured (sam3d/empty_crop_rate.py): raising the floor from
+# 64 to 512 costs 2.5% of crop usability (90.0% -> 87.5%) and drops the median object count per
+# crop from 138 to 123. 4096 (a 4^3 output footprint) is the stricter alternative and costs
+# nothing further in usability.
+min_object_voxels = 512
 rounds = 3               # the reference uses 11, affordable because its decoder is under 1% of its
                          # encoder; in 3D the mask head runs at voxel scale and that does not hold
 box_prob = 0.5
@@ -125,7 +133,14 @@ patch_size = [256, 256, 256]
 defer_image_ops = true
 
 [trainer]
-max_steps = 50000
+# One schedule, start to finish. The first leg (promptable_lmd_20260909_225714) ran a clean 50k and
+# ended still improving -- val IoU 0.512 -> 0.553 over its last 4k steps with loss still falling --
+# so it was schedule-limited, not converged. Extending it by resuming was tried and abandoned: the
+# LR schedule is replayed rather than serialised, so raising `max_steps` recomputes it against the
+# new horizon and warm-restarts the learning rate (1.0e-05 -> 5.5e-05, measured, loss 0.447 ->
+# 0.619). Correct behaviour, but it makes the run a poor baseline. Starting over at the horizon we
+# actually want costs 50k steps of compute and buys one comparable curve.
+max_steps = 150000
 batch_size = 1
 lr = 1.0e-4              # lower than a from-scratch run: the encoder arrives already trained
 warmup_steps = 1000
@@ -150,12 +165,12 @@ compile = true
 activation_checkpointing = true   # the head's expansion to mask resolution, which is where this
                                   # strategy's memory goes
 log_every = 50
-val_every = 1000
+val_every = 2500
 checkpoint_every = 5000
-num_workers = 8
+num_workers = 8   # enough with `defer_image_ops`; the loader is not the constraint (dwait ~0.001)
 seed = 0
 
 [parallelism]
 dp_replicate = 1
-dp_shard = 4
+dp_shard = 8   # one full B300 node
 tp = 1

@@ -229,3 +229,184 @@ breaks and shape recompilations. It now resolves each voxel's object slot with a
 `searchsorted` over the drawn ids and scatters unclaimed voxels into a discard row, so every shape
 is static and nothing is read back. `tests/unit/test_promptable_targets.py` pins it against
 `F.avg_pool3d` either way.
+
+## Phase 4 — segment everything, first pass
+
+The automatic mask generator (`algorithms/promptable/amg.py`) driven through the unified
+`predict.py` via `BaseAlgorithm.volume_predictor()`. Scored with `mia-evals` on a 384-cube block of
+the held-out volume (`exm-mouse-liconn-ExPID82-1`, 101 ground-truth objects, 58.6% annotated),
+`truth_kind = "sibling_artifact"` against the `.gt.zarr` that `predict.py` writes beside the
+prediction. Model: the clean 50k checkpoint (val voxel IoU 0.524 after refinement, **0.429 from a
+single click** -- and a single click is all the generator gives it).
+
+### Threshold sweep
+
+Two tiles at 50% overlap, `nms_iou 0.7`, `prefer = "whole"`, `merge_fraction 0.5`:
+
+| grid | pred IoU >= | stability >= | predicted | TP | FP | FN | **pq** | rq | sq | voi merge | voi split |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10^3 | 0.3 | 0.5 | 182 | 27 | 155 | 74 | 0.118 | 0.191 | 0.619 | 1.51 | 1.73 |
+| 10^3 | 0.3 | 0.8 | 138 | 20 | 118 | 81 | 0.111 | 0.167 | 0.660 | 2.53 | 1.31 |
+| 10^3 | 0.5 | 0.5 | 74 | 17 | 57 | 84 | 0.126 | 0.194 | 0.650 | 2.85 | 1.10 |
+| 10^3 | 0.5 | 0.8 | 66 | 14 | 52 | 87 | 0.114 | 0.168 | 0.681 | 3.26 | 0.88 |
+| 14^3 | 0.3 | 0.5 | 241 | 28 | 213 | 73 | 0.102 | 0.164 | 0.625 | 1.34 | 1.87 |
+| **14^3** | **0.5** | **0.5** | 89 | 21 | 68 | 80 | **0.142** | 0.221 | 0.642 | 2.78 | 1.17 |
+| 14^3 | 0.5 | 0.8 | 85 | 20 | 65 | 81 | 0.139 | 0.215 | 0.645 | 3.05 | 1.03 |
+
+Every setting lands in pq 0.10-0.14. The thresholds trade merges for splits -- loosening the IoU
+gate halves `voi_merge` and doubles `voi_split` -- but do not move pq, and matched masks are decent
+(sq 0.62-0.68). The problem is that few match: 21 true positives against 68 false positives at the
+best setting.
+
+### Two controls that say where the loss is
+
+| | GT | predicted | TP | FP | FN | pq | voi merge | voi split |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| best grid setting (2 tiles) | 101 | 89 | 21 | 68 | 80 | 0.142 | 2.78 | 1.17 |
+| **oracle: one true interior click per object** | 101 | 28 | 11 | 17 | 90 | **0.113** | **4.36** | 0.34 |
+| same setting, one tile (different 256-cube) | 82 | 47 | 21 | 26 | 61 | 0.216 | 2.80 | 0.77 |
+
+**The model is the ceiling, not the generator.** Given a *perfect* click inside every one of the 101
+objects, with every filter and the assembly unchanged, the result is 28 masks -- because clicks on
+different neighbouring objects come back as near-identical masks that NMS then collapses. That is
+`voi_merge` 4.36, the worst number in this table. Prompt placement and threshold tuning cannot fix
+a mask that spans three cells; only the model can, and the number it has to improve is the
+single-click IoU (0.429), not the refined one training reports as headline.
+
+The single-tile control is on a different sub-region so it is not a clean comparison, but the
+pattern is informative: identical `voi_merge` (2.80 vs 2.78) and lower `voi_split` and FP. Cross-
+tile assembly adds fragments, not merges -- which points at `merge_fraction`, swept below.
+
+### What the grid can and cannot reach
+
+Measured on the block's ground truth alone, the fraction of objects a per-tile grid lands at least
+one click inside:
+
+| grid per tile | clicks | all objects | small (<4k vox) | medium | large (>32k) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8^3 | 1024 | 71% | 0% | 38% | 98% |
+| 10^3 | 2000 | 78% | 0% | 67% | 100% |
+| 12^3 | 3456 | 84% | 7% | 90% | 100% |
+| 16^3 | 8192 | 87% | 20% | 95% | 100% |
+
+Every large object is reached at 10^3, so for them the 17% match rate is entirely the model. Small
+objects are essentially unreachable by a grid at any affordable density: the reference solves this
+with zoomed-in crops, and a 3D equivalent is the one structural addition the generator still needs.
+
+### Mechanics worth recording
+
+* `resolve_containment` runs BEFORE NMS, and treats a nested pair as one with high containment and
+  IoU *below* `nms_iou`. Without the IoU clause it also adjudicated duplicates, by size; with NMS
+  first, a part that is most of its whole and scores higher removes the whole. The oracle test in
+  `tests/unit/test_amg.py` caught the second case.
+* NMS sorts with `stable=True`: exact score ties are then reproducible rather than different per
+  run.
+* `mia-evals` bug, reproduced: `truth_kind = "sibling_artifact"` resolves the truth as
+  `artifact.path.parent / f"{volume.name}.gt.zarr"`, which nests a slashed volume name a second
+  time (`.../ExPID82-1/ExPID82-1/crop-002_sub.gt.zarr`). The sweep artifacts were scored through a
+  symlink; the durable fix is `Path(volume.name).name` there, and until then eval data configs
+  should use slash-free volume names.
+
+### Two follow-ups, both flat
+
+| | predicted | TP | FP | FN | pq | voi merge | voi split |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| best grid, `merge_fraction 0.3` | 82 | 21 | 61 | 80 | 0.145 | 2.88 | 1.11 |
+| best grid, `merge_fraction 0.5` | 89 | 21 | 68 | 80 | 0.142 | 2.78 | 1.17 |
+| best grid, `merge_fraction 0.7` | 95 | 21 | 74 | 80 | 0.138 | 2.77 | 1.19 |
+| oracle clicks, `prefer = "whole"` | 28 | 11 | 17 | 90 | 0.113 | 4.36 | 0.34 |
+| oracle clicks, `prefer = "part"` | 28 | 11 | 17 | 90 | 0.112 | 4.38 | 0.33 |
+
+The cross-tile merge threshold moves pq by 0.007 across its range: not a lever. And `prefer` makes
+no difference at all to the oracle -- the same 28 masks either way -- which rules out the last
+generator-side explanation for the merges. There is no smaller "part" candidate being discarded in
+favour of a merged whole; clicks on different neighbouring cells simply return the same mask.
+
+### Conclusion, and what it means for training
+
+Segment-everything is implemented, tested against brute-force references, wired through the
+unified `predict.py`, and scored end to end with `mia-evals`. Its first number is pq 0.14, and every
+control says the same thing about why: **the model merges neighbours from a single click**, and no
+grid density, threshold, level preference or assembly setting changes that.
+
+Two facts about training follow directly:
+
+1. **The generator consumes the model's weakest output.** Training reports the refined IoU as its
+   headline (0.524 voxel), but the generator can only issue a single click -- round 0 -- and that is
+   0.429. The interactive rounds add +0.10 that whole-volume prediction never sees. The metric to
+   watch for this use is `first_voxel_iou`, not `final_voxel_iou`.
+2. **The mask-only refinement round is missing.** The plan specified the reference's extra round
+   with no new point, so the model learns to refine its own mask from the mask alone. Every round
+   in `_step` adds a correction click (`_correction`, `promptable_seg.py:505`), so that round was
+   never trained. Implementing it would let the generator run a second, prompt-free pass over each
+   mask *in distribution* -- the cheapest available way to give whole-volume prediction some of the
+   +0.10 the interactive rounds are worth. It is a training-recipe change and should wait for the
+   150k run to finish rather than be introduced mid-comparison.
+
+## Phase 4b — how to reconcile masks across tiles
+
+Five schemes, one block, one model, one set of thresholds. 520-cube of the held-out volume,
+27 tiles of 256 at 50% overlap, 318 ground-truth objects of which **258 cross a tile seam**, the
+clean 50k checkpoint, 14^3 grid, pred IoU >= 0.5, stability >= 0.5, `nms_iou 0.7`,
+`merge_fraction 0.5`. Scored with `mia-evals` (pq at IoU 0.5) and with `sam3d/seam_splits.py`,
+which looks only at the crossing objects: *intact* (one id covers most of it), *split* (two or more
+ids each cover >= 10%), *missed* (nothing predicted on it).
+
+| scheme | pred | TP | FP | FN | **pq** | voi merge | voi split | intact | split | missed | wall |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `none` — every mask a new id (control) | 1204 | 29 | 1175 | 289 | 0.023 | 3.24 | 2.03 | 62% | 65 | 32 | 174 s |
+| `canvas` — inherit if >= 50% overlap (baseline) | 520 | 35 | 485 | 283 | 0.050 | 3.28 | 1.76 | 65% | 59 | 32 | 174 s |
+| `canvas` + `edge_discard` (the reference's rule) | 189 | 33 | 156 | 285 | **0.077** | 5.30 | **0.68** | 65% | **15** | 76 | 167 s |
+| `propagate`, gated by the IoU head | 520 | 35 | 485 | 283 | 0.050 | 3.26 | 1.76 | = canvas | | | 170 s |
+| **`propagate`, gated by fragment coverage** | 459 | **37** | 422 | **281** | **0.056** | **3.05** | 1.72 | **66%** | 65 | **23** | 192 s |
+| same + `skip_claimed_clicks` | 462 | 35 | 427 | 283 | 0.052 | 3.11 | 1.73 | 66% | 66 | 23 | 160 s |
+
+### What each row says
+
+**Inheriting ids is worth 2x pq — but not for the reason expected.** `none` -> `canvas` halves the
+predicted instances (1204 -> 520) and doubles pq, yet prevents only six seam splits (65 -> 59). Its
+value is *deduplication*: without it every tile re-paints slivers of objects its neighbours already
+own, and each sliver is a false positive. The seam metric is what separates the two effects.
+
+**Propagation as first implemented was a silent no-op.** `propagate` gated like a discovery -- IoU
+head >= 0.5, stability >= 0.5 -- scored identically to `canvas` to the instance. `propagate_probe.py`
+showed why: all 34 continuations on the probe tile covered 90-100% of their fragment and were
+rejected, with predicted IoU 0.16-0.39. The IoU head was trained to score mask-prompted rounds that
+carry an *error-correction* click; handed a redundant interior click and a truncated prompt it
+reports no confidence, whatever the mask. Under the grid's gates, propagation cannot paint.
+
+**Gated on coverage, propagation is the best scheme that keeps large objects.** Accepting a
+continuation when it covers >= 80% of the fragment whose identity was already earned gives the
+most true positives (37), fewest false positives among the full-coverage schemes (422), lowest
+`voi_merge` (3.05), and -- the targeted number -- **nine fewer crossing objects missed** (32 -> 23).
+Note what it did *not* do: splits are unchanged (59 -> 65). Its gain is *continuity* across seams,
+not fewer cuts. Cost is +10% wall time; `skip_claimed_clicks` buys that back (160 s) for 0.004 pq.
+
+**The reference's edge rule has the highest pq, and the size analysis says why that is a warning,
+not a recommendation.** Discarding masks that touch an interior tile face removes 329 predictions
+and loses only two true positives -- at this model quality, edge-touching masks are almost all
+junk, so the rule is a strong false-positive filter (485 -> 156). It also cuts seam splits 59 -> 15.
+But it misses 114 objects against `canvas`'s 65, and the 49 it alone loses are the ones the tiling
+is *for*: of the 143 ground-truth objects at least a whole tile (256 voxels) across, `edge_discard`
+misses **20** where `canvas` misses **1**; of the 199 at least half a tile across, 36 against 8.
+Those are the neurites. The rule wins today by deleting fragments of a model that produces mostly
+fragments; as single-click quality improves and those fragments become real pieces of large
+objects, it deletes exactly the objects that matter most in EM. Right for photographs, where the
+full image is a base layer everything fits in; wrong for a volume tiled because nothing does.
+
+### Reading it as a whole
+
+Every scheme lands in pq 0.02-0.08 on a block where the model's single-click masks are the
+binding constraint (Phase 4). Reconciliation moves pq by about 0.03 end to end; the difference
+between the 50k and a converged checkpoint will move it by far more. The defensible default is
+**`tile_merge = "propagate"` with the coverage gate**, because it is the best of the schemes whose
+behaviour does not invert as the model improves, and because it is the one that turns stitching
+from a geometric heuristic into an inference the model was (mostly) trained for. The two
+out-of-distribution facts about that inference -- truncated prompt, redundant click -- are what the
+still-missing mask-only refinement round would fix; once it is trained, the coverage gate can be
+retired in favour of the IoU head.
+
+Method notes: single runs per arm are exact, not noisy -- inference here is deterministic (stable
+NMS, fixed tile order), so the only noise is the block. One run was lost to shell quoting stripping
+the TOML quotes off a string override before `predict.py` saw it; the arm scripts now single-quote
+string-valued overrides, and `predict.py`'s refusal message is worth passing through any log filter.

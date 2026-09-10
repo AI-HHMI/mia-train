@@ -1,13 +1,15 @@
-"""`predict` must read exactly what miao reads, and tile on a lattice that stitches.
+"""`prediction.grid` must read exactly what miao reads, and tile on a lattice that stitches.
 
-The parity test is the important one. `predict` reproduces miao's read, resample and
+The parity test is the important one. `prediction.grid` reproduces miao's read, resample and
 normalisation rather than calling into it, because miao offers no "read this exact box" entry point
 -- its samplers choose the origin. A reimplementation that drifted would feed the encoder something
 subtly unlike its training data and still produce a plausible score, so the two are compared
 directly on real volumes: a box narrow enough to leave miao a handful of legal positions, then the
 same box read both ways and required to agree to the bit.
 
-Marked `slow` because it opens stores under /groups. Everything else here is pure arithmetic.
+Marked `slow` because it opens stores under /groups. Everything else here is pure arithmetic,
+plus the `VolumePredictor` dispatch in `prediction.dense` and the `--override` parsing in
+`predict.py`.
 """
 
 from __future__ import annotations
@@ -16,8 +18,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
-from predict import aligned_tiling, blend_weight, normalize, resample_labels
+from prediction.dense import blend_weight
+from prediction.grid import aligned_tiling, normalize, resample_labels
 
 pytestmark = pytest.mark.unit
 
@@ -108,7 +112,8 @@ def test_reader_matches_miao_exactly(volume: str) -> None:
     from miao.config import load_config
     from miao.dataset import VolumeDataset
 
-    from predict import VolumeGrid, resolve_patch
+    from predict import resolve_patch
+    from prediction.grid import VolumeGrid
 
     base = load_config(DATA_CONFIG)
     out_axes = "".join(axis for axis in base.output_axes if axis in "xyz")
@@ -192,7 +197,7 @@ def test_tiles_and_ground_truth_cover_the_same_region():
             label_chosen_levels = [0]
             read_shapes = [np.array([71, 342, 342])]
 
-    from predict import VolumeGrid
+    from prediction.grid import VolumeGrid
 
     grid = VolumeGrid.__new__(VolumeGrid)          # geometry only; no store is opened
     grid.volume = None
@@ -218,3 +223,135 @@ def test_tiles_and_ground_truth_cover_the_same_region():
             "truth is read from native_box, so prediction and truth would describe different "
             "regions and every score would be meaningless."
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# The VolumePredictor dispatch. These protect the dense path: every scored run in this repo was
+# produced by `predict_volume`, and the dispatch must be a pure wrapper around it.
+# ---------------------------------------------------------------------------------------------
+
+
+class _FakeGrid:
+    """Enough of `VolumeGrid` for `predict_volume`: a patch, two overlapping tiles, a fixed read."""
+
+    patch = [8, 8, 8]
+    output_shape = (12, 8, 8)
+    effective_voxel = [1.0, 1.0, 1.0]
+    axes = "zyx"
+    box_coverage = 1.0
+
+    def __init__(self, seed: int = 0) -> None:
+        generator = np.random.default_rng(seed)
+        self._tiles = [((0, 0, 0), (0, 0, 0)), ((4, 0, 0), (4, 0, 0))]
+        self._reads = {origin: generator.random((8, 8, 8), dtype=np.float32)
+                       for origin, _ in self._tiles}
+
+    @property
+    def tiles(self):
+        return list(self._tiles)
+
+    def image_handle(self):
+        return None
+
+    def read_image(self, handle, origin):
+        return self._reads[tuple(origin)]
+
+
+class _DenseAlgorithm:
+    """A dense-output strategy in miniature: three channels of a deterministic function."""
+
+    prediction_kind = "affinity"
+    prediction_channels = 3
+    squash_convention = "sigmoid(0.2 * logit)"
+
+    def volume_predictor(self):
+        return None
+
+    def logits(self, volumes):
+        x = volumes[:, 0]
+        return torch.stack([x, x * 2 - 1, -x], dim=1)
+
+    @staticmethod
+    def squash(logits):
+        return torch.sigmoid(0.2 * logits)
+
+
+@pytest.mark.unit
+def test_the_dense_predictor_is_byte_identical_to_the_bare_dense_path():
+    from prediction.dense import DensePredictor, predict_volume
+
+    algorithm = _DenseAlgorithm()
+    device = torch.device("cpu")
+    direct = predict_volume(algorithm, _FakeGrid(), device)
+    wrapped = DensePredictor(algorithm).run(_FakeGrid(), device)
+
+    assert wrapped.array.dtype == direct.dtype == np.float16
+    assert np.array_equal(wrapped.array, direct), "the wrapper must not touch the numbers"
+    assert wrapped.kind == "affinity"
+    assert wrapped.attrs == {
+        "convention": "sigmoid(0.2 * logit), blended in that space",
+        "channels": 3,
+    }
+
+
+@pytest.mark.unit
+def test_dispatch_prefers_the_strategy_s_own_predictor_and_falls_back_to_dense():
+    from prediction.dense import DensePredictor, select_predictor
+
+    assert isinstance(select_predictor(_DenseAlgorithm()), DensePredictor)
+
+    class _Own:
+        def run(self, grid, device):
+            raise AssertionError("not called here")
+
+    class _WithOwn(_DenseAlgorithm):
+        def volume_predictor(self):
+            return _Own()
+
+    assert isinstance(select_predictor(_WithOwn()), _Own)
+
+
+@pytest.mark.unit
+def test_a_strategy_with_neither_predictor_nor_dense_protocol_is_refused_up_front():
+    from prediction.dense import select_predictor
+
+    class _Neither:
+        def volume_predictor(self):
+            return None
+
+    with pytest.raises(SystemExit, match=r"lacks \['logits'.*volume_predictor"):
+        select_predictor(_Neither())
+
+
+@pytest.mark.unit
+def test_overrides_patch_the_resolved_record_and_refuse_what_the_run_never_had():
+    from predict import apply_overrides
+
+    # Real registered names: the key check is against what the class accepts, so that a knob
+    # added after a run was trained can still be set on that run's checkpoint.
+    resolved = {
+        "algorithm": {"name": "promptable_seg", "kwargs": {"pred_iou_thresh": 0.88,
+                                                          "prefer": "part"}},
+        "model": {"name": "dinov3_vit3d", "kwargs": {"use_fa4": True}},
+        "data": {"name": "d", "kwargs": {}},
+    }
+    patched = apply_overrides(
+        resolved,
+        ["algorithm.pred_iou_thresh=0.7", 'algorithm.prefer="whole"', "model.use_fa4=false"],
+    )
+    assert patched["algorithm"]["kwargs"] == {"pred_iou_thresh": 0.7, "prefer": "whole"}
+    assert patched["model"]["kwargs"] == {"use_fa4": False}
+    # The caller's record is untouched: it is the run's history, not scratch space.
+    assert resolved["algorithm"]["kwargs"]["pred_iou_thresh"] == 0.88
+
+    with pytest.raises(SystemExit, match="accepts no 'typo'"):
+        apply_overrides(resolved, ["algorithm.typo=1"])
+    # Not in the run's record, but the class takes it: allowed, which is the whole point.
+    later = apply_overrides(resolved, ["algorithm.nms_iou=0.6"])
+    assert later["algorithm"]["kwargs"]["nms_iou"] == 0.6
+    with pytest.raises(SystemExit, match="only"):
+        apply_overrides(resolved, ["trainer.lr=1"])
+    with pytest.raises(SystemExit, match="expected section.key=value"):
+        apply_overrides(resolved, ["pred_iou_thresh=0.7"])
+    with pytest.raises(SystemExit, match="not a TOML value"):
+        apply_overrides(resolved, ["algorithm.prefer=whole"])  # an unquoted string

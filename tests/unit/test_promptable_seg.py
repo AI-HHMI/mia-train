@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import components  # noqa: F401  (populates the registries as a real run would)
 from algorithms.promptable.decoder import MaskDecoder3D
-from algorithms.promptable.losses import best_of, dice_loss, focal_loss, mask_iou
-from algorithms.promptable.targets import IDS_KEY, SPLIT_LABEL_KEY
+from algorithms.promptable.losses import (
+    best_of,
+    dice_loss,
+    focal_loss,
+    mask_iou,
+    voxel_mask_iou,
+)
+from algorithms.promptable.targets import IDS_KEY, SPLIT_LABEL_KEY, pooled_masks
 from algorithms.promptable_seg import PromptableSegmentation
 from algorithms.registry import AlgorithmRegistry
 from layers.common.prompt import (
@@ -289,3 +296,62 @@ def test_a_point_prompt_pads_the_second_slot_so_the_batch_stays_rectangular():
     assert coords.shape == (2, 2, 3)
     clicks = torch.tensor([[4.0, 5, 6], [7, 8, 9]])
     torch.testing.assert_close(coords[:, 0], voxel_coords(clicks, (32,) * 3))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stride", [2, 4, 8])
+def test_voxel_iou_equals_upsampling_the_prediction_and_scoring_at_full_resolution(stride):
+    """The closed form must be exact, not close: it is the metric every head comparison rests on.
+
+    Scored the slow way -- upsample the coarse prediction with nearest neighbour, compare against
+    the unpooled binary mask -- against the cheap way, which never leaves the mask grid.
+    """
+    torch.manual_seed(0)
+    extent = 32
+    truth = torch.zeros(1, extent, extent, extent, dtype=torch.long)
+    truth[0, 3:19, 5:27, 2:23] = 7          # a slab that does not align to any block boundary
+    truth[0, 20:31, 1:6, 25:31] = 7         # a second piece, deliberately thin in one axis
+    soft = pooled_masks(truth, torch.tensor([[7]]), stride)[:, 0]
+
+    blocks = extent // stride
+    logits = torch.randn(1, 3, blocks, blocks, blocks) * 3
+    expanded = soft.unsqueeze(1).expand(-1, 3, -1, -1, -1)
+
+    cheap = voxel_mask_iou(logits, expanded)
+
+    binary = (truth == 7)[0]
+    slow = []
+    for candidate in range(3):
+        upsampled = (
+            F.interpolate((logits[0, candidate] > 0).float()[None, None], scale_factor=stride,
+                          mode="nearest")[0, 0] > 0.5
+        )
+        intersection = (upsampled & binary).sum().item()
+        union = (upsampled | binary).sum().item()
+        slow.append(intersection / union)
+
+    reference = torch.tensor(slow, dtype=cheap.dtype)
+    torch.testing.assert_close(cheap[0], reference, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.unit
+def test_voxel_iou_is_below_pooled_iou_because_quantisation_is_not_free():
+    # The two metrics answer different questions and the gap between them is the ceiling the mask
+    # stride imposes. A perfect prediction ON THE MASK GRID scores 1.0 there and strictly less at
+    # voxel resolution, whenever the object does not tile the grid exactly.
+    truth = torch.zeros(1, 16, 16, 16, dtype=torch.long)
+    truth[0, 1:10, 2:13, 3:14] = 5          # nothing aligns to a 4-voxel block
+    soft = pooled_masks(truth, torch.tensor([[5]]), 4)[:, 0]
+    perfect = torch.where(soft > 0.5, 20.0, -20.0).unsqueeze(1)
+    target = soft.unsqueeze(1)
+
+    assert mask_iou(perfect, target).item() == pytest.approx(1.0)
+    assert voxel_mask_iou(perfect, target).item() < 0.85
+
+
+@pytest.mark.unit
+def test_a_training_step_reports_voxel_resolution_iou():
+    torch.manual_seed(0)
+    metrics = _algorithm().training_step(_batch())
+    assert {"first_voxel_iou", "final_voxel_iou"} <= set(metrics)
+    assert torch.isfinite(metrics["first_voxel_iou"])

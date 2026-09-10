@@ -53,8 +53,9 @@ from layers.common.rope import patch_grid_coords, voxel_coords
 from models.base import BaseModel
 
 from .base import BaseAlgorithm
+from .promptable.amg import PREFER, TILE_MERGE, PromptGridPredictor
 from .promptable.decoder import MaskDecoder3D
-from .promptable.losses import best_of, dice_loss, focal_loss, mask_iou
+from .promptable.losses import best_of, dice_loss, focal_loss, mask_iou, voxel_mask_iou
 from .promptable.targets import (
     BOXES_KEY,
     IDS_KEY,
@@ -95,9 +96,11 @@ class PromptableSegmentation(BaseAlgorithm):
     text encoder because the corpus carries no captions or descriptions to train one from; a text
     encoder producing tokens in the same space would slot in behind the same interface.
 
-    This strategy deliberately implements no `logits()` / `prediction_kind`: `predict.py`'s protocol
-    is a fixed number of channels per voxel, and what this model emits depends on what it was
-    asked. Whole-volume inference is a search over prompts, and it belongs to its own entrypoint.
+    This strategy deliberately implements no `logits()` / `prediction_kind`: `predict.py`'s dense
+    protocol is a fixed number of channels per voxel, and what this model emits depends on what it
+    was asked. Whole-volume inference is instead a search over prompts, provided through
+    `volume_predictor()`, which `predict.py` drives through the same command as every other
+    strategy.
     """
 
     def __init__(
@@ -125,12 +128,31 @@ class PromptableSegmentation(BaseAlgorithm):
         dice_weight: float = 1.0,
         iou_weight: float = 1.0,
         attention_backend: str = "auto",
+        points_per_side: int = 12,
+        points_per_batch: int = 64,
+        pred_iou_thresh: float = 0.5,
+        stability_thresh: float = 0.8,
+        stability_delta: float = 1.0,
+        nms_iou: float = 0.7,
+        min_mask_voxels: int = 512,
+        max_mask_fraction: float = 0.95,
+        prefer: str = "whole",
+        containment_thresh: float = 0.8,
+        merge_fraction: float = 0.5,
+        tile_merge: str = "canvas",
+        edge_discard: bool = False,
+        skip_claimed_clicks: bool = False,
+        propagate_min_coverage: float = 0.8,
     ) -> None:
         super().__init__(model, dataset)
         if rounds < 1:
             raise ValueError(f"rounds must be at least 1, got {rounds}")
         if not 0.0 <= box_prob <= 1.0:
             raise ValueError(f"box_prob must be a probability, got {box_prob}")
+        if prefer not in PREFER:
+            raise ValueError(f"prefer must be one of {PREFER}, got {prefer!r}")
+        if tile_merge not in TILE_MERGE:
+            raise ValueError(f"tile_merge must be one of {TILE_MERGE}, got {tile_merge!r}")
 
         self.input_axes = self._resolve_input_axes(input_axes, dataset)
         self.input_key = input_key
@@ -145,6 +167,27 @@ class PromptableSegmentation(BaseAlgorithm):
         self.dice_weight = dice_weight
         self.iou_weight = iou_weight
         self.encoder = model
+        # Whole-volume mask generation, none of which touches training. Constructor arguments
+        # rather than constants because every one of them is decided *after* training, against a
+        # score on a held-out volume (`predict.py --override algorithm.<name>=...`), and the
+        # reference's values assume a far better model than a first run produces.
+        self.amg_settings: dict[str, Any] = {
+            "points_per_side": points_per_side,
+            "points_per_batch": points_per_batch,
+            "pred_iou_thresh": pred_iou_thresh,
+            "stability_thresh": stability_thresh,
+            "stability_delta": stability_delta,
+            "nms_iou": nms_iou,
+            "min_mask_voxels": min_mask_voxels,
+            "max_mask_fraction": max_mask_fraction,
+            "prefer": prefer,
+            "containment_thresh": containment_thresh,
+            "merge_fraction": merge_fraction,
+            "tile_merge": tile_merge,
+            "edge_discard": edge_discard,
+            "skip_claimed_clicks": skip_claimed_clicks,
+            "propagate_min_coverage": propagate_min_coverage,
+        }
 
         patch = cast(Any, model).patch_size
         self.patch_size: tuple[int, ...] = (
@@ -196,6 +239,16 @@ class PromptableSegmentation(BaseAlgorithm):
     def sample_transform(self) -> PromptTargets:
         self._delegated = True
         return self._targets
+
+    def volume_predictor(self) -> PromptGridPredictor:
+        """Segment everything: a grid of clicks per tile, reconciled into one labelling.
+
+        The reason this strategy does not implement `logits()`: its whole-volume output is a search
+        over prompts yielding a set of masks, not a fixed number of channels per voxel, and
+        `predict.py` drives it through this rather than through the dense path. See
+        `promptable/amg.py` for the procedure and the three places it departs from the reference.
+        """
+        return PromptGridPredictor(self, **self.amg_settings)
 
     def checkpointable_modules(self) -> tuple[nn.Module, ...]:
         """The expansion to mask resolution, which is where this strategy's memory goes.
@@ -329,6 +382,56 @@ class PromptableSegmentation(BaseAlgorithm):
         labels = torch.where(has_error, labels, torch.full_like(labels, PAD))
         return voxel_coords(centre, extent).unsqueeze(1), labels.unsqueeze(1)
 
+    def encode(
+        self, volumes: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+        """`(B, C, *spatial)` volumes -> image embedding `(B, N, D)`, its coordinates, its grid.
+
+        The prompt-independent half of the model, and the expensive one: run once per volume and
+        reused by every prompt against it. `patch_features` is the only thing asked of the
+        encoder, so any backbone implementing it serves. The coordinates come back with a leading
+        axis of 1 because every prompt reads the same crop -- they broadcast over the prompt batch
+        instead of being copied per prompt.
+
+        Public because whole-volume prediction (`volume_predictor`) drives it directly, once per
+        tile, and then decodes a few thousand prompts against the result.
+        """
+        with torch.profiler.record_function("encoder"):
+            tokens, grid = self.encoder.patch_features(volumes)
+        image = self.neck(
+            tokens.transpose(1, 2).reshape(tokens.shape[0], -1, *grid)
+        ).flatten(2).transpose(1, 2)
+        extent = tuple(volumes.shape[-SPATIAL_RANK:])
+        image_coords = patch_grid_coords(
+            grid, self.patch_size, extent, device=image.device
+        ).unsqueeze(0)
+        return image, image_coords, grid
+
+    def decode_points(
+        self,
+        image: torch.Tensor,
+        image_coords: torch.Tensor,
+        grid: tuple[int, ...],
+        point_coords: torch.Tensor,
+        point_labels: torch.Tensor,
+        multimask: bool,
+        mask_input: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Point prompts against an embedding -> mask logits `(P, K, *mask grid)` and IoUs `(P, K)`.
+
+        `image` is `(P, N, D)`, already expanded to the prompt batch; `point_coords` are in the
+        [-1, 1] frame `rope.voxel_coords` produces and `point_labels` use `layers.common.prompt`'s
+        vocabulary. Exactly what one interactive round does in training, so a prompt at inference
+        is decoded by the same path it was trained through.
+        """
+        sparse, sparse_coords, dense = self.prompt_encoder(
+            point_coords, point_labels, grid, mask_input=mask_input
+        )
+        with torch.profiler.record_function("decoder"):
+            return self.decoder(
+                image, image_coords, grid, sparse, sparse_coords, dense, multimask=multimask
+            )
+
     def _step(self, batch: Any) -> dict[str, torch.Tensor]:
         objects = self._objects(batch)
         volumes = self.encoder.prepare_input(batch[self.input_key], self.input_axes)
@@ -340,18 +443,10 @@ class PromptableSegmentation(BaseAlgorithm):
                 "must be co-registered with"
             )
 
-        with torch.profiler.record_function("encoder"):
-            tokens, grid = self.encoder.patch_features(volumes)
-        image = self.neck(
-            tokens.transpose(1, 2).reshape(tokens.shape[0], -1, *grid)
-        ).flatten(2).transpose(1, 2)
-
+        image, image_coords, grid = self.encode(volumes)
         batch_size, masks = objects[IDS_KEY].shape
         prompts = batch_size * masks
         image = image.repeat_interleave(masks, dim=0)
-        image_coords = patch_grid_coords(
-            grid, self.patch_size, extent, device=image.device
-        ).unsqueeze(0)
 
         target = pooled_masks(labels, objects[IDS_KEY], self.mask_stride).reshape(
             prompts, 1, *[extent[axis] // self.mask_stride[axis] for axis in range(SPATIAL_RANK)]
@@ -367,17 +462,13 @@ class PromptableSegmentation(BaseAlgorithm):
         mask_input: torch.Tensor | None = None
         totals: dict[str, torch.Tensor] = {}
         for index in range(self.rounds):
-            sparse, sparse_coords, dense = self.prompt_encoder(
-                coords, point_labels, grid, mask_input=mask_input
-            )
             # Only the first round is ambiguous: by the second the model has been told where it
             # went wrong, so three answers would be three copies and the min-reduction would give
             # the winner a third of the gradient it should have.
-            multimask = index == 0
-            with torch.profiler.record_function("decoder"):
-                logits, scores = self.decoder(
-                    image, image_coords, grid, sparse, sparse_coords, dense, multimask=multimask
-                )
+            logits, scores = self.decode_points(
+                image, image_coords, grid, coords, point_labels,
+                multimask=index == 0, mask_input=mask_input,
+            )
 
             candidates = logits.shape[1]
             expanded = target.expand(-1, candidates, *(-1,) * SPATIAL_RANK)
@@ -394,11 +485,20 @@ class PromptableSegmentation(BaseAlgorithm):
             loss = ((chosen + self.iou_weight * iou_loss) * weight).sum() / denominator
 
             picked = achieved.gather(1, which.unsqueeze(1)).squeeze(1)
+            # The same masks scored at voxel resolution rather than on the mask grid. Reported
+            # beside `*_iou` rather than replacing it, because they answer different questions and
+            # their difference IS the quantisation ceiling: `*_iou` is what the loss optimises,
+            # `*_voxel_iou` is what a consumer of the mask gets. Only the second is comparable
+            # across `mask_upscale`.
+            at_voxels = voxel_mask_iou(logits, expanded)
             stage = "first" if index == 0 else "final"
             totals[f"loss_round_{index}"] = loss.detach()
             totals[f"{stage}_iou"] = (picked * weight).sum() / denominator
             oracle = achieved.max(dim=1).values
             totals[f"{stage}_oracle_iou"] = (oracle * weight).sum() / denominator
+            totals[f"{stage}_voxel_iou"] = (
+                at_voxels.gather(1, which.unsqueeze(1)).squeeze(1) * weight
+            ).sum() / denominator
             totals[f"{stage}_iou_error"] = (
                 (scores - achieved).abs().mean(dim=1) * weight
             ).sum() / denominator

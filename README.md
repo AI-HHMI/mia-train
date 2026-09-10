@@ -75,9 +75,9 @@ Machine-local paths common to all runs (dataset roots, checkpoint directory, ven
 | `muvit_mae` | Masked autoencoding across scale levels, one decoder per level. |
 | `simmim` | Masked image modelling by mask-token substitution. Works with DINOv3 encoders, which MAE cannot use because they cannot consume a scattered token subset. |
 | `dinov3` | The DINOv3 self-supervised objective: teacher/student EMA, DINO + iBOT losses, Sinkhorn centring, KoLeo. Rank-agnostic. |
-| `affinity_seg` | Supervised instance segmentation by affinity prediction (e.g. the NISB task). |
+| `affinity_seg` | Supervised instance segmentation by binary affinity prediction. |
 | `semantic_seg` | Supervised per-voxel classification (serves both 2D and 3D). |
-| `promptable_seg` | Supervised *promptable* instance segmentation, Segment Anything-style: a point, box, previous mask or class token names one object and the model returns a mask for it, with a predicted IoU. Position is carried by rotary embedding over shared coordinates rather than the reference's additive random-Fourier encoding, so a click and the patch containing it are positioned identically. |
+| `promptable_seg` | Supervised *promptable* instance segmentation, Segment Anything-style, supporting point, box, mask, or class token prompts. |
 
 Adding a new component simply involves writing it and adding one line to `src/components.py`. The engine and the
 registries never change.

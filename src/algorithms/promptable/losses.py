@@ -69,6 +69,39 @@ def mask_iou(
     return intersection / union.clamp_min(1)
 
 
+def voxel_mask_iou(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """IoU at VOXEL resolution, computed on the coarse grid -> `(P, K)`.
+
+    `mask_iou` scores the prediction against the *pooled* target, so both live on the mask grid and
+    the number it reports is blind to everything the pooling threw away. That flatters the model,
+    and worse, it is not comparable between strides: a finer head is scored against a harder target
+    and can report a lower number while being strictly better. Any experiment that changes
+    `mask_upscale` needs a metric that does not move with it.
+
+    This is that metric, and it costs nothing. The prediction is constant on each block, so
+    upsampling it with nearest-neighbour and scoring against the true binary mask has a closed
+    form: a block the model calls foreground contributes `stride^3 * target` intersecting voxels
+    and `stride^3` predicted ones, and the true mask has `stride^3 * sum(target)` voxels in total.
+    Every `stride^3` cancels in the ratio, so the soft target -- which is exactly the fraction of
+    each block belonging to the object -- carries all the information needed:
+
+        IoU = sum(p * t) / (sum(p) + sum(t) - sum(p * t))
+
+    with `p` the thresholded prediction and `t` the soft target. **Exact**, not an approximation,
+    and pinned against an explicit upsample-and-score in `tests/unit/test_promptable_seg.py`.
+
+    The gap between this and `mask_iou` is the quantisation ceiling. Measured on this corpus
+    (`sam3d/stride_ceiling.py`): a *perfect* model at stride 4 caps at 0.755 overall and 0.555 on
+    objects under 4k voxels, against 0.912 at stride 2. So the two numbers are far apart, and the
+    coarse one is the misleading one.
+    """
+    predicted = (logits > 0).to(targets.dtype)
+    flat_predicted, flat_targets = predicted.flatten(2), targets.flatten(2)
+    intersection = (flat_predicted * flat_targets).sum(-1)
+    union = flat_predicted.sum(-1) + flat_targets.sum(-1) - intersection
+    return intersection / union.clamp_min(1e-6)
+
+
 def best_of(losses: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """`(P, K)` per-candidate losses -> the lowest of each row, and which candidate it was.
 

@@ -31,6 +31,24 @@ Two measurements shaped it (`sam3d/instance_census.py`):
   Their annotation is an offset sub-box. Every volume therefore carries a `bounding_box`; without
   one the model would be trained mostly on the claim that there is nothing to segment.
 
+## Whole-volume prediction goes through `predict.py`, not a second entrypoint
+
+Segment-everything is a *search* over prompts that yields a set of masks reconciled by identity,
+not a dense field that overlapping tiles can average. Rather than a `predict_X.py` per algorithm,
+`BaseAlgorithm` gained one hook, `volume_predictor()`, returning `None` for the dense default; the
+promptable strategy returns `algorithms/promptable/amg.PromptGridPredictor`, and `predict.py`
+dispatches with one line. The dense path is untouched and pinned byte-identical
+(`tests/unit/test_predict.py`). `predict.py --override algorithm.<knob>=<toml value>` patches a
+run's resolved config before rebuilding it, so thresholds decided after training are set at
+prediction time and validated against the class signature -- which is what lets a knob added after
+a run was trained be set on that run's checkpoint.
+
+Results and diagnostics: **`RESULTS.md`, "Phase 4"**; the five-way comparison of how tiles are
+reconciled (canvas inheritance, none, the reference's edge rule, mask-prompt propagation with and
+without click skipping) is **"Phase 4b"**. Summary: pq 0.10-0.14 across every
+threshold; an oracle given a true click inside every object scores the *same* (0.113) because the
+model's single-click masks span neighbouring cells -- the model, not the generator, is the ceiling.
+
 ## Arm 1 — `escape.toml`: does it learn on real data?
 
 The smoke run (`configs/promptable_smoke.toml`, 50 steps) only ever showed the collapse to
