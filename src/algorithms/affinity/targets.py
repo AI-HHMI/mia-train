@@ -1,9 +1,9 @@
 """Turning an instance-segmentation crop into affinity targets.
 
-Affinities are the representation the NISB baseline predicts: for each voxel and each of a small
-set of offsets, "does the voxel at this offset belong to the same object as I do?". A network
-predicting them learns object *boundaries* rather than object identities, which is what makes the
-task independent of how many neurons happen to be in a crop and of what ids they were given.
+For each voxel and each of a small set of offsets, "does the voxel at this offset belong to the 
+same object as I do?". A network predicting them learns object *boundaries* rather than object 
+identities, which is what makes the task independent of how many neurons happen to be in a crop 
+and of what ids they were given.
 
 Kept out of the algorithm module because both halves of this file are plain tensor functions with
 their own failure modes, and they are far easier to test directly than through a training step.
@@ -17,10 +17,10 @@ import cc3d
 import numpy as np
 import torch
 
-# The NISB baseline's six offsets, in the order it emits them: three short-range (nearest
-# neighbour along each axis) then three long-range. They are expressed in *spatial axis order as
-# the batch arrives*, so with `output_axes = "lcxyz"` channel 0 is +1 in x. Nothing here checks
-# that -- the algorithm does, once, against the dataset's declared axes.
+# Six offsets, in the order it emits them: three short-range (nearest neighbour along each axis) 
+# then three long-range. They are expressed in *spatial axis order as the batch arrives*, so with
+# `output_axes = "lcxyz"` channel 0 is +1 in x. Nothing here checks that -- the algorithm does, 
+# once, against the dataset's declared axes.
 SHORT_RANGE = 1
 LONG_RANGE = 10
 

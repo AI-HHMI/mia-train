@@ -117,6 +117,8 @@ class PromptableSegmentation(BaseAlgorithm):
         num_multimask_outputs: int = 3,
         mask_upscale: int = 4,
         mask_feature_dim: int = 32,
+        mask_refine_depth: int = 2,
+        mask_upscale_hidden: int | None = None,
         masks_per_sample: int = 16,
         min_object_voxels: int = 64,
         rounds: int = 3,
@@ -215,6 +217,12 @@ class PromptableSegmentation(BaseAlgorithm):
         self.prompt_encoder = PromptEncoder3D(
             prompt_dim, mask_downscale=mask_upscale, num_classes=num_classes
         )
+        # `mask_refine_depth` and `mask_upscale_hidden` reach the sub-pixel expansion's own
+        # knobs. The refinement convolutions are the only layers that run *at* mask resolution --
+        # everything else is decided on the patch grid -- so they are where extra capacity for
+        # fine spatial detail would go, and their count sets the receptive field across the
+        # seams between independently decoded blocks (`2 * depth + 1`). Exposed rather than fixed
+        # so the trade can be measured; the defaults are the decoder's own.
         self.decoder = MaskDecoder3D(
             prompt_dim,
             num_heads=decoder_heads,
@@ -223,6 +231,8 @@ class PromptableSegmentation(BaseAlgorithm):
             num_multimask_outputs=num_multimask_outputs,
             upscale=mask_upscale,
             mask_feature_dim=mask_feature_dim,
+            upscale_hidden=mask_upscale_hidden,
+            refine_depth=mask_refine_depth,
             attention_backend=attention_backend,
         )
 

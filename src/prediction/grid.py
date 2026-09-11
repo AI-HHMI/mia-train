@@ -177,7 +177,12 @@ class VolumeGrid:
         self.patch = list(patch)
         self.rank = len(self.axes)
         self.image_level = int(info.scales.chosen_levels[0])
-        self.label_level = int(info.scales.label_chosen_levels[0])
+        # None for a volume with no `label_key`: pseudo-labelling runs this lattice over unlabeled
+        # volumes, where there is no ground truth to read and `read_ground_truth` says so itself.
+        self.label_level = (
+            int(info.scales.label_chosen_levels[0])
+            if info.scales.label_chosen_levels is not None else None
+        )
         self.image_voxel = [float(v) for v in info.img_level_voxels[self.image_level]]
 
         self._resolve_geometry(box, volume_name)
@@ -192,6 +197,21 @@ class VolumeGrid:
         `tests/unit/test_predict.py::test_tiles_and_ground_truth_cover_the_same_region`.
         """
         info = self.info
+        if self.image_level != 0:
+            # Every quantity below -- the bounding box, the tile origins, `native_box()` -- is in
+            # LEVEL-0 voxels, and `read_image` indexes the chosen level's array with them. That is
+            # one coordinate system only while the chosen level is 0. miao picks a coarser rung
+            # when it matches the target resolution better (a 4 nm store asked for 8 nm reads its
+            # level 1), and this lattice would then read from the wrong place and shrink every
+            # tile by the level's factor, with nothing downstream able to tell. Refused rather than
+            # generalised, because no volume this has been run on needs it: all eight eval volumes
+            # and all 87 unlabeled pretraining volumes resolve to level 0 at 8 nm (measured).
+            raise SystemExit(
+                f"volume {volume_name!r} would be read at pyramid level {self.image_level}, but "
+                "this lattice is expressed in level-0 voxels and only reads level 0. Predict at a "
+                "target resolution the store's level 0 serves, or extend VolumeGrid to convert "
+                "its box and origins into the chosen level's voxels (and its origin offset)."
+            )
         if info.bounding_box is None:
             raise SystemExit(
                 f"volume {volume_name!r} has no bounding_box. It is not optional for scoring: "

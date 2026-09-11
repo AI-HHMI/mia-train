@@ -362,6 +362,34 @@ def test_block_stochastic_depth_is_training_only():
 
 
 @pytest.mark.unit
+def test_stochastic_depth_drops_nothing_at_batch_one_and_takes_the_plain_path():
+    """At batch 1 the sample subset is the whole batch, so the stochastic path IS the residual add.
+
+    Pinned because that identity is what lets a compiled run carry `drop_path > 0` at one sample
+    per rank at all: the randperm-and-slice form of the same computation trips an inductor
+    pattern bug (torch 2.13, `randperm_index`), and every finetune in this repo runs batch 1 per
+    rank. Deterministic here -- no draw is made on the plain path -- so training and eval agree
+    exactly, for the single-tensor and the list entry points alike.
+    """
+    torch.manual_seed(0)
+    block = SelfAttentionBlock(dim=16, num_heads=4, drop_path=0.5)
+    x = torch.randn(1, 5, 16)
+    block.eval()
+    with torch.no_grad():
+        reference = block(x)
+    block.train()
+    with torch.no_grad():
+        assert torch.equal(block(x), reference)
+        assert torch.equal(block([x, x.clone()])[1], reference)
+
+    # With a batch that CAN be subsampled the stochastic path is still taken: two training passes
+    # differ, which is what `test_block_stochastic_depth_is_training_only` relies on.
+    many = torch.randn(8, 5, 16)
+    with torch.no_grad():
+        assert not torch.allclose(block(many), block(many))
+
+
+@pytest.mark.unit
 def test_layerscale_is_only_added_when_configured():
     assert isinstance(SelfAttentionBlock(dim=16, num_heads=4).ls1, nn.Identity)
     assert isinstance(SelfAttentionBlock(dim=16, num_heads=4, init_values=1e-4).ls1, LayerScale)

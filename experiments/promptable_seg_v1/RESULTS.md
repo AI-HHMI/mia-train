@@ -407,6 +407,10 @@ still-missing mask-only refinement round would fix; once it is trained, the cove
 retired in favour of the IoU head.
 
 Method notes: single runs per arm are exact, not noisy -- inference here is deterministic (stable
-NMS, fixed tile order), so the only noise is the block. One run was lost to shell quoting stripping
+NMS, fixed tile order), so the only noise is the block. Verified 2026-09-10: re-running the
+`canvas` arm on H100 with the current tree reproduces its artifact byte-for-byte. **Every arm
+above was scored on H100, and a new arm must be too** -- the same code on a B300 gives 530
+instances against 520 and pq 0.0486 against 0.0503, from bf16 kernel differences at the gate
+boundaries (the partitions still agree to 98.5%). One run was lost to shell quoting stripping
 the TOML quotes off a string override before `predict.py` saw it; the arm scripts now single-quote
 string-valued overrides, and `predict.py`'s refusal message is worth passing through any log filter.

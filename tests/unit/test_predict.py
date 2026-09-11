@@ -355,3 +355,63 @@ def test_overrides_patch_the_resolved_record_and_refuse_what_the_run_never_had()
         apply_overrides(resolved, ["pred_iou_thresh=0.7"])
     with pytest.raises(SystemExit, match="not a TOML value"):
         apply_overrides(resolved, ["algorithm.prefer=whole"])  # an unquoted string
+
+
+def _geometry_only_grid(chosen_levels, label_chosen_levels):
+    """A `VolumeGrid` built without a store, as the tiles-vs-ground-truth test above does."""
+    class FakeInfo:
+        img_spatial_axes = "zyx"
+        lbl_spatial_axes = "zyx"
+        lbl_axes = "zyx"
+        bounding_box = np.array([[0, 100], [0, 1024], [0, 1024]])
+        img_level_voxels = {0: [29.0, 6.0, 6.0], 1: [58.0, 12.0, 12.0]}
+        lbl_level_voxels = {0: [29.0, 6.0, 6.0]}
+
+        class scales:
+            read_shapes = [np.array([71, 342, 342])]
+
+    FakeInfo.scales.chosen_levels = chosen_levels
+    FakeInfo.scales.label_chosen_levels = label_chosen_levels
+
+    from prediction.grid import VolumeGrid
+
+    grid = VolumeGrid.__new__(VolumeGrid)
+    grid.volume = None
+    grid.patch = [256, 256, 256]
+    grid.info = FakeInfo()
+    grid.axes = FakeInfo.img_spatial_axes
+    grid.rank = 3
+    grid.image_level = int(chosen_levels[0])
+    grid.label_level = (
+        int(label_chosen_levels[0]) if label_chosen_levels is not None else None
+    )
+    grid.image_voxel = FakeInfo.img_level_voxels[grid.image_level]
+    return grid
+
+
+def test_a_volume_without_labels_still_gets_a_lattice():
+    """Pseudo-labelling tiles unlabeled volumes: no `label_key`, so no label level to resolve.
+
+    Mirrors the `label_level` branch in `VolumeGrid.__init__`; `read_ground_truth` is where the
+    absence of labels is reported, and only when someone asks for them.
+    """
+    from prediction.grid import VolumeGrid
+
+    grid = _geometry_only_grid(chosen_levels=[0], label_chosen_levels=None)
+    VolumeGrid._resolve_geometry(grid, None, "unlabeled")
+    assert grid.label_level is None
+    assert len(grid.tiles) > 0
+
+
+def test_a_volume_read_above_level_zero_is_refused_not_mislocated():
+    """The lattice is in level-0 voxels and reads the chosen level with them.
+
+    For a chosen level of 1 every tile would be read from twice the intended coordinate and cover
+    half the intended extent, and the ground truth -- read in level-0 units -- would describe a
+    different region. Nothing else would notice; the scores would be plausible. So it is refused.
+    """
+    from prediction.grid import VolumeGrid
+
+    grid = _geometry_only_grid(chosen_levels=[1], label_chosen_levels=[0])
+    with pytest.raises(SystemExit, match="pyramid level 1"):
+        VolumeGrid._resolve_geometry(grid, None, "fine-store")

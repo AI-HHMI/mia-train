@@ -108,7 +108,14 @@ class SelfAttentionBlock(nn.Module):
         sample_subset_size = max(int(b * (1 - self.sample_drop_ratio)), 1)
         residual_scale_factor = b / sample_subset_size
 
-        if self.training and self.sample_drop_ratio > 0.0:
+        # The stochastic path only when it would drop something. With the subset the whole batch
+        # -- which is EVERY batch of one sample per rank, the layout this repo's finetunes run at --
+        # it is the plain residual add computed through a gather, an index_add and a scale of 1,
+        # so taking the plain path changes nothing numerically. It also sidesteps a torch 2.13
+        # inductor bug: `randperm(b)[:b]` folds its slice away and the joint-graph
+        # `randperm_index` pattern then fails to bind `slice_shape`, killing compilation at the
+        # first step of any compiled run with drop_path > 0 and batch 1.
+        if self.training and self.sample_drop_ratio > 0.0 and sample_subset_size < b:
             indices_1 = (torch.randperm(b, device=x.device))[:sample_subset_size]
 
             x_subset_1 = x[indices_1]
@@ -153,7 +160,11 @@ class SelfAttentionBlock(nn.Module):
             for b, sample_subset_size in zip(b_list, sample_subset_sizes, strict=True)
         ]
 
-        if self.training and self.sample_drop_ratio > 0.0:
+        # As in `_forward`: only when some crop's subset is smaller than its batch.
+        drops_something = any(
+            size < b for size, b in zip(sample_subset_sizes, b_list, strict=True)
+        )
+        if self.training and self.sample_drop_ratio > 0.0 and drops_something:
             indices_1_list = [
                 (torch.randperm(b, device=x.device))[:sample_subset_size]
                 for x, b, sample_subset_size in zip(

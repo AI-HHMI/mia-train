@@ -355,3 +355,24 @@ def test_a_training_step_reports_voxel_resolution_iou():
     metrics = _algorithm().training_step(_batch())
     assert {"first_voxel_iou", "final_voxel_iou"} <= set(metrics)
     assert torch.isfinite(metrics["first_voxel_iou"])
+
+
+@pytest.mark.unit
+def test_the_mask_head_refinement_depth_and_width_are_configurable():
+    """`mask_refine_depth` / `mask_upscale_hidden` reach the sub-pixel expansion.
+
+    The refinement convolutions are the only layers that run at mask resolution, so they are the
+    knob an experiment on fine spatial detail turns; a config key that was accepted and silently
+    ignored would make such a sweep measure noise.
+    """
+    default = _algorithm()
+    deeper = _algorithm(mask_refine_depth=4, mask_upscale_hidden=48)
+    # Each refinement step is a convolution followed by a GELU.
+    assert len(default.decoder.upscaler.refine) == 2 * 2
+    assert len(deeper.decoder.upscaler.refine) == 2 * 4
+    assert deeper.decoder.upscaler.project.out_channels == 48
+    assert default.decoder.upscaler.project.out_channels == DIM
+
+    torch.manual_seed(0)
+    metrics = deeper.training_step(_batch())
+    assert torch.isfinite(metrics["loss"])
