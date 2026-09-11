@@ -23,12 +23,10 @@ experiment_name = "my_run"
 [algorithm]    # name = a registered algorithm, plus its kwargs
 [data]         # name = a registered dataset; or config_path = a shared data config
 [val_data]     # optional: same shape as [data]
-[trainer]      # steps, batch size, lr, schedule, precision, checkpointing cadence
+[trainer]      # steps, local batch size, lr, schedule, precision, checkpointing cadence
 [augment]      # optional: training-data augmentation (never applied to [val_data])
 [parallelism]  # dp_replicate, dp_shard, tp; must multiply to the torchrun world size
 ```
-
-Note that `[trainer].batch_size` is per rank, so the global batch size is `batch_size × dp_replicate × dp_shard`.
 
 See `configs/*.toml` for working examples.
 
