@@ -15,7 +15,7 @@ from algorithms.promptable.losses import (
     mask_iou,
     voxel_mask_iou,
 )
-from algorithms.promptable.targets import IDS_KEY, SPLIT_LABEL_KEY, pooled_masks
+from algorithms.promptable.targets import IDS_KEY, SPLIT_LABEL_KEY, pooled_known, pooled_masks
 from algorithms.promptable_seg import PromptableSegmentation
 from algorithms.registry import AlgorithmRegistry
 from layers.common.prompt import (
@@ -227,7 +227,8 @@ def test_the_sample_transform_is_the_same_work_moved_not_different_work():
     torch.manual_seed(1)
     prepared = [transform({"label": batch["label"][i]}) for i in range(2)]
     delegated = dict(batch)
-    for key in (SPLIT_LABEL_KEY, IDS_KEY, "object_points", "object_boxes", "object_valid"):
+    for key in (SPLIT_LABEL_KEY, IDS_KEY, "object_points", "object_boxes", "object_valid",
+                "object_offobject"):
         delegated[key] = torch.stack([sample[key] for sample in prepared])
 
     torch.manual_seed(2)
@@ -376,3 +377,133 @@ def test_the_mask_head_refinement_depth_and_width_are_configurable():
     torch.manual_seed(0)
     metrics = deeper.training_step(_batch())
     assert torch.isfinite(metrics["loss"])
+
+
+@pytest.mark.unit
+def test_off_object_prompts_train_only_the_iou_head():
+    """Every slot off-object: no mask loss can flow, so with the IoU term weightless the loss is 0;
+    with it, the head is pushed towards 0 and the calibration metric is reported."""
+    torch.manual_seed(0)
+    silent = _algorithm(offobject_prob=1.0, iou_weight=0.0)
+    metrics = silent.training_step(_batch())
+    assert metrics["offobject_fraction"] == 1.0 and metrics["valid_fraction"] == 0.0
+    assert metrics["loss"].item() == 0.0
+
+    trained = _algorithm(offobject_prob=1.0, iou_weight=1.0)
+    metrics = trained.training_step(_batch())
+    assert metrics["loss"].item() > 0.0 and torch.isfinite(metrics["loss"])
+    assert 0.0 <= metrics["offobject_pred_iou"].item() <= 1.0
+    # Only the head and what feeds it should receive gradient from an off-object-only batch --
+    # the mask hypernetworks are behind the masked-out mask loss and see nothing.
+    metrics["loss"].backward()
+    assert all(
+        parameter.grad is None or parameter.grad.abs().sum() == 0
+        for parameter in trained.decoder.hypernetworks.parameters()
+    )
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum() > 0
+        for parameter in trained.decoder.iou_head.parameters()
+    )
+
+
+@pytest.mark.unit
+def test_a_mixed_batch_reports_both_kinds_and_matches_the_old_recipe_when_off():
+    torch.manual_seed(0)
+    mixed = _algorithm(offobject_prob=0.5, boundary_prob=0.5)
+    metrics = mixed.training_step(_batch())
+    assert torch.isfinite(metrics["loss"])
+    assert {"offobject_fraction", "offobject_pred_iou", "valid_fraction"} <= set(metrics)
+
+    # With both knobs at 0 the loss is the old recipe's, term for term.
+    torch.manual_seed(0)
+    plain = _algorithm()
+    reference = plain.training_step(_batch())
+    assert reference["offobject_fraction"] == 0.0
+    assert reference["offobject_pred_iou"] == 0.0
+
+
+
+# ------------------------------------------------------------------- unlabelled voxels (-1)
+
+
+@pytest.mark.unit
+def test_pooled_known_is_the_labelled_fraction_of_each_block():
+    labels = torch.zeros(1, 8, 8, 8, dtype=torch.int64)
+    labels[0, :4, :4, :4] = -1                 # one whole block unknown
+    labels[0, 4:8, :4, :4][:2] = -1            # half of another
+    labels[0, 4:6, 4:6, 4:6] = 7               # an object counts as known
+    known = pooled_known(labels, 4)
+    assert known.shape == (1, 1, 2, 2, 2)
+    assert known[0, 0, 0, 0, 0] == 0.0
+    assert known[0, 0, 1, 0, 0] == 0.5
+    assert known[0, 0, 1, 1, 1] == 1.0
+
+
+@pytest.mark.unit
+def test_weighted_losses_reproduce_the_unweighted_ones_under_all_ones():
+    torch.manual_seed(0)
+    logits = torch.randn(2, 3, 4, 4, 4)
+    targets = (torch.rand(2, 3, 4, 4, 4) > 0.5).float()
+    ones = torch.ones_like(targets)
+    for fn in (focal_loss, dice_loss, mask_iou, voxel_mask_iou):
+        assert torch.allclose(fn(logits, targets), fn(logits, targets, weight=ones), atol=1e-6), fn
+
+
+@pytest.mark.unit
+def test_unknown_cells_change_nothing_however_wrong_the_prediction_there_is():
+    """Half the cells unknown: the four numbers equal those computed on the known half alone."""
+    torch.manual_seed(1)
+    logits = torch.randn(1, 2, 4, 4, 4)
+    targets = (torch.rand(1, 2, 4, 4, 4) > 0.5).float()
+    weight = torch.ones(1, 1, 4, 4, 4)
+    weight[..., 2:, :, :] = 0.0                # the second half along x is unknown
+    wrong = logits.clone()
+    wrong[..., 2:, :, :] = 40.0 * (1 - 2 * targets[..., 2:, :, :])   # maximally wrong there
+    for fn in (focal_loss, dice_loss, mask_iou, voxel_mask_iou):
+        on_known = fn(logits[..., :2, :, :], targets[..., :2, :, :])
+        assert torch.allclose(fn(wrong, targets, weight=weight), on_known, atol=1e-5), fn
+        assert torch.allclose(fn(logits, targets, weight=weight), on_known, atol=1e-5), fn
+
+
+@pytest.mark.unit
+def test_a_correction_never_clicks_in_unlabelled_space():
+    algorithm = _algorithm()
+    stride = algorithm.mask_stride[0]                # 2 for this fixture: patch 8 / upscale 4
+    extent = (32, 32, 32)
+    cells = extent[0] // stride                       # 16 blocks along each axis
+    grid = (cells,) * 3
+    logits = torch.full((4, 1, *grid), 5.0)          # predicts foreground everywhere
+    target = torch.zeros(4, 1, *grid)
+    target[..., :4, :, :] = 1.0                       # the object: blocks 0..3 along x
+    known = torch.ones(4, 1, *grid)
+    known[..., 4:12, :, :] = 0.0                      # blocks 4..11 unknown; 12..15 background
+
+    def block_x(coords: torch.Tensor) -> torch.Tensor:
+        return ((coords[..., 0] + 1) / 2 * extent[0]) // stride
+
+    for _ in range(20):
+        coords, labels = algorithm._correction(logits, target, extent, known)
+        assert (labels == BACKGROUND).all()           # the only error is spill
+        assert (block_x(coords) >= 12).all(), block_x(coords)
+    seen_unknown = False                              # without `known`, spill anywhere is clicked
+    for _ in range(50):
+        coords, _ = algorithm._correction(logits, target, extent)
+        b = block_x(coords)
+        seen_unknown |= bool(((b >= 4) & (b < 12)).any())
+    assert seen_unknown
+
+
+@pytest.mark.unit
+def test_a_training_step_treats_unlabelled_voxels_as_silence_not_background():
+    """Two batches, identical except that one marks a background region -1: the step runs, the
+    loss is finite, and it differs from the batch that calls the same region background."""
+    algorithm = _algorithm()
+    batch = _batch()
+    unknown = {k: v.clone() for k, v in batch.items()}
+    unknown["label"][1, 0, 22:32, 22:32, 22:32] = -1  # far from object 333 (4..20)
+    torch.manual_seed(7)
+    with_background = algorithm.training_step(batch)["loss"]
+    torch.manual_seed(7)
+    with_unknown = algorithm.training_step(unknown)["loss"]
+    assert torch.isfinite(with_unknown)
+    assert not torch.isclose(with_background, with_unknown)

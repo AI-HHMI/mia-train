@@ -15,7 +15,8 @@
 #
 # **Mask-generator settings are fixed here, not fitted.** They are the values
 # promptable_seg_v1/RESULTS.md found best on a held-out block (14^3 clicks per tile, IoU and
-# stability gates at 0.5, propagate-with-coverage tile reconciliation), applied identically to
+# stability gates at 0.5), with the windows reconciled by agreement (`consensus`, measured best on
+# the GT blocks 2026-09-12 and at the metric's ceiling for perfect masks), applied identically to
 # every arm and round, and recorded in each artifact's attrs. The only parameter fitted per arm is
 # the size filter, which is also the only one fitted for the MWS rows. `points_per_batch` is a
 # throughput knob with no effect on the result and is lowered for the finer-stride arms, whose
@@ -69,7 +70,7 @@ case "$upscale" in 16) batch=8; mem_scale=3 ;; 8) batch=32; mem_scale=2 ;; *) ba
 # A run was once lost to the shell stripping them and predict.py refusing the bare word.
 OVERRIDES='--override algorithm.points_per_side=14 --override algorithm.pred_iou_thresh=0.5 \
 --override algorithm.stability_thresh=0.5 --override algorithm.nms_iou=0.7 \
---override algorithm.tile_merge=\"propagate\" --override algorithm.propagate_min_coverage=0.8'
+--override algorithm.tile_merge=\"consensus\" --override algorithm.agree_thresh=0.5'
 OVERRIDES+=" --override algorithm.points_per_batch=$batch"
 echo "run   $run"
 echo "step  $STEP"

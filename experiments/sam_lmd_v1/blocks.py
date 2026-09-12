@@ -16,10 +16,11 @@ miao co-registers them with the image by construction -- no scale or translation
 wrong, and the corpus's per-level origin conventions never enter. The cost is up to 8x the voxels
 of the 8 nm lattice for a 4 nm volume, which is cheap: a labelling has no information below the
 mask stride (4 lattice voxels = 32 nm), it compresses ~20x, and only the blocks actually labelled
-occupy chunks. Voxels never labelled read as `IGNORE` (-1) from the array's fill value; voxels
-inside a labelled block that no confident mask claimed are 0. The promptable strategy treats both
-as "not an object" -- ids are only ever drawn from values above 0 -- so the distinction is for
-whoever reads these labels next, not for this training.
+occupy chunks. Voxels never labelled read as `IGNORE` (-1) from the array's fill value, and so do
+voxels inside a labelled block that no confident mask claimed (`pseudolabel.py` writes them as
+`IGNORE` too). Nothing in a sidecar is ever 0: in a label array 0 asserts "background, nobody's
+object", the strategy draws its off-object prompts from exactly that value, and a teacher with a
+recall far below one is in no position to make the assertion.
 
 **The container is a sidecar.** The published stores are read-only, so each labelled volume gets
 its own OME-Zarr directory whose `raw` is a symlink to the real one and whose `labels/<name>` is

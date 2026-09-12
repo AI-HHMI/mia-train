@@ -27,6 +27,7 @@ from typing import Any
 import cc3d
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 # Reused rather than reimplemented: this is the same connected-components pass the affinity
 # strategy runs, in the same place (a worker), for a reason that applies here too -- a crop can cut
@@ -42,6 +43,9 @@ IDS_KEY = "object_ids"
 POINTS_KEY = "object_points"
 BOXES_KEY = "object_boxes"
 VALID_KEY = "object_valid"
+#: Per slot: this prompt is a click on a voxel that belongs to NO object (label 0). The mask
+#: losses skip it; the IoU head is trained to answer 0 for every candidate it produces.
+OFFOBJECT_KEY = "object_offobject"
 SPLIT_LABEL_KEY = "split_label"
 
 
@@ -129,8 +133,70 @@ def random_voxel_per_object(
     return voxels
 
 
+def boundary_shell(labels: torch.Tensor, radius: int = 1) -> torch.Tensor:
+    """Voxels within `radius` (Chebyshev) of one carrying a different label -> `(*spatial)` bool.
+
+    Both sides of every boundary: the rim of each object AND the background voxels touching it,
+    since a max- and a min-pool over the label ids both differ from the centre wherever the
+    neighbourhood is not uniform. The crop's faces are not boundaries -- pooling pads with -inf, so
+    a voxel at a face is compared only with what is inside.
+    """
+    if radius < 1:
+        raise ValueError(f"radius must be at least 1, got {radius}")
+    pool = {2: F.max_pool2d, 3: F.max_pool3d}.get(labels.dim())
+    if pool is None:
+        raise ValueError(f"labels must have 2 or 3 spatial axes, got shape {tuple(labels.shape)}")
+    # float32 is exact for the dense ids `relabel_connected_cc3d` leaves (far below 2**24).
+    values = labels.to(torch.float32)[None, None]
+    size = 2 * radius + 1
+    highest = pool(values, size, stride=1, padding=radius)
+    lowest = -pool(-values, size, stride=1, padding=radius)
+    return ((highest != values) | (lowest != values))[0, 0]
+
+
+def random_background_voxels(labels: torch.Tensor, count: int) -> torch.Tensor:
+    """Up to `count` distinct uniformly random voxels with label exactly 0 -> `(k, rank)`.
+
+    Label 0 only. Negative labels mean "unknown" -- the corpus's ignore value, and what the
+    pseudo-label sidecars write wherever a teacher kept no mask -- and a click there is not a
+    click on nothing; it is a click on something nobody has annotated. Fewer than `count` rows
+    when the crop has fewer background voxels, none when it has none.
+    """
+    flat = labels.reshape(-1)
+    background = flat == 0
+    available = int(background.sum())
+    if count < 1 or available == 0:
+        return torch.zeros(0, labels.dim(), dtype=torch.long)
+    key = torch.where(background, torch.rand(flat.shape), torch.full(flat.shape, float("inf")))
+    positions = key.topk(min(count, available), largest=False).indices
+    coordinates = []
+    remaining = positions
+    for extent in reversed(labels.shape):
+        coordinates.append(remaining % extent)
+        remaining = remaining // extent
+    return torch.stack(list(reversed(coordinates)), dim=-1)
+
+
 class PromptTargets:
     """Draw prompt-able objects from a sample's label crop, in a worker process.
+
+    Three kinds of round-0 prompt come out of here, and the mix is the recipe:
+
+      * an **interior click** -- a voxel drawn uniformly from the object (the reference's prompt);
+      * a **boundary click** -- with probability `boundary_prob`, the voxel is drawn from the
+        object's rim instead (`boundary_shell`, `boundary_radius` wide): the hardest, most
+        ambiguous positive click, which a grid of prompts issues constantly against thin
+        neurites and which uniform sampling almost never produces for a thick object;
+      * an **off-object click** -- with probability `offobject_prob` per slot, a click on a voxel
+        with label 0, asked with the same foreground-click prompt the grid issues everywhere. It
+        carries no object: the mask losses skip it, and the IoU head is trained to answer 0 for
+        every candidate. This is the prompt segment-everything issues most and training never
+        showed the model; without it the head's confidence on membranes and unannotated space is
+        untrained, and gating on it filters nothing (measured: pseudo-masks passing 0.7 predicted
+        IoU had 0.24 true IoU).
+
+    Boxes are drawn for object slots only, and the strategy never turns an off-object slot into a
+    box.
 
     A callable class rather than a closure, for the reason `SplitDisconnectedLabels` is one: a
     worker is forked from a pickled copy of the dataset, and a closure over an algorithm would drag
@@ -154,15 +220,27 @@ class PromptTargets:
         masks_per_sample: int = 16,
         min_object_voxels: int = 64,
         level: int = 0,
+        offobject_prob: float = 0.0,
+        boundary_prob: float = 0.0,
+        boundary_radius: int = 1,
     ) -> None:
         if masks_per_sample < 1:
             raise ValueError(f"masks_per_sample must be at least 1, got {masks_per_sample}")
         if min_object_voxels < 1:
             raise ValueError(f"min_object_voxels must be at least 1, got {min_object_voxels}")
+        if not 0.0 <= offobject_prob <= 1.0:
+            raise ValueError(f"offobject_prob must be a probability, got {offobject_prob}")
+        if not 0.0 <= boundary_prob <= 1.0:
+            raise ValueError(f"boundary_prob must be a probability, got {boundary_prob}")
+        if boundary_radius < 1:
+            raise ValueError(f"boundary_radius must be at least 1, got {boundary_radius}")
         self.label_key = label_key
         self.masks_per_sample = masks_per_sample
         self.min_object_voxels = min_object_voxels
         self.level = level
+        self.offobject_prob = offobject_prob
+        self.boundary_prob = boundary_prob
+        self.boundary_radius = boundary_radius
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         if self.label_key not in sample:
@@ -189,31 +267,88 @@ class PromptTargets:
         ids, counts, boxes = eligible_objects(dense, self.min_object_voxels)
 
         masks = self.masks_per_sample
+        rank = split.dim()
         sample = dict(sample)
         sample[SPLIT_LABEL_KEY] = split
-        if len(ids) == 0:
-            rank = split.dim()
-            sample[IDS_KEY] = torch.zeros(masks, dtype=torch.long)
-            sample[POINTS_KEY] = torch.zeros(masks, rank, dtype=torch.long)
-            sample[BOXES_KEY] = torch.zeros(masks, 2, rank, dtype=torch.long)
-            sample[VALID_KEY] = torch.zeros(masks, dtype=torch.bool)
-            return sample
 
-        picked = area_stratified_choice(counts, masks)
-        chosen_ids = torch.from_numpy(ids[picked]).long()
+        out_ids = torch.zeros(masks, dtype=torch.long)
+        out_points = torch.zeros(masks, rank, dtype=torch.long)
+        out_boxes = torch.zeros(masks, 2, rank, dtype=torch.long)
+        valid = torch.zeros(masks, dtype=torch.bool)
+        offobject = torch.zeros(masks, dtype=torch.bool)
 
-        # One slot per *distinct* id, so a repeated draw costs one pass, not two; the slots are
-        # then fanned back out to the drawn order.
-        unique_ids, inverse = torch.unique(chosen_ids, return_inverse=True)
-        slot_of_id = torch.full((int(split.max()) + 1,), -1, dtype=torch.long)
-        slot_of_id[unique_ids] = torch.arange(len(unique_ids))
-        points = random_voxel_per_object(split, slot_of_id, len(unique_ids))[inverse]
+        # Off-object slots take the tail; only as many as the crop has background voxels to
+        # supply, so a densely annotated crop simply yields fewer of them.
+        if self.offobject_prob > 0:
+            wanted = int((torch.rand(masks) < self.offobject_prob).sum())
+            background = random_background_voxels(split, wanted)
+            if background.shape[0]:
+                out_points[masks - background.shape[0]:] = background
+                offobject[masks - background.shape[0]:] = True
+        objects = masks - int(offobject.sum())
 
-        sample[IDS_KEY] = chosen_ids
-        sample[POINTS_KEY] = points
-        sample[BOXES_KEY] = torch.from_numpy(boxes[picked]).long()
-        sample[VALID_KEY] = torch.ones(masks, dtype=torch.bool)
+        if len(ids) and objects:
+            picked = area_stratified_choice(counts, objects)
+            chosen_ids = torch.from_numpy(ids[picked]).long()
+
+            # One slot per *distinct* id, so a repeated draw costs one pass, not two; the slots
+            # are then fanned back out to the drawn order.
+            unique_ids, inverse = torch.unique(chosen_ids, return_inverse=True)
+            slot_of_id = torch.full((int(split.max()) + 1,), -1, dtype=torch.long)
+            slot_of_id[unique_ids] = torch.arange(len(unique_ids))
+            points = random_voxel_per_object(split, slot_of_id, len(unique_ids))[inverse]
+            if self.boundary_prob > 0:
+                points = self._boundary_points(split, slot_of_id, unique_ids, inverse, points)
+
+            out_ids[:objects] = chosen_ids
+            out_points[:objects] = points
+            out_boxes[:objects] = torch.from_numpy(boxes[picked]).long()
+            valid[:objects] = True
+
+        sample[IDS_KEY] = out_ids
+        sample[POINTS_KEY] = out_points
+        sample[BOXES_KEY] = out_boxes
+        sample[VALID_KEY] = valid
+        sample[OFFOBJECT_KEY] = offobject
         return sample
+
+    def _boundary_points(
+        self,
+        split: torch.Tensor,
+        slot_of_id: torch.Tensor,
+        unique_ids: torch.Tensor,
+        inverse: torch.Tensor,
+        points: torch.Tensor,
+    ) -> torch.Tensor:
+        """Swap a `boundary_prob` share of the interior clicks for clicks in the object's rim.
+
+        One `boundary_shell` pass over the crop for every object at once, then the same one-pass
+        draw as the interior click on the rim-restricted label volume. An object without a rim
+        voxel in the crop -- one that fills it -- keeps its interior click.
+        """
+        shell = boundary_shell(split, self.boundary_radius)
+        rim = torch.where(shell, split, torch.zeros_like(split))
+        rim_points = random_voxel_per_object(rim, slot_of_id, len(unique_ids))
+        has_rim = torch.bincount(rim[rim > 0], minlength=int(split.max()) + 1)[unique_ids] > 0
+        use = (torch.rand(points.shape[0]) < self.boundary_prob) & has_rim[inverse]
+        return torch.where(use.unsqueeze(1), rim_points[inverse], points)
+
+def pooled_known(labels: torch.Tensor, stride: int | Sequence[int]) -> torch.Tensor:
+    """`(B, *spatial)` labels -> `(B, 1, *spatial // stride)`: the labelled fraction of each block.
+
+    Labelled means `>= 0`: background and every object are decisions, `-1` is the absence of one --
+    a pseudo-label's unclaimed space, a crop's unannotated margin. The mask losses, the IoU the head
+    is trained to predict, and the correction clicks all weight cells by this, so an unknown voxel
+    is neither foreground nor background but silence. Without it every unlabelled voxel trains as
+    "not this object", and a model trained on truncated pseudo-masks learns a boundary wherever the
+    labeller's window ended (measured: the sam_lmd_v1 data engine's round-1 targets).
+    """
+    spatial = tuple(labels.shape[1:])
+    strides = (stride,) * len(spatial) if isinstance(stride, int) else tuple(stride)
+    if len(strides) != 3:
+        raise ValueError(f"pooled_known expects 3 spatial axes, got {len(strides)}")
+    known = (labels >= 0).to(torch.float32).unsqueeze(1)
+    return F.avg_pool3d(known, kernel_size=strides, stride=strides)
 
 
 def pooled_masks(

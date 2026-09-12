@@ -164,7 +164,7 @@ def main() -> None:
                         help="share of samples drawn from the four ground-truth volumes")
     parser.add_argument("--expect", type=int, default=None,
                         help="refuse unless exactly this many volumes have a manifest")
-    parser.add_argument("--samples-per-epoch", type=int, default=10_000)
+    parser.add_argument("--samples-per-epoch", type=int, default=100_000)
     parser.add_argument("--verify", action="store_true",
                         help="also build the dataset through mia-train's registry")
     args = parser.parse_args()

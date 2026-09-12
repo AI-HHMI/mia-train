@@ -1,4 +1,4 @@
-# sam_lmd_v1 arm `stride1`, round 0 -- ground truth only. From the released DINOv3 LVD-1689M checkpoint, 100k steps at lmd_ssl_v1 stage B's schedule. This is the arm-2 analogue, and the teacher of round 1.
+# sam_lmd_v1 arm `stride1`, round 0 -- ground truth only. From the released DINOv3 LVD-1689M checkpoint, 200k steps at lmd_ssl_v1 stage B's schedule. This is the arm-2 analogue, and the teacher of round 1.
 #
 # Arm: masks at voxel resolution. The ceiling removed entirely, at 64x the decoder's output tensors; feasible only with a B300's memory, and expected to be the slowest arm by a wide margin.
 #
@@ -57,7 +57,7 @@ attention_backend = "sdpa"  # the DECODER's kernel; sdpa is the one torch.compil
 # liconn_mouse_dg, hemibrain_ellipsoid_body), equally weighted, 8 nm, patch 256.
 name = "miao_volumes"
 config_path = "experiments/lmd_ssl_v1/lmd_finetune_singlescale.yaml"
-samples_per_epoch = 10000
+samples_per_epoch = 100000
 # FALSE, deliberately, against this repo's usual setting. With deferral on, the geometric
 # augmentation runs on the device AFTER the dataloader worker has already drawn this strategy's
 # prompts from the un-augmented labels (`PromptTargets` is a sample transform), so every click
@@ -76,7 +76,7 @@ samples_per_epoch = 32
 defer_image_ops = false
 
 [trainer]
-max_steps = 100000
+max_steps = 200000
 batch_size = 1            # per rank; x 8 ranks -> global batch 8
 lr = 0.0003
 warmup_steps = 3000
@@ -94,7 +94,7 @@ compile = true
 activation_checkpointing = true   # the head's expansion to mask resolution, where its memory goes
 log_every = 100
 val_every = 2500
-checkpoint_every = 5000
+checkpoint_every = 12500
 num_workers = 8
 seed = 0
 

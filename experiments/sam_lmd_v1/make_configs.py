@@ -38,7 +38,7 @@ DINOV3_LVD = ("/groups/miaai/miaai/pretrained_models/dinov3/"
 # encoder. SAM has one decoder and nothing to stage, so round 0 is ONE 100k-step schedule at stage
 # B's peak LR. Rounds 1 and 2 warm-start a model that has already converged under a decaying
 # schedule, which is exactly stage C's situation, so they take stage C's lower peak.
-R0_STEPS = 100_000
+R0_STEPS = 200_000
 ROUND_STEPS = 50_000
 WARMUP = 3_000
 LR_R0 = 3.0e-4
@@ -47,10 +47,12 @@ MIN_LR_RATIO = 0.001
 BATCH_PER_RANK = 1
 DP_SHARD = 8                    # one full node, global batch 8, as every lmd_ssl_v1 finetune
 WORKERS = 8
-# 10,000 rather than the finetune stages' 1,000. Statistically identical -- sampling is random with
-# replacement either way -- but at global batch 8 a 1,000-sample epoch is 125 steps, and every
-# epoch boundary respawns the workers (~4 s, measured as periodic `data_wait_frac_max` spikes).
-SAMPLES_PER_EPOCH = 10_000
+# 100,000 rather than the finetune stages' 1,000. Statistically identical -- sampling is random
+# with replacement either way -- but every epoch boundary respawns the dataloader workers (~4 s,
+# visible as a periodic `data_wait_frac_max` spike), and at global batch 8 a 1,000-sample epoch is
+# 125 steps and a 10,000-sample one 1,250: the first v2 launch ran at 10,000 and the spikes were
+# plainly visible. At 100,000 an epoch is 12,500 steps -- eight boundaries in a 100k-step round.
+SAMPLES_PER_EPOCH = 100_000
 VAL_SAMPLES = 32                # what arms 1/2 validated on; see lmd_ssl_v1/make_configs.py
 
 # The encoder block of lmd_ssl_v1 arm 2, verbatim except for the attention kernel (see comment).
@@ -118,6 +120,7 @@ BASE_HEAD: dict[str, object] = {
     "min_object_voxels": 512,
     "rounds": 3,
     "box_prob": 0.5,
+    # The v2 prompting recipe (see README, "Version 1 and why it was stopped"). Every arm.
     "attention_backend": "sdpa",
 }
 
@@ -205,7 +208,7 @@ compile = true
 activation_checkpointing = true   # the head's expansion to mask resolution, where its memory goes
 log_every = 100
 val_every = 2500
-checkpoint_every = 5000
+checkpoint_every = 12500
 num_workers = %(workers)d
 seed = 0
 

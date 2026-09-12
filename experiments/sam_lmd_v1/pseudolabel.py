@@ -36,6 +36,7 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,7 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(HERE))
 
 from blocks import (  # noqa: E402
+    IGNORE,
     block_edges,
     create_label_array,
     create_sidecar,
@@ -72,8 +74,12 @@ LABEL_AMG: dict[str, Any] = {
     "pred_iou_thresh": 0.7,
     "stability_thresh": 0.8,
     "nms_iou": 0.7,
-    "tile_merge": "propagate",
-    "propagate_min_coverage": 0.8,
+    # Windows are reconciled by agreement (`amg.consensus_labelling`): measured 2026-09-12 on the
+    # GT blocks, `propagate` 0.18 / `canvas` 0.17 precision against `consensus` 0.31 for the same
+    # masks, and with perfect masks consensus reaches the metric's ceiling where canvas halves it.
+    "tile_merge": "consensus",
+    "agree_thresh": 0.5,
+    "min_support": 1,
     "points_per_batch": 64,
 }
 
@@ -167,8 +173,21 @@ def _toml(value: Any) -> str:
     return str(value)
 
 
+def steps_for(patch: Sequence[int], tile_step: int | None) -> int:
+    """`--tile-step` (output voxels the window advances by) -> `VolumeGrid.steps_per_patch`."""
+    if tile_step is None:
+        return 2
+    steps = {p // tile_step for p in patch if p % tile_step == 0}
+    if len(steps) != 1 or any(p % tile_step for p in patch):
+        raise SystemExit(
+            f"--tile-step {tile_step} must divide every axis of the patch {list(patch)} into the "
+            "same number of steps"
+        )
+    return steps.pop()
+
+
 def run_block(algorithm: Any, resolved_cfg: dict, config_resolved: dict[str, Any],
-              box: list[list[int]]) -> tuple[Any, Any, float]:
+              box: list[list[int]], tile_step: int | None = None) -> tuple[Any, Any, float]:
     """One block through the mask generator -> (grid, VolumePrediction, seconds)."""
     from predict import resolve_patch
     from prediction.dense import select_predictor
@@ -176,7 +195,9 @@ def run_block(algorithm: Any, resolved_cfg: dict, config_resolved: dict[str, Any
 
     name = config_resolved["volume"].name
     patch = resolve_patch(config_resolved["config"], resolved_cfg, name, None)
-    grid = VolumeGrid(config_resolved["config"], name, patch, box=box)
+    grid = VolumeGrid(
+        config_resolved["config"], name, patch, box=box, steps_per_patch=steps_for(patch, tile_step)
+    )
     device = next(algorithm.parameters()).device
     started = time.perf_counter()
     prediction = select_predictor(algorithm).run(grid, device)
@@ -241,7 +262,8 @@ def cmd_label(args: argparse.Namespace) -> None:
             "normalize": volume.normalize, "normalize_min": volume.normalize_min,
             "normalize_max": volume.normalize_max,
             "run": args.run_dir.name, "run_dir": str(args.run_dir), "step": step,
-            "lattice_block": args.block, "amg": amg_settings(algorithm, amg),
+            "lattice_block": args.block, "tile_step": args.tile_step,
+            "amg": amg_settings(algorithm, amg),
             "blocks": [],
         }
     else:
@@ -254,13 +276,20 @@ def cmd_label(args: argparse.Namespace) -> None:
             )
 
     for index, box in todo:
-        grid, prediction, seconds = run_block(algorithm, resolved_cfg, resolved, box)
+        grid, prediction, seconds = run_block(
+            algorithm, resolved_cfg, resolved, box, tile_step=args.tile_step
+        )
         # Nearest-neighbour from the lattice back to the source's own voxels, ids intact (an id
         # survives an index map, not an interpolation). int32 first: ids are dense and small, and
         # the native block can be eight times the lattice block's voxels.
         native = resample_labels(
             prediction.array.astype(np.int32), tuple(int(v) for v in grid.native_extent)
         )
+        # Unclaimed voxels are written as IGNORE, not 0. In a label array 0 means "background --
+        # nobody's object", and the strategy draws its off-object prompts from label 0 to teach
+        # the IoU head to say no there. A teacher's silence is not that assertion: its recall is
+        # far below one, so most of what it did not claim IS somebody's object.
+        native[native == 0] = IGNORE
         covered = grid.native_box()
         array[tuple(slice(lo, hi) for lo, hi in covered)] = native
         claimed = float((prediction.array > 0).mean())
@@ -288,6 +317,166 @@ def cmd_label(args: argparse.Namespace) -> None:
     print(f"wrote {manifest_path} ({len(manifest['blocks'])} blocks)", flush=True)
 
 
+# -------------------------------------------------------------------------------------- oracle
+
+
+def oracle_tile_masks(
+    truth_tile: torch.Tensor, stride: Sequence[int], min_voxels: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The ground truth inside one window -> `(N, *cells)` perfect masks and unit scores.
+
+    What a perfect model would return for that window: one mask per connected component of the
+    labels within it (the object as `PromptTargets` defines it for training), of at least
+    `min_voxels`, area-pooled to the mask grid and thresholded at half as `losses.mask_iou` does.
+    """
+    from algorithms.affinity.targets import relabel_connected_cc3d
+    from algorithms.promptable.targets import pooled_masks
+
+    split = relabel_connected_cc3d(truth_tile)
+    ids, counts = torch.unique(split, return_counts=True)
+    keep = (ids > 0) & (counts >= min_voxels)
+    ids = ids[keep]
+    cells = [e // s for e, s in zip(truth_tile.shape, stride, strict=True)]
+    if ids.numel() == 0:
+        return torch.zeros((0, *cells), dtype=torch.bool), torch.zeros(0)
+    masks = pooled_masks(split[None], ids[None], tuple(stride))[0] > 0.5
+    masks = masks[masks.flatten(1).any(dim=1)]
+    return masks, torch.ones(masks.shape[0])
+
+
+def assemble_oracle(
+    tiles: Sequence[tuple[Sequence[int], Sequence[int]]],
+    patch: Sequence[int],
+    output_shape: Sequence[int],
+    truth: torch.Tensor,
+    *,
+    stride: Sequence[int],
+    tile_merge: str,
+    edge_discard: bool = False,
+    agree_thresh: float = 0.5,
+    min_support: int = 1,
+    merge_fraction: float = 0.5,
+    recall: float = 1.0,
+    seed: int = 0,
+    min_mask_voxels: int = 512,
+    report: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, int]:
+    """`PromptGridPredictor.run`'s assembly with the model's masks replaced by the truth's.
+
+    `tiles` are `VolumeGrid.tiles` (native origin, output origin), `truth` the block's labels on
+    the output lattice. `recall` < 1 keeps each window's masks independently with that
+    probability (seeded), which is the one thing the real model does that a perfect one would
+    not: find an object in one window and miss it in the next. `propagate` is not offered: a
+    continuation needs the model.
+    """
+    from algorithms.promptable.amg import (
+        Canvas,
+        consensus_labelling,
+        tile_labelling,
+        touches_tile_face,
+    )
+
+    if tile_merge not in ("canvas", "none", "consensus"):
+        raise SystemExit(f"oracle assembly supports canvas, none or consensus, not {tile_merge!r}")
+    if not 0.0 < recall <= 1.0:
+        raise SystemExit(f"--recall must be in (0, 1], got {recall}")
+    canvas_shape = [v // s for v, s in zip(output_shape, stride, strict=True)]
+    canvas = (
+        None if tile_merge == "consensus"
+        else Canvas(canvas_shape, merge_fraction, truth.device, tile_merge=tile_merge)
+    )
+    generator = torch.Generator().manual_seed(seed)
+    collected: list[tuple[tuple[int, ...], torch.Tensor]] = []
+    drawn = 0
+    for _native, out in tiles:
+        window = tuple(slice(o, o + p) for o, p in zip(out, patch, strict=True))
+        masks, scores = oracle_tile_masks(truth[window], stride, min_mask_voxels)
+        if recall < 1.0 and masks.shape[0]:
+            keep = torch.rand(masks.shape[0], generator=generator) < recall
+            masks, scores = masks[keep], scores[keep]
+        origin = [o // s for o, s in zip(out, stride, strict=True)]
+        if edge_discard and masks.shape[0]:
+            interior = [
+                (o > 0, o + p < full) for o, p, full in zip(out, patch, output_shape, strict=True)
+            ]
+            keep = ~touches_tile_face(masks, interior)
+            masks, scores = masks[keep], scores[keep]
+        drawn += int(masks.shape[0])
+        if canvas is not None:
+            canvas.add(masks, scores, origin)
+        else:
+            collected.append((tuple(origin), tile_labelling(masks, scores)))
+    if canvas is not None:
+        labels, instances = canvas.labels, canvas.instances
+    else:
+        labels, instances = consensus_labelling(
+            collected, canvas_shape, agree_thresh, min_support, report=report
+        )
+    if report is not None:
+        report["tile_masks_drawn"] = drawn
+    labels = torch.nn.functional.interpolate(
+        labels[None, None].float(), size=tuple(output_shape), mode="nearest"
+    )[0, 0].to(torch.int64)
+    return labels, instances
+
+
+def cmd_oracle(args: argparse.Namespace) -> None:
+    from miao.config import load_config
+
+    from prediction.grid import VolumeGrid
+
+    config = load_config(args.gt_config)
+    resolved = resolve_volume(config, args.volume)
+    if resolved["volume"].label_key is None:
+        raise SystemExit(f"{args.volume} has no label_key in {args.gt_config}; nothing to score")
+    name = resolved["volume"].name
+    patch = [args.patch] * 3
+    stride = (args.mask_stride,) * 3
+    settings = {
+        "oracle": True, "tile_merge": args.tile_merge, "edge_discard": bool(args.edge_discard),
+        "agree_thresh": args.agree_thresh, "min_support": args.min_support,
+        "merge_fraction": args.merge_fraction, "recall": args.recall, "seed": args.seed,
+        "min_mask_voxels": args.min_mask_voxels, "mask_stride": args.mask_stride,
+    }
+    out_report: dict[str, Any] = {
+        "volume": name, "gt_config": str(args.gt_config), "run": "oracle", "step": 0,
+        "lattice_block": args.block, "tile_step": args.tile_step, "amg": settings, "blocks": [],
+    }
+    for index, box in plan_blocks(resolved, args.block, args.blocks):
+        grid = VolumeGrid(
+            resolved["config"], name, patch, box=box,
+            steps_per_patch=steps_for(patch, args.tile_step),
+        )
+        started = time.perf_counter()
+        truth_np = grid.read_ground_truth()
+        values, inverse = np.unique(truth_np, return_inverse=True)
+        dense = np.arange(values.size, dtype=np.int64)
+        dense[values <= 0] = 0
+        truth = torch.from_numpy(dense[inverse].reshape(truth_np.shape))
+        stats: dict[str, Any] = {}
+        labels, instances = assemble_oracle(
+            grid.tiles, grid.patch, grid.output_shape, truth, stride=stride,
+            tile_merge=args.tile_merge, edge_discard=bool(args.edge_discard),
+            agree_thresh=args.agree_thresh, min_support=args.min_support,
+            merge_fraction=args.merge_fraction, recall=args.recall,
+            seed=args.seed + index, min_mask_voxels=args.min_mask_voxels, report=stats,
+        )
+        seconds = time.perf_counter() - started
+        scores = compare_labellings(labels.numpy(), truth.numpy(),
+                                    min_truth_voxels=args.min_truth_voxels)
+        scores.update(index=index, native_box_storage=grid.native_box(), tiles=len(grid.tiles),
+                      seconds=round(seconds, 1), instances=instances, consensus=stats)
+        out_report["blocks"].append(scores)
+        print(f"  block {index}: {len(grid.tiles)} tiles, {stats.get('tile_masks_drawn', 0)} "
+              f"oracle masks -> {instances} objects; {scores['pseudo_instances']} pseudo vs "
+              f"{scores['truth_instances']} true  precision@0.5 {scores['precision']:.3f}  "
+              f"recall {scores['recall']:.3f}  merges {scores['merges']}  "
+              f"fragments {scores['fragments']}  ({seconds:.0f} s)", flush=True)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(out_report, indent=2))
+    print(f"wrote {args.out}", flush=True)
+
+
 # ------------------------------------------------------------------------------------ diagnose
 
 
@@ -297,9 +486,15 @@ def compare_labellings(pred: np.ndarray, truth: np.ndarray, *, iou_thresh: float
 
     Precision is the number that matters for a training target: the fraction of pseudo-masks whose
     best-matching true object reaches `iou_thresh`. A *merge* is a pseudo-mask of which two or more
-    true objects each make up at least `part`; recall is over true objects of at least
-    `min_truth_voxels` (the same floor the strategy prompts for). Truth ids are factorised first --
-    this corpus stores 64-bit segment ids, and a pair key built by multiplication would overflow.
+    true objects each make up at least `part`; a *fragment* is the mirror image, a true object of
+    which two or more pseudo-masks each hold at least `part` -- the two ways tile assembly can go
+    wrong, joining what should stay apart and leaving apart what should be joined.
+    `truth_best_share` is how much of a true object sits under its single largest pseudo id (1 =
+    whole object under one id), `pseudo_purity` how much of a pseudo-mask is one label (background
+    counts as one).
+    Recall is over true objects of at least `min_truth_voxels` (the same floor the strategy prompts
+    for). Truth ids are factorised first -- this corpus stores 64-bit segment ids, and a pair key
+    built by multiplication would overflow.
     """
     p = pred.ravel().astype(np.int64)
     t_values, t = np.unique(truth.ravel(), return_inverse=True)
@@ -325,7 +520,8 @@ def compare_labellings(pred: np.ndarray, truth: np.ndarray, *, iou_thresh: float
     }
     if pseudo_ids.size == 0:
         result.update(precision=0.0, recall=0.0, merges=0, merge_rate=0.0,
-                      claimed_on_background=0.0, mean_best_iou=0.0)
+                      claimed_on_background=0.0, mean_best_iou=0.0, fragments=0,
+                      fragment_rate=0.0, truth_best_share=0.0, pseudo_purity=0.0)
         return result
 
     pairs, counts = np.unique(p[claimed] * n_truth + t[claimed], return_counts=True)
@@ -344,6 +540,14 @@ def compare_labellings(pred: np.ndarray, truth: np.ndarray, *, iou_thresh: float
     partners = np.bincount(pid[on_object][significant], minlength=pseudo_sizes.size)
     merges = int((partners >= 2).sum())
 
+    share_of_truth = inter / truth_sizes[tid[on_object]]
+    pieces = np.bincount(tid[on_object][share_of_truth >= part], minlength=n_truth)
+    fragments = int((pieces[truth_ids] >= 2).sum()) if truth_ids.size else 0
+    best_share = np.zeros(n_truth)
+    np.maximum.at(best_share, tid[on_object], share_of_truth)
+    purity = np.zeros(pseudo_sizes.size)
+    np.maximum.at(purity, pid, counts / pseudo_sizes[pid])
+
     result.update(
         precision=float((best_pseudo[pseudo_ids] >= iou_thresh).mean()),
         recall=float((best_truth[truth_ids] >= iou_thresh).mean()) if truth_ids.size else 0.0,
@@ -351,6 +555,10 @@ def compare_labellings(pred: np.ndarray, truth: np.ndarray, *, iou_thresh: float
         merge_rate=merges / pseudo_ids.size,
         claimed_on_background=float(counts[~on_object].sum() / n_claimed),
         mean_best_iou=float(best_pseudo[pseudo_ids].mean()),
+        fragments=fragments,
+        fragment_rate=fragments / max(int(truth_ids.size), 1),
+        truth_best_share=float(best_share[truth_ids].mean()) if truth_ids.size else 0.0,
+        pseudo_purity=float(purity[pseudo_ids].mean()),
     )
     return result
 
@@ -368,11 +576,14 @@ def cmd_diagnose(args: argparse.Namespace) -> None:
 
     report: dict[str, Any] = {
         "volume": args.volume, "gt_config": str(args.gt_config), "run": args.run_dir.name,
-        "step": step, "lattice_block": args.block, "amg": amg_settings(algorithm, amg),
+        "step": step, "lattice_block": args.block, "tile_step": args.tile_step,
+        "amg": amg_settings(algorithm, amg),
         "blocks": [],
     }
     for index, box in plan_blocks(resolved, args.block, args.blocks):
-        grid, prediction, seconds = run_block(algorithm, resolved_cfg, resolved, box)
+        grid, prediction, seconds = run_block(
+            algorithm, resolved_cfg, resolved, box, tile_step=args.tile_step
+        )
         truth = grid.read_ground_truth()
         scores = compare_labellings(prediction.array, truth, min_truth_voxels=args.min_truth_voxels)
         scores.update(index=index, native_box_storage=grid.native_box(), tiles=len(grid.tiles),
@@ -381,7 +592,8 @@ def cmd_diagnose(args: argparse.Namespace) -> None:
         print(f"  block {index}: {scores['pseudo_instances']} pseudo vs "
               f"{scores['truth_instances']} true  precision@0.5 {scores['precision']:.3f}  "
               f"recall {scores['recall']:.3f}  "
-              f"merges {scores['merges']}  claimed {100 * scores['claimed_fraction']:.1f}% "
+              f"merges {scores['merges']}  fragments {scores['fragments']}  "
+              f"claimed {100 * scores['claimed_fraction']:.1f}% "
               f"(truth fg {100 * scores['truth_foreground_fraction']:.1f}%)", flush=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2))
@@ -394,7 +606,9 @@ def cmd_summarize(args: argparse.Namespace) -> None:
     reports = [p for p in reports if p.name != "summary.json"]
     if not reports:
         raise SystemExit(f"no diagnose reports under {args.directory}")
-    rows, totals = [], {"pseudo": 0, "truth": 0, "hits": 0.0, "found": 0.0, "merges": 0}
+    rows = []
+    totals = {"pseudo": 0, "truth": 0, "hits": 0.0, "found": 0.0, "merges": 0, "fragments": 0,
+              "purity": 0.0, "share": 0.0}
     for path in reports:
         report = json.loads(path.read_text())
         blocks = report["blocks"]
@@ -403,15 +617,22 @@ def cmd_summarize(args: argparse.Namespace) -> None:
         hits = sum(b["precision"] * b["pseudo_instances"] for b in blocks)
         found = sum(b["recall"] * b["truth_instances"] for b in blocks)
         merges = sum(b["merges"] for b in blocks)
+        # Reports written before these fields existed read as 0; the table then says so.
+        fragments = sum(b.get("fragments", 0) for b in blocks)
+        purity = sum(b.get("pseudo_purity", 0.0) * b["pseudo_instances"] for b in blocks)
+        share = sum(b.get("truth_best_share", 0.0) * b["truth_instances"] for b in blocks)
         rows.append({
             "volume": report["volume"], "blocks": len(blocks), "pseudo_instances": pseudo,
             "truth_instances": truth, "precision": hits / max(pseudo, 1),
             "recall": found / max(truth, 1), "merges": merges,
             "merge_rate": merges / max(pseudo, 1),
+            "fragments": fragments, "fragment_rate": fragments / max(truth, 1),
+            "pseudo_purity": purity / max(pseudo, 1), "truth_best_share": share / max(truth, 1),
             "claimed_fraction": float(np.mean([b["claimed_fraction"] for b in blocks])),
         })
         for key, value in (("pseudo", pseudo), ("truth", truth), ("hits", hits),
-                           ("found", found), ("merges", merges)):
+                           ("found", found), ("merges", merges), ("fragments", fragments),
+                           ("purity", purity), ("share", share)):
             totals[key] += value
     summary = {
         "run": json.loads(reports[0].read_text())["run"],
@@ -423,17 +644,25 @@ def cmd_summarize(args: argparse.Namespace) -> None:
             "precision": totals["hits"] / max(totals["pseudo"], 1),
             "recall": totals["found"] / max(totals["truth"], 1),
             "merges": totals["merges"], "merge_rate": totals["merges"] / max(totals["pseudo"], 1),
+            "fragments": totals["fragments"],
+            "fragment_rate": totals["fragments"] / max(totals["truth"], 1),
+            "pseudo_purity": totals["purity"] / max(totals["pseudo"], 1),
+            "truth_best_share": totals["share"] / max(totals["truth"], 1),
         },
     }
     print(f"{'volume':30s} {'blocks':>6s} {'pseudo':>7s} {'truth':>6s} {'prec@.5':>8s} "
-          f"{'recall':>7s} {'merges':>7s} {'claimed':>8s}")
+          f"{'recall':>7s} {'merges':>7s} {'frags':>6s} {'purity':>7s} {'share':>6s} "
+          f"{'claimed':>8s}")
     for row in rows:
         print(f"{row['volume'][:30]:30s} {row['blocks']:6d} {row['pseudo_instances']:7d} "
               f"{row['truth_instances']:6d} {row['precision']:8.3f} {row['recall']:7.3f} "
-              f"{row['merges']:7d} {100 * row['claimed_fraction']:7.1f}%")
+              f"{row['merges']:7d} {row['fragments']:6d} {row['pseudo_purity']:7.3f} "
+              f"{row['truth_best_share']:6.3f} {100 * row['claimed_fraction']:7.1f}%")
     pooled = summary["pooled"]
     print(f"{'POOLED':30s} {'':6s} {pooled['pseudo_instances']:7d} {pooled['truth_instances']:6d} "
-          f"{pooled['precision']:8.3f} {pooled['recall']:7.3f} {pooled['merges']:7d}")
+          f"{pooled['precision']:8.3f} {pooled['recall']:7.3f} {pooled['merges']:7d} "
+          f"{pooled['fragments']:6d} {pooled['pseudo_purity']:7.3f} "
+          f"{pooled['truth_best_share']:6.3f}")
     out = args.out or (args.directory / "summary.json")
     out.write_text(json.dumps(summary, indent=2))
     print(f"wrote {out}")
@@ -449,14 +678,32 @@ def _amg_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--points-per-side", type=int)
     group.add_argument("--points-per-batch", type=int)
     group.add_argument("--nms-iou", type=float)
-    group.add_argument("--tile-merge", choices=("canvas", "none", "propagate"))
+    group.add_argument("--tile-merge", choices=("canvas", "none", "propagate", "consensus"))
     group.add_argument("--propagate-min-coverage", type=float)
+    group.add_argument("--agree-thresh", type=float,
+                       help="consensus: IoU two windows' masks need in their shared region")
+    group.add_argument("--min-support", type=int,
+                       help="consensus: windows that must claim a cell (capped at how many saw it)")
+    group.add_argument("--edge-discard", type=int, choices=(0, 1),
+                       help="drop masks touching an interior tile face (the reference's rule)")
+    # The merge-aware filters (amg.py `tiled_wholes`, `PromptGridPredictor._consistency`).
+    group.add_argument("--consistency-clicks", type=int)
+    group.add_argument("--consistency-thresh", type=float)
+    group.add_argument("--consistency-pick", choices=("top", "best"))
+    group.add_argument("--split-tiled-wholes", type=int, choices=(0, 1))
+    group.add_argument("--tiled-cover-thresh", type=float)
 
 
 def _collect_amg(args: argparse.Namespace) -> dict[str, Any]:
     keys = ("pred_iou_thresh", "stability_thresh", "points_per_side", "points_per_batch",
-            "nms_iou", "tile_merge", "propagate_min_coverage")
-    return {key: getattr(args, key) for key in keys if getattr(args, key, None) is not None}
+            "nms_iou", "tile_merge", "propagate_min_coverage", "consistency_clicks",
+            "consistency_thresh", "consistency_pick", "split_tiled_wholes", "tiled_cover_thresh",
+            "edge_discard", "agree_thresh", "min_support")
+    amg = {key: getattr(args, key) for key in keys if getattr(args, key, None) is not None}
+    for flag in ("split_tiled_wholes", "edge_discard"):
+        if flag in amg:
+            amg[flag] = bool(amg[flag])
+    return amg
 
 
 def main() -> None:
@@ -468,9 +715,35 @@ def main() -> None:
         p.add_argument("--volume", required=True)
         p.add_argument("--step", type=int, default=None, help="checkpoint step; default newest")
         p.add_argument("--blocks", type=int, default=1, help="how many blocks of this volume")
+        p.add_argument("--tile-step", type=int, default=None,
+                       help="output voxels the window advances by (default: half the patch)")
         p.add_argument("--block", type=int, default=512,
                        help="block edge in voxels of the training lattice (8 nm)")
         _amg_arguments(p)
+
+    oracle = sub.add_parser(
+        "oracle", help="assemble PERFECT per-window masks (from the ground truth) with a rule"
+    )
+    oracle.add_argument("--volume", required=True)
+    oracle.add_argument("--out", type=Path, required=True, help="JSON report to write")
+    oracle.add_argument("--gt-config", type=Path, default=GT_CONFIG)
+    oracle.add_argument("--blocks", type=int, default=1, help="how many blocks of this volume")
+    oracle.add_argument("--block", type=int, default=512,
+                        help="block edge in voxels of the training lattice (8 nm)")
+    oracle.add_argument("--tile-step", type=int, default=None,
+                        help="output voxels the window advances by (default: half the patch)")
+    oracle.add_argument("--patch", type=int, default=256, help="window size, output voxels")
+    oracle.add_argument("--mask-stride", type=int, default=4)
+    oracle.add_argument("--min-mask-voxels", type=int, default=512)
+    oracle.add_argument("--min-truth-voxels", type=int, default=512)
+    oracle.add_argument("--tile-merge", choices=("canvas", "none", "consensus"), default="canvas")
+    oracle.add_argument("--edge-discard", type=int, choices=(0, 1), default=0)
+    oracle.add_argument("--agree-thresh", type=float, default=0.5)
+    oracle.add_argument("--min-support", type=int, default=1)
+    oracle.add_argument("--merge-fraction", type=float, default=0.5)
+    oracle.add_argument("--recall", type=float, default=1.0,
+                        help="keep each window's masks with this probability (a model that misses)")
+    oracle.add_argument("--seed", type=int, default=0)
 
     label = sub.add_parser("label", help="pseudo-label blocks of an unlabeled volume")
     common(label)
@@ -488,10 +761,21 @@ def main() -> None:
     summarize.add_argument("directory", type=Path)
     summarize.add_argument("--out", type=Path, default=None)
 
-    args = parser.parse_args()
+    dispatch(parser.parse_args())
+
+
+COMMANDS = {"label": None, "diagnose": None, "summarize": None, "oracle": None}
+
+
+def dispatch(args: argparse.Namespace) -> None:
+    """Run the parsed subcommand. Separate from `main` so a test can drive it without a process."""
+    commands = {"label": cmd_label, "diagnose": cmd_diagnose, "summarize": cmd_summarize,
+                "oracle": cmd_oracle}
+    if set(commands) != set(COMMANDS):
+        raise RuntimeError("COMMANDS and dispatch() disagree; a subcommand was added to one only")
     if args.command in ("label", "diagnose"):
         args.amg = _collect_amg(args)
-    {"label": cmd_label, "diagnose": cmd_diagnose, "summarize": cmd_summarize}[args.command](args)
+    commands[args.command](args)
 
 
 if __name__ == "__main__":

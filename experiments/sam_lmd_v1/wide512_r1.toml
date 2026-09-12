@@ -66,7 +66,7 @@ attention_backend = "sdpa"  # the DECODER's kernel; sdpa is the one torch.compil
 # block -- written by make_round_config.py after the labelling job, and substituted by submit.sh.
 name = "miao_volumes"
 config_path = "ROUND_CONFIG"
-samples_per_epoch = 10000
+samples_per_epoch = 100000
 # FALSE, deliberately, against this repo's usual setting. With deferral on, the geometric
 # augmentation runs on the device AFTER the dataloader worker has already drawn this strategy's
 # prompts from the un-augmented labels (`PromptTargets` is a sample transform), so every click
@@ -103,7 +103,7 @@ compile = true
 activation_checkpointing = true   # the head's expansion to mask resolution, where its memory goes
 log_every = 100
 val_every = 2500
-checkpoint_every = 5000
+checkpoint_every = 12500
 num_workers = 8
 seed = 0
 

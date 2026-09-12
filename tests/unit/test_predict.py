@@ -55,7 +55,7 @@ def test_tiling_shrinks_rather_than_pads():
 
 def test_an_odd_read_shape_is_refused():
     """An odd read cannot halve into a stride: the lattice would drift half a voxel per tile."""
-    with pytest.raises(ValueError, match="must be even"):
+    with pytest.raises(ValueError, match="must divide by 2"):
         aligned_tiling(480, 205, 256)
 
 
@@ -167,6 +167,67 @@ def test_blend_weight_generalises_the_cubic_closed_form():
     assert oblong.shape == (2, 8, 8)
     # The short axis caps the weight everywhere: no voxel is more than 1 from a face along it.
     assert oblong.max() == 1.0
+
+
+def test_aligned_tiling_with_a_quarter_window_step():
+    """`steps_per_patch=4`: the window advances by a quarter, native and output strides in step."""
+    native, output, extent = aligned_tiling(480, 208, 256, steps_per_patch=4)
+    assert native == [0, 52, 104, 156, 208, 260]          # 208 / 4 = 52 native voxels per step
+    assert output == [0, 64, 128, 192, 256, 320]          # 256 / 4 = 64 output voxels per step
+    assert extent == 256 + 5 * 64
+    # Every native origin maps to its output origin by the one resampling factor 256 / 208.
+    for n, o in zip(native, output, strict=True):
+        assert n * 256 == o * 208
+    # The default reproduces the half-window lattice exactly.
+    assert aligned_tiling(480, 206, 256) == aligned_tiling(480, 206, 256, steps_per_patch=2)
+    with pytest.raises(ValueError, match="divide by 4"):
+        aligned_tiling(480, 206, 256, steps_per_patch=4)
+
+
+def test_volume_grid_quarter_step_rounds_reads_and_keeps_tiles_on_the_truth_region():
+    """The covering invariant of the test below, at a quarter-window step.
+
+    Reads are rounded UP to a multiple of the step count (71 -> 72, 342 -> 344), so every native
+    stride is whole and the tiles and `native_box()` still describe one region.
+    """
+    class FakeInfo:
+        img_spatial_axes = "zyx"
+        lbl_spatial_axes = "zyx"
+        lbl_axes = "zyx"
+        bounding_box = np.array([[0, 100], [0, 1024], [0, 1024]])
+        img_level_voxels = {0: [29.0, 6.0, 6.0]}
+        lbl_level_voxels = {0: [29.0, 6.0, 6.0]}
+
+        class scales:
+            chosen_levels = [0]
+            label_chosen_levels = [0]
+            read_shapes = [np.array([71, 342, 342])]
+
+    from prediction.grid import VolumeGrid
+
+    grid = VolumeGrid.__new__(VolumeGrid)
+    grid.volume = None
+    grid.patch = [256, 256, 256]
+    grid.info = FakeInfo()
+    grid.axes = "zyx"
+    grid.rank = 3
+    grid.image_level = 0
+    grid.label_level = 0
+    grid.image_voxel = FakeInfo.img_level_voxels[0]
+    grid.steps_per_patch = 4
+    VolumeGrid._resolve_geometry(grid, None, "fake")
+
+    assert grid.read == [72, 344, 344]
+    assert grid.output_origins[1][:3] == [0, 64, 128]
+    assert grid.native_origins[1][:3] == [0, 86, 172]
+    assert grid.native_origins[0] == [0, 18]                 # 100 slices, 72-slice tiles, stride 18
+    counts = [len(o) for o in grid.native_origins]
+    assert len(grid.tiles) == counts[0] * counts[1] * counts[2]
+    tiles = grid.tiles
+    for axis in range(3):
+        starts = [native[axis] for native, _ in tiles]
+        low, high = min(starts), max(starts) + grid.read[axis]
+        assert [low, high] == grid.native_box()[axis]
 
 
 def test_tiles_and_ground_truth_cover_the_same_region():

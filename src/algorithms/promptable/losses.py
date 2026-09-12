@@ -8,6 +8,11 @@ folded into the losses.
 Targets are *soft*, in [0, 1], because they arrive area-pooled from voxel resolution
 (`targets.pooled_masks`). Focal and dice both accept that reading without modification; the IoU the
 prediction head is trained against does not, so it thresholds.
+
+Every function takes an optional `weight` of the targets' shape (broadcastable), the labelled
+fraction of each cell from `targets.pooled_known`: a cell of unknown voxels weighs nothing, so it
+is neither penalised nor rewarded and does not count in an IoU. `None` is all ones, and every
+function reproduces its unweighted value exactly under all-ones weights.
 """
 
 from __future__ import annotations
@@ -16,10 +21,18 @@ import torch
 import torch.nn.functional as F
 
 
+def _weights(targets: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
+    return torch.ones_like(targets) if weight is None else weight.expand_as(targets)
+
+
 def focal_loss(
-    logits: torch.Tensor, targets: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.25,
+    gamma: float = 2.0,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Mean focal loss per candidate mask -> `(P, K)`.
+    """Weighted mean focal loss per candidate mask -> `(P, K)`.
 
     The reference's weights. `gamma` down-weights voxels the model already gets right, which in a
     3D crop is nearly all of them: an object occupying 1% of the volume leaves 99% easy background,
@@ -31,26 +44,36 @@ def focal_loss(
     loss = cross_entropy * (1 - agreement).pow(gamma)
     if alpha >= 0:
         loss = loss * (alpha * targets + (1 - alpha) * (1 - targets))
-    return loss.flatten(2).mean(-1)
+    w = _weights(targets, weight).flatten(2)
+    return (loss.flatten(2) * w).sum(-1) / w.sum(-1).clamp_min(1e-6)
 
 
-def dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
-    """Soft dice loss per candidate mask -> `(P, K)`.
+def dice_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    eps: float = 1.0,
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Soft dice loss per candidate mask -> `(P, K)`, over the weighted cells.
 
     Scale-free where focal is not: it is a ratio of overlaps, so a 200-voxel object and a
     200,000-voxel one contribute comparably. That is what keeps the small objects in a microscopy
     crop from being optimised away, and it is why the reference combines the two rather than
     picking one.
     """
-    probabilities = logits.sigmoid().flatten(2)
-    flat = targets.flatten(2)
+    w = _weights(targets, weight).flatten(2)
+    probabilities = logits.sigmoid().flatten(2) * w
+    flat = targets.flatten(2) * w
     intersection = (probabilities * flat).sum(-1)
     denominator = probabilities.sum(-1) + flat.sum(-1)
     return 1 - (2 * intersection + eps) / (denominator + eps)
 
 
 def mask_iou(
-    logits: torch.Tensor, targets: torch.Tensor, target_threshold: float = 0.5
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    target_threshold: float = 0.5,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """IoU of the thresholded prediction against the thresholded target -> `(P, K)`.
 
@@ -64,12 +87,15 @@ def mask_iou(
     """
     predicted = logits > 0
     actual = targets > target_threshold
-    intersection = (predicted & actual).flatten(2).sum(-1)
-    union = (predicted | actual).flatten(2).sum(-1)
-    return intersection / union.clamp_min(1)
+    w = _weights(targets, weight).flatten(2)
+    intersection = ((predicted & actual).flatten(2) * w).sum(-1)
+    union = ((predicted | actual).flatten(2) * w).sum(-1)
+    return intersection / union.clamp_min(1e-6)
 
 
-def voxel_mask_iou(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+def voxel_mask_iou(
+    logits: torch.Tensor, targets: torch.Tensor, weight: torch.Tensor | None = None
+) -> torch.Tensor:
     """IoU at VOXEL resolution, computed on the coarse grid -> `(P, K)`.
 
     `mask_iou` scores the prediction against the *pooled* target, so both live on the mask grid and
@@ -95,10 +121,14 @@ def voxel_mask_iou(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     objects under 4k voxels, against 0.912 at stride 2. So the two numbers are far apart, and the
     coarse one is the misleading one.
     """
-    predicted = (logits > 0).to(targets.dtype)
-    flat_predicted, flat_targets = predicted.flatten(2), targets.flatten(2)
-    intersection = (flat_predicted * flat_targets).sum(-1)
-    union = flat_predicted.sum(-1) + flat_targets.sum(-1) - intersection
+    w = _weights(targets, weight).flatten(2)
+    # With `w` the labelled fraction of a block and `t` the object's share of the labelled voxels,
+    # a predicted block holds `w * t` true and `w` counted voxels (over `stride^3`), so the same
+    # closed form scores the labelled voxels only.
+    predicted = (logits > 0).to(targets.dtype).flatten(2) * w
+    flat_targets = targets.flatten(2)
+    intersection = (predicted * flat_targets).sum(-1)
+    union = predicted.sum(-1) + (w * flat_targets).sum(-1) - intersection
     return intersection / union.clamp_min(1e-6)
 
 

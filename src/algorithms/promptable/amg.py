@@ -51,6 +51,7 @@ from prediction.grid import VolumeGrid
 from prediction.types import VolumePrediction
 
 PREFER = ("whole", "part")
+CONSISTENCY_PICK = ("top", "best")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -224,7 +225,257 @@ def resolve_containment(
     return torch.nonzero(alive, as_tuple=True)[0]
 
 
-TILE_MERGE = ("canvas", "none", "propagate")
+def interior_points(mask: torch.Tensor, logits: torch.Tensor, count: int) -> torch.Tensor:
+    """`count` well-separated cells inside one `(*grid)` mask -> `(k, rank)` indices, k <= count.
+
+    The first is the mask's most confident cell; each further one is the mask cell farthest from
+    every point chosen so far (farthest-point sampling). So for a mask made of two lobes, the second
+    point lands in the other lobe -- which is the whole reason to ask the model again from there.
+    """
+    cells = torch.nonzero(mask, as_tuple=False)
+    if cells.shape[0] == 0 or count < 1:
+        return cells[:0]
+    chosen = [int(logits[mask].argmax())]
+    if count > 1 and cells.shape[0] > 1:
+        position = cells.to(torch.float32)
+        nearest = ((position - position[chosen[0]]) ** 2).sum(-1)
+        for _ in range(min(count, cells.shape[0]) - 1):
+            farthest = int(nearest.argmax())
+            chosen.append(farthest)
+            nearest = torch.minimum(nearest, ((position - position[farthest]) ** 2).sum(-1))
+    return cells[torch.tensor(chosen, device=cells.device)]
+
+
+def tiled_wholes(
+    masks: torch.Tensor,
+    scores: torch.Tensor,
+    containment_thresh: float,
+    cover_thresh: float,
+    duplicate_iou: float,
+    min_parts: int = 2,
+    part_overlap: float = 0.2,
+) -> torch.Tensor:
+    """Which `(N, *grid)` masks are tiled by two or more disjoint smaller masks -> `(N,)` bool.
+
+    A merge -- one mask spanning two neighbouring objects -- usually arrives with its own evidence:
+    the grid also clicked inside each object it spans, and those clicks produced confident masks of
+    the objects on their own. `resolve_containment(prefer="whole")` would keep the merge and drop
+    them, which is the right call for a nucleus inside a cell and the wrong one here. This tells
+    the two cases apart by what the contained masks add up to: a nucleus is one part covering a
+    fraction of its cell, a merge is several disjoint parts that together cover almost all of it.
+
+    A mask is flagged when at least `min_parts` of its contained masks (`|A & M| / |A| >=
+    containment_thresh`, not a duplicate of `M`, smaller than `M`), chosen greedily by score and
+    pairwise overlapping by less than `part_overlap` of themselves, together cover at least
+    `cover_thresh` of it. The parts themselves are left alone -- dropping the flagged whole is what
+    lets them through containment and NMS as ordinary masks.
+    """
+    count = masks.shape[0]
+    flagged = torch.zeros(count, dtype=torch.bool, device=masks.device)
+    if count < min_parts + 1:
+        return flagged
+    areas = masks.flatten(1).sum(-1).to(torch.float32)
+    boxes = mask_boxes(masks)
+    for index in range(count):
+        others = torch.arange(count, device=masks.device)
+        others = others[
+            (others != index) & (areas[others] < areas[index])
+            & boxes_intersect(boxes[index : index + 1], boxes[others])[0]
+        ]
+        if others.numel() < min_parts:
+            continue
+        inter = pairwise_intersection(masks[index : index + 1], masks[others])[0]
+        inside = inter / areas[others].clamp_min(1)
+        iou = inter / (areas[index] + areas[others] - inter).clamp_min(1)
+        parts = others[(inside >= containment_thresh) & (iou < duplicate_iou)]
+        if parts.numel() < min_parts:
+            continue
+        # Greedy by score, so the confident answers define the tiling; a part overlapping what is
+        # already tiled by more than `part_overlap` of itself is a duplicate answer, not a new part.
+        union = torch.zeros_like(masks[index])
+        accepted = 0
+        for part in parts[scores[parts].argsort(descending=True)].tolist():
+            overlap = (masks[part] & union).sum().to(torch.float32) / areas[part].clamp_min(1)
+            if overlap > part_overlap:
+                continue
+            union |= masks[part]
+            accepted += 1
+        covered = (union & masks[index]).sum().to(torch.float32) / areas[index].clamp_min(1)
+        flagged[index] = accepted >= min_parts and bool(covered >= cover_thresh)
+    return flagged
+
+
+TILE_MERGE = ("canvas", "none", "propagate", "consensus")
+
+#: A mask counts as reaching into a shared region when at least this many of its cells lie there;
+#: below it, two windows' boundary jitter would be read as a disagreement.
+MIN_SHARED_CELLS = 8
+
+
+def tile_labelling(masks: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+    """`(N, *tile)` masks -> `(*tile)` int32 map of local ids 1..N; a better score wins overlaps."""
+    out = torch.zeros(masks.shape[1:], dtype=torch.int32, device=masks.device)
+    for index in scores.argsort(descending=True, stable=True).tolist():
+        out[masks[index] & (out == 0)] = index + 1
+    return out
+
+
+def consensus_labelling(
+    tiles: Sequence[tuple[Sequence[int], torch.Tensor]],
+    shape: Sequence[int],
+    agree_thresh: float,
+    min_support: int = 1,
+    report: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Every window's masks, reconciled by agreement between windows -> `(*shape)` labels, count.
+
+    `tiles` holds, per window, its origin on the mask grid and its `tile_labelling` map. Two masks
+    from two windows are the same object when they agree where BOTH windows looked: their IoU
+    inside the two windows' shared region reaches `agree_thresh`, and each is the other's best
+    match there (mutual best, so a mask that spans two objects cannot bridge them -- it is joined
+    to the one it matches best and disputed on the other). Agreements are chained with union-find,
+    which is how an object longer than a window gets one id.
+
+    Then every window votes: a cell takes the class that the windows covering it assigned, and a
+    cell that two windows assign to DIFFERENT classes is left unlabelled (0) rather than given to
+    whichever window came first. A window that saw a cell and drew no mask there is not a vote
+    against -- the grid misses about half of what it clicks on -- so unlabelled means disputed or
+    unseen-by-any-mask, never "background by majority". `min_support` asks a cell to be claimed
+    by at least that many windows, capped at the number of windows that actually covered it, so
+    the block's borders are not erased for lack of a second look.
+
+    The alternative this replaces painted first-come and joined on one-sided coverage; measured on
+    this repo's data, that rule got WORSE with more windows (finer steps multiplied its mistakes and
+    added no corrections), which is the signature of a rule that cannot use evidence.
+
+    `report`, if given, receives counts of what happened to every mask that reaches into a shared
+    region with at least `MIN_SHARED_CELLS` cells: `joined` (agreed with a mutual best match),
+    `disagreed` (overlapped the other window's masks but did not agree), `unmet` (the other window
+    drew nothing there at all). The last is the one no joining rule can fix: the object was found
+    in one window and missed in the next.
+    """
+    if not 0.0 < agree_thresh <= 1.0:
+        raise ValueError(f"agree_thresh must be in (0, 1], got {agree_thresh}")
+    if min_support < 1:
+        raise ValueError(f"min_support must be at least 1, got {min_support}")
+    shape = tuple(int(v) for v in shape)
+    stats = {"joined": 0, "disagreed": 0, "unmet": 0, "disagreed_best_iou_sum": 0.0}
+    if report is not None:
+        report.update(stats)
+    if not tiles:
+        return torch.zeros(shape, dtype=torch.int64), 0
+    device = tiles[0][1].device
+    rank = len(shape)
+
+    offsets: list[int] = []
+    total = 0
+    boxes: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    for origin, local in tiles:
+        if local.dim() != rank or len(origin) != rank:
+            raise ValueError(
+                f"tile at {tuple(origin)} with shape {tuple(local.shape)} is not rank {rank}"
+            )
+        offsets.append(total)
+        total += int(local.max()) if local.numel() else 0
+        lo = tuple(int(o) for o in origin)
+        boxes.append((lo, tuple(o + e for o, e in zip(lo, local.shape, strict=True))))
+
+    parent = list(range(total + 1))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    def in_region(index: int, lo: Sequence[int], hi: Sequence[int]) -> torch.Tensor:
+        origin, local = tiles[index]
+        window = tuple(
+            slice(low - o, high - o) for low, high, o in zip(lo, hi, origin, strict=True)
+        )
+        ids = local[window].long()
+        return torch.where(ids > 0, ids + offsets[index], torch.zeros_like(ids))
+
+    for t in range(len(tiles)):
+        for u in range(t + 1, len(tiles)):
+            lo = [max(a, b) for a, b in zip(boxes[t][0], boxes[u][0], strict=True)]
+            hi = [min(a, b) for a, b in zip(boxes[t][1], boxes[u][1], strict=True)]
+            if any(high <= low for low, high in zip(lo, hi, strict=True)):
+                continue
+            a, b = in_region(t, lo, hi), in_region(u, lo, hi)
+            # Sizes INSIDE the shared region: a mask is compared only where the other window
+            # could have seen the same object, never on what lies beyond that window's edge.
+            sizes_a = torch.bincount(a[a > 0], minlength=total + 1)
+            sizes_b = torch.bincount(b[b > 0], minlength=total + 1)
+            present_a = torch.nonzero(sizes_a >= MIN_SHARED_CELLS).flatten()
+            present_b = torch.nonzero(sizes_b >= MIN_SHARED_CELLS).flatten()
+            both = (a > 0) & (b > 0)
+            if not bool(both.any()):
+                stats["unmet"] += int(present_a.numel() + present_b.numel())
+                continue
+            ua, ia = torch.unique(a[both], return_inverse=True)
+            ub, ib = torch.unique(b[both], return_inverse=True)
+            inter = torch.zeros(ua.numel(), ub.numel(), device=device)
+            inter.index_put_((ia, ib), torch.ones_like(ia, dtype=torch.float32), accumulate=True)
+            size_a = sizes_a[ua].float()
+            size_b = sizes_b[ub].float()
+            iou = inter / (size_a[:, None] + size_b[None, :] - inter).clamp_min(1.0)
+            best_b = iou.argmax(dim=1)
+            best_a = iou.argmax(dim=0)
+            rows = torch.arange(ua.numel(), device=device)
+            mutual = best_a[best_b] == rows
+            ok = mutual & (iou[rows, best_b] >= agree_thresh)
+            for i, j in zip(ua[ok].tolist(), ub[best_b[ok]].tolist(), strict=True):
+                union(i, j)
+            if report is not None:
+                cols = torch.arange(ub.numel(), device=device)
+                ok_b = (best_b[best_a] == cols) & (iou[best_a, cols] >= agree_thresh)
+                big_a, big_b = size_a >= MIN_SHARED_CELLS, size_b >= MIN_SHARED_CELLS
+                stats["joined"] += int((ok & big_a).sum() + (ok_b & big_b).sum())
+                stats["disagreed"] += int((~ok & big_a).sum() + (~ok_b & big_b).sum())
+                stats["disagreed_best_iou_sum"] += float(
+                    iou[rows, best_b][~ok & big_a].sum() + iou[best_a, cols][~ok_b & big_b].sum()
+                )
+                met = torch.isin(present_a, ua).sum() + torch.isin(present_b, ub).sum()
+                stats["unmet"] += int(present_a.numel() + present_b.numel() - met)
+
+    roots = torch.tensor([find(x) for x in range(total + 1)], dtype=torch.int64, device=device)
+    roots[0] = 0
+
+    first = torch.zeros(shape, dtype=torch.int64, device=device)
+    support = torch.zeros(shape, dtype=torch.int32, device=device)
+    seen = torch.zeros(shape, dtype=torch.int32, device=device)
+    conflict = torch.zeros(shape, dtype=torch.bool, device=device)
+    for (origin, local), offset in zip(tiles, offsets, strict=True):
+        window = tuple(slice(o, o + e) for o, e in zip(origin, local.shape, strict=True))
+        ids = local.long()
+        classes = roots[torch.where(ids > 0, ids + offset, torch.zeros_like(ids))]
+        has = classes > 0
+        seen[window] += 1
+        f, sup, con = first[window], support[window], conflict[window]
+        new = has & (f == 0)
+        f[new] = classes[new]
+        sup[new] = 1
+        same = has & ~new & (f == classes)
+        sup[same] += 1
+        con |= has & ~new & (f != classes)
+
+    need = torch.minimum(torch.full_like(seen, min_support), seen)
+    labels = torch.where(~conflict & (support >= need), first, torch.zeros_like(first))
+    kept = torch.unique(labels)
+    kept = kept[kept > 0]
+    lut = torch.zeros(total + 1, dtype=torch.int64, device=device)
+    lut[kept] = torch.arange(1, kept.numel() + 1, device=device)
+    if report is not None:
+        report.update(stats)
+        report["disputed_cells"] = int(conflict.sum())
+        report["tile_masks"] = total
+    return lut[labels], int(kept.numel())
 
 
 class Canvas:
@@ -427,17 +678,43 @@ class PromptGridPredictor:
         edge_discard: bool = False,
         skip_claimed_clicks: bool = False,
         propagate_min_coverage: float = 0.8,
+        consistency_clicks: int = 0,
+        consistency_thresh: float = 0.5,
+        consistency_pick: str = "top",
+        split_tiled_wholes: bool = False,
+        tiled_cover_thresh: float = 0.8,
+        agree_thresh: float = 0.5,
+        min_support: int = 1,
     ) -> None:
         if prefer not in PREFER:
             raise ValueError(f"prefer must be one of {PREFER}, got {prefer!r}")
         if tile_merge not in TILE_MERGE:
             raise ValueError(f"tile_merge must be one of {TILE_MERGE}, got {tile_merge!r}")
+        if not 0.0 < agree_thresh <= 1.0:
+            raise ValueError(f"agree_thresh must be in (0, 1], got {agree_thresh}")
+        if min_support < 1:
+            raise ValueError(f"min_support must be at least 1, got {min_support}")
         if points_per_batch < 1:
             raise ValueError(f"points_per_batch must be at least 1, got {points_per_batch}")
         if not 0.0 < propagate_min_coverage <= 1.0:
             raise ValueError(
                 f"propagate_min_coverage must be in (0, 1], got {propagate_min_coverage}"
             )
+        if consistency_clicks < 0:
+            raise ValueError(f"consistency_clicks must not be negative, got {consistency_clicks}")
+        if consistency_pick not in CONSISTENCY_PICK:
+            raise ValueError(
+                f"consistency_pick must be one of {CONSISTENCY_PICK}, got {consistency_pick!r}"
+            )
+        if not 0.0 < consistency_thresh <= 1.0 or not 0.0 < tiled_cover_thresh <= 1.0:
+            raise ValueError("consistency_thresh and tiled_cover_thresh must be in (0, 1]")
+        self.consistency_clicks = consistency_clicks
+        self.consistency_thresh = consistency_thresh
+        self.consistency_pick = consistency_pick
+        self.split_tiled_wholes = split_tiled_wholes
+        self.tiled_cover_thresh = tiled_cover_thresh
+        self.agree_thresh = agree_thresh
+        self.min_support = min_support
         self.algorithm = algorithm
         self.points_per_side = points_per_side
         self.points_per_batch = points_per_batch
@@ -472,6 +749,13 @@ class PromptGridPredictor:
             "edge_discard": self.edge_discard,
             "skip_claimed_clicks": self.skip_claimed_clicks,
             "propagate_min_coverage": self.propagate_min_coverage,
+            "consistency_clicks": self.consistency_clicks,
+            "consistency_thresh": self.consistency_thresh,
+            "consistency_pick": self.consistency_pick,
+            "split_tiled_wholes": self.split_tiled_wholes,
+            "tiled_cover_thresh": self.tiled_cover_thresh,
+            "agree_thresh": self.agree_thresh,
+            "min_support": self.min_support,
         }
 
     def _bounds(self, extent: Sequence[int]) -> tuple[int, float]:
@@ -540,6 +824,18 @@ class PromptGridPredictor:
         masks = torch.cat([k[0] for k in kept])
         scores = torch.cat([k[1] for k in kept])
         logits = torch.cat([k[2] for k in kept])
+        # The merge-aware filters, BEFORE containment: a rejected merge must not have already
+        # suppressed the parts it was made of. Tiling first, because it costs no decodes and
+        # leaves fewer masks for the clicks to check.
+        if self.split_tiled_wholes and masks.shape[0]:
+            merged = tiled_wholes(
+                masks, scores, self.containment_thresh, self.tiled_cover_thresh, self.nms_iou
+            )
+            masks, scores, logits = masks[~merged], scores[~merged], logits[~merged]
+        if self.consistency_clicks > 0 and masks.shape[0]:
+            agreement = self._consistency(image, image_coords, grid, extent, masks, logits)
+            keep = agreement >= self.consistency_thresh
+            masks, scores, logits = masks[keep], scores[keep], logits[keep]
         # Nesting first, duplicates second -- see `resolve_containment` for why the order matters.
         keep = resolve_containment(
             masks, scores, self.prefer, self.containment_thresh, duplicate_iou=self.nms_iou
@@ -547,6 +843,66 @@ class PromptGridPredictor:
         masks, scores, logits = masks[keep], scores[keep], logits[keep]
         keep = mask_nms(masks, scores, self.nms_iou)
         return masks[keep], scores[keep], logits[keep]
+
+    @torch.no_grad()
+    def _consistency(
+        self,
+        image: torch.Tensor,
+        image_coords: torch.Tensor,
+        grid: tuple[int, ...],
+        extent: Sequence[int],
+        masks: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Ask the model again from inside each mask -> `(N,)` agreement, the min over the clicks.
+
+        The gates judge a mask by itself -- the IoU head's confidence, the boundary's stability --
+        and a mask that merges two neighbouring objects passes both: it is a clean, stable,
+        plausible object, and nothing about it alone says it is two. This uses the model's own
+        promptability as an independent witness. `consistency_clicks` well-separated interior
+        points of the mask are clicked one at a time (the grid's prompt type, asked from a
+        different place), and each answer is compared with the mask. One object gives back the
+        same mask from anywhere inside it; a merge gives back a lobe from a click in that lobe.
+
+        `consistency_pick` decides which of the three candidates an answer is: `"top"`, the one
+        the IoU head ranks first, or `"best"`, the one most like the mask. `"best"` only rejects
+        masks the model cannot reproduce from inside at all; `"top"` also rejects a merge whose
+        lobe the model is more confident about than the whole -- which is the case the diagnostic
+        shows, since in this corpus a confident sub-part candidate is itself the anomaly (the
+        targets are whole cells, so the head learns to score sub-parts low). Reduced by `min`: an
+        object has to be claimed from every part of itself.
+        """
+        device = masks.device
+        stride = torch.tensor(self.algorithm.mask_stride, device=device)
+        owners, cells = [], []
+        for index in range(masks.shape[0]):
+            points = interior_points(masks[index], logits[index], self.consistency_clicks)
+            owners.append(torch.full((points.shape[0],), index, device=device))
+            cells.append(points)
+        owner = torch.cat(owners)
+        clicks = torch.cat(cells).to(torch.float32) * stride + (stride - 1).float() / 2
+        coords = voxel_coords(clicks, extent).unsqueeze(1)
+        labels = torch.full((clicks.shape[0], 1), FOREGROUND, device=device)
+
+        agreement = torch.ones(masks.shape[0], device=device)
+        for start in range(0, clicks.shape[0], self.points_per_batch):
+            batch_coords = coords[start : start + self.points_per_batch]
+            batch_owner = owner[start : start + self.points_per_batch]
+            out, ious = self.algorithm.decode_points(
+                image.expand(batch_coords.shape[0], -1, -1), image_coords, grid,
+                batch_coords, labels[start : start + self.points_per_batch], multimask=True,
+            )
+            candidates = out.float() > 0                       # (b, K, *grid)
+            own = masks[batch_owner].unsqueeze(1)              # (b, 1, *grid)
+            inter = (candidates & own).flatten(2).sum(-1).to(torch.float32)
+            union = (candidates | own).flatten(2).sum(-1).to(torch.float32)
+            iou = inter / union.clamp_min(1)                   # (b, K)
+            if self.consistency_pick == "top":
+                picked = iou.gather(1, ious.argmax(dim=1, keepdim=True)).squeeze(1)
+            else:
+                picked = iou.max(dim=1).values
+            agreement.scatter_reduce_(0, batch_owner, picked, reduce="amin", include_self=True)
+        return agreement
 
     @torch.no_grad()
     def segment_tile(self, volume: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -618,10 +974,14 @@ class PromptGridPredictor:
                     f"{name} shape {tuple(values)} is not divisible by the mask stride {stride}; "
                     "the masks are assembled on the mask grid and every tile must land on it"
                 )
-        canvas = Canvas(
-            [v // s for v, s in zip(grid.output_shape, stride, strict=True)],
-            self.merge_fraction, device, tile_merge=self.tile_merge,
+        canvas_shape = [v // s for v, s in zip(grid.output_shape, stride, strict=True)]
+        # "consensus" keeps every window's labelling and reconciles them once, at the end; the
+        # other modes paint into one canvas as they go.
+        canvas = (
+            None if self.tile_merge == "consensus"
+            else Canvas(canvas_shape, self.merge_fraction, device, tile_merge=self.tile_merge)
         )
+        collected: list[tuple[tuple[int, ...], torch.Tensor]] = []
         handle = grid.image_handle()
         tiles = grid.tiles
         print(f"{len(tiles)} tiles of {grid.patch} -> output {grid.output_shape}; "
@@ -636,9 +996,12 @@ class PromptGridPredictor:
             shape = tuple(e // s for e, s in zip(extent, stride, strict=True))
             with torch.autocast(device.type, dtype=torch.bfloat16):
                 image, image_coords, token_grid = self.algorithm.encode(volume)
-                if self.tile_merge == "propagate":
+                if canvas is not None and self.tile_merge == "propagate":
                     self._propagate(canvas, origin, image, image_coords, token_grid, extent)
-                skip = canvas.claimed(origin, shape) if self.skip_claimed_clicks else None
+                skip = (
+                    canvas.claimed(origin, shape)
+                    if canvas is not None and self.skip_claimed_clicks else None
+                )
                 masks, scores, logits = self.decode_grid(
                     image, image_coords, token_grid, extent, skip=skip
                 )
@@ -649,15 +1012,33 @@ class PromptGridPredictor:
                 ]
                 keep = ~touches_tile_face(masks, interior)
                 masks, scores, logits = masks[keep], scores[keep], logits[keep]
-            canvas.add(masks, scores, origin, logits if canvas.logits is not None else None)
+            if canvas is not None:
+                canvas.add(masks, scores, origin, logits if canvas.logits is not None else None)
+                so_far = canvas.instances
+            else:
+                collected.append((tuple(origin), tile_labelling(masks, scores)))
+                so_far = sum(int(t.max()) for _, t in collected)
             if (index + 1) % 10 == 0 or index + 1 == len(tiles):
-                print(f"  {index + 1}/{len(tiles)}  {canvas.instances} instances so far",
-                      flush=True)
-
+                what = "instances" if canvas is not None else "tile masks"
+                print(f"  {index + 1}/{len(tiles)}  {so_far} {what} so far", flush=True)
+        if canvas is not None:
+            labels, instances = canvas.labels, canvas.instances
+        else:
+            report: dict[str, Any] = {}
+            labels, instances = consensus_labelling(
+                collected, canvas_shape, self.agree_thresh, self.min_support, report=report
+            )
+            checks = report["joined"] + report["disagreed"] + report["unmet"]
+            mean_iou = report["disagreed_best_iou_sum"] / max(report["disagreed"], 1)
+            print(f"  consensus: {report['tile_masks']} tile masks -> {instances} objects; of "
+                  f"{checks} mask-in-shared-region checks {report['joined']} joined, "
+                  f"{report['disagreed']} disagreed (best IoU {mean_iou:.2f}), "
+                  f"{report['unmet']} met no mask in the other window; "
+                  f"{report['disputed_cells']} cells disputed", flush=True)
         # Back to voxel resolution with nearest-neighbour: the labelling has no information below
         # the mask stride, and interpolating ids would invent new ones.
         labels = F.interpolate(
-            canvas.labels[None, None].float(), size=tuple(grid.output_shape), mode="nearest"
+            labels[None, None].float(), size=tuple(grid.output_shape), mode="nearest"
         )[0, 0].to(torch.int64)
         array: np.ndarray = labels.cpu().numpy()
         return VolumePrediction(
@@ -665,7 +1046,7 @@ class PromptGridPredictor:
             kind="instances",
             attrs={
                 "background_id": 0,
-                "instances": canvas.instances,
+                "instances": instances,
                 "mask_stride": list(stride),
                 "generator": "prompt_grid",
                 **self.settings(),

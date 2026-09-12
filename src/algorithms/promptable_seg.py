@@ -59,15 +59,19 @@ from .promptable.losses import best_of, dice_loss, focal_loss, mask_iou, voxel_m
 from .promptable.targets import (
     BOXES_KEY,
     IDS_KEY,
+    OFFOBJECT_KEY,
     POINTS_KEY,
     SPLIT_LABEL_KEY,
     VALID_KEY,
     PromptTargets,
+    pooled_known,
     pooled_masks,
 )
 from .registry import AlgorithmRegistry
 
 SPATIAL_RANK = 3
+#: What `PromptTargets` attaches to a sample and `_step` reads back, in one place.
+_OBJECT_KEYS = (SPLIT_LABEL_KEY, IDS_KEY, POINTS_KEY, BOXES_KEY, VALID_KEY, OFFOBJECT_KEY)
 
 
 @AlgorithmRegistry.register("promptable_seg")
@@ -121,6 +125,9 @@ class PromptableSegmentation(BaseAlgorithm):
         mask_upscale_hidden: int | None = None,
         masks_per_sample: int = 16,
         min_object_voxels: int = 64,
+        offobject_prob: float = 0.0,
+        boundary_prob: float = 0.0,
+        boundary_radius: int = 1,
         rounds: int = 3,
         box_prob: float = 0.5,
         box_noise: float = 0.1,
@@ -145,6 +152,13 @@ class PromptableSegmentation(BaseAlgorithm):
         edge_discard: bool = False,
         skip_claimed_clicks: bool = False,
         propagate_min_coverage: float = 0.8,
+        consistency_clicks: int = 0,
+        consistency_thresh: float = 0.5,
+        consistency_pick: str = "top",
+        split_tiled_wholes: bool = False,
+        tiled_cover_thresh: float = 0.8,
+        agree_thresh: float = 0.5,
+        min_support: int = 1,
     ) -> None:
         super().__init__(model, dataset)
         if rounds < 1:
@@ -189,6 +203,13 @@ class PromptableSegmentation(BaseAlgorithm):
             "edge_discard": edge_discard,
             "skip_claimed_clicks": skip_claimed_clicks,
             "propagate_min_coverage": propagate_min_coverage,
+            "consistency_clicks": consistency_clicks,
+            "consistency_thresh": consistency_thresh,
+            "consistency_pick": consistency_pick,
+            "split_tiled_wholes": split_tiled_wholes,
+            "tiled_cover_thresh": tiled_cover_thresh,
+            "agree_thresh": agree_thresh,
+            "min_support": min_support,
         }
 
         patch = cast(Any, model).patch_size
@@ -243,6 +264,9 @@ class PromptableSegmentation(BaseAlgorithm):
             label_key=label_key,
             masks_per_sample=masks_per_sample,
             min_object_voxels=min_object_voxels,
+            offobject_prob=offobject_prob,
+            boundary_prob=boundary_prob,
+            boundary_radius=boundary_radius,
         )
         self._delegated = False
 
@@ -299,7 +323,7 @@ class PromptableSegmentation(BaseAlgorithm):
         if SPLIT_LABEL_KEY in batch:
             return {
                 key: batch[key]
-                for key in (SPLIT_LABEL_KEY, IDS_KEY, POINTS_KEY, BOXES_KEY, VALID_KEY)
+                for key in _OBJECT_KEYS
             }
         if self.label_key not in batch:
             raise KeyError(
@@ -315,11 +339,15 @@ class PromptableSegmentation(BaseAlgorithm):
         ]
         return {
             key: torch.stack([sample[key] for sample in samples])
-            for key in (SPLIT_LABEL_KEY, IDS_KEY, POINTS_KEY, BOXES_KEY, VALID_KEY)
+            for key in _OBJECT_KEYS
         }
 
     def _initial_prompt(
-        self, points: torch.Tensor, boxes: torch.Tensor, extent: tuple[int, ...]
+        self,
+        points: torch.Tensor,
+        boxes: torch.Tensor,
+        extent: tuple[int, ...],
+        offobject: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Round 0's prompt: a click, or a noised box -> `(P, 2, 3)` coords and `(P, 2)` labels.
 
@@ -330,7 +358,11 @@ class PromptableSegmentation(BaseAlgorithm):
         """
         prompts = points.shape[0]
         device = points.device
+        # Never a box for an off-object prompt: there is no object to draw one around, and the
+        # grid this prompt stands in for only ever clicks.
         use_box = torch.rand(prompts, device=device) < self.box_prob
+        if offobject is not None:
+            use_box = use_box & ~offobject
 
         # Independent noise per corner per axis, not one offset applied to both corners: a shared
         # offset only ever *translates* the box, so the model would never see a box that is too
@@ -355,9 +387,17 @@ class PromptableSegmentation(BaseAlgorithm):
         return voxel_coords(coords, extent), labels
 
     def _correction(
-        self, logits: torch.Tensor, target: torch.Tensor, extent: tuple[int, ...]
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        extent: tuple[int, ...],
+        known: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One point per prompt from where the prediction and the target disagree.
+
+        `known` (`(P, 1, *grid)`, the labelled fraction of each cell) keeps the click out of
+        unlabelled space: a mask reaching into voxels nobody labelled is not a spill, and an
+        unlabelled voxel is not a miss.
 
         `logits` and `target` are at the decoder's own stride, so the point is drawn on the mask
         grid and reported at the centre of the block it lands in. That is a coarser click than the
@@ -371,6 +411,9 @@ class PromptableSegmentation(BaseAlgorithm):
         predicted = logits.squeeze(1) > 0
         actual = target.squeeze(1) > 0.5
         missed, spilled = actual & ~predicted, predicted & ~actual
+        if known is not None:
+            labelled = known.squeeze(1) > 0.5
+            missed, spilled = missed & labelled, spilled & labelled
         wrong = (missed | spilled).flatten(1)
 
         key = torch.rand(wrong.shape, device=wrong.device).masked_fill(~wrong, float("inf"))
@@ -458,15 +501,31 @@ class PromptableSegmentation(BaseAlgorithm):
         prompts = batch_size * masks
         image = image.repeat_interleave(masks, dim=0)
 
-        target = pooled_masks(labels, objects[IDS_KEY], self.mask_stride).reshape(
-            prompts, 1, *[extent[axis] // self.mask_stride[axis] for axis in range(SPATIAL_RANK)]
+        cells = [extent[axis] // self.mask_stride[axis] for axis in range(SPATIAL_RANK)]
+        target = pooled_masks(labels, objects[IDS_KEY], self.mask_stride)
+        target = target.reshape(prompts, 1, *cells)
+        # The labelled fraction of every cell, per prompt. A cell's target is its object's share
+        # of the LABELLED voxels, and every loss below weights cells by `known`, so unlabelled
+        # voxels (-1: a pseudo-label's unclaimed space) train nothing: neither object nor
+        # background.
+        known = pooled_known(labels, self.mask_stride).repeat_interleave(masks, dim=0)
+        target = torch.where(
+            known > 0, (target / known.clamp_min(1e-6)).clamp_max(1.0), torch.zeros_like(target)
         )
         valid = objects[VALID_KEY].reshape(prompts)
+        offobject = objects[OFFOBJECT_KEY].reshape(prompts)
+        # Two weightings. The mask losses see object prompts only: an off-object prompt has no
+        # object to segment, and pulling the decoder towards an empty mask there is the collapse
+        # every mask model starts in. The IoU head sees both -- for an off-object prompt every
+        # candidate's achieved IoU is 0, which is exactly what it has to learn to say.
+        mask_weight = valid.float()
+        head_weight = (valid | offobject).float()
 
         coords, point_labels = self._initial_prompt(
             objects[POINTS_KEY].reshape(prompts, SPATIAL_RANK),
             objects[BOXES_KEY].reshape(prompts, 2, SPATIAL_RANK),
             extent,
+            offobject,
         )
 
         mask_input: torch.Tensor | None = None
@@ -482,17 +541,20 @@ class PromptableSegmentation(BaseAlgorithm):
 
             candidates = logits.shape[1]
             expanded = target.expand(-1, candidates, *(-1,) * SPATIAL_RANK)
+            cell_weight = known.expand(-1, candidates, *(-1,) * SPATIAL_RANK)
             per_candidate = (
-                self.focal_weight * focal_loss(logits, expanded)
-                + self.dice_weight * dice_loss(logits, expanded)
+                self.focal_weight * focal_loss(logits, expanded, weight=cell_weight)
+                + self.dice_weight * dice_loss(logits, expanded, weight=cell_weight)
             )
             chosen, which = best_of(per_candidate)
-            achieved = mask_iou(logits, expanded)
+            achieved = mask_iou(logits, expanded, weight=cell_weight)
             iou_loss = (scores - achieved.detach()).square().mean(dim=1)
 
-            weight = valid.float()
+            weight = mask_weight
             denominator = weight.sum().clamp_min(1.0)
-            loss = ((chosen + self.iou_weight * iou_loss) * weight).sum() / denominator
+            loss = (chosen * weight).sum() / denominator + self.iou_weight * (
+                (iou_loss * head_weight).sum() / head_weight.sum().clamp_min(1.0)
+            )
 
             picked = achieved.gather(1, which.unsqueeze(1)).squeeze(1)
             # The same masks scored at voxel resolution rather than on the mask grid. Reported
@@ -500,7 +562,7 @@ class PromptableSegmentation(BaseAlgorithm):
             # their difference IS the quantisation ceiling: `*_iou` is what the loss optimises,
             # `*_voxel_iou` is what a consumer of the mask gets. Only the second is comparable
             # across `mask_upscale`.
-            at_voxels = voxel_mask_iou(logits, expanded)
+            at_voxels = voxel_mask_iou(logits, expanded, weight=cell_weight)
             stage = "first" if index == 0 else "final"
             totals[f"loss_round_{index}"] = loss.detach()
             totals[f"{stage}_iou"] = (picked * weight).sum() / denominator
@@ -513,6 +575,14 @@ class PromptableSegmentation(BaseAlgorithm):
                 (scores - achieved).abs().mean(dim=1) * weight
             ).sum() / denominator
             totals["loss"] = loss if "loss" not in totals else totals["loss"] + loss
+            if index == 0:
+                # What the mask generator's gate sees for a click on nothing: the best predicted
+                # IoU among the candidates. The recipe exists to drive this to 0; if it stays
+                # near the object prompts' scores the head has not learned the distinction.
+                off = offobject.float()
+                totals["offobject_pred_iou"] = (
+                    scores.max(dim=1).values * off
+                ).sum() / off.sum().clamp_min(1.0)
 
             if index + 1 < self.rounds:
                 # The mask carried forward is the model's own best guess, unthresholded: the
@@ -522,13 +592,14 @@ class PromptableSegmentation(BaseAlgorithm):
                     1,
                     which.reshape(-1, 1, *(1,) * SPATIAL_RANK).expand(-1, 1, *logits.shape[2:]),
                 )
-                new_coords, new_labels = self._correction(best.detach(), target, extent)
+                new_coords, new_labels = self._correction(best.detach(), target, extent, known)
                 coords = torch.cat([coords, new_coords], dim=1)
                 point_labels = torch.cat([point_labels, new_labels], dim=1)
                 mask_input = best.detach()
 
         totals["loss"] = totals["loss"] / self.rounds
         totals["valid_fraction"] = valid.float().mean()
+        totals["offobject_fraction"] = offobject.float().mean()
         return totals
 
     def training_step(self, batch: Any) -> dict[str, torch.Tensor]:

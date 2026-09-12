@@ -15,13 +15,16 @@ import torch.nn.functional as F
 from algorithms.promptable.targets import (
     BOXES_KEY,
     IDS_KEY,
+    OFFOBJECT_KEY,
     POINTS_KEY,
     SPLIT_LABEL_KEY,
     VALID_KEY,
     PromptTargets,
     area_stratified_choice,
+    boundary_shell,
     eligible_objects,
     pooled_masks,
+    random_background_voxels,
 )
 
 
@@ -182,3 +185,122 @@ def test_the_transform_survives_labels_that_already_reached_a_device():
     tracked = labels.to(torch.float32).requires_grad_(True).detach().to(torch.int64)
     sample = PromptTargets(masks_per_sample=2, min_object_voxels=64)({"label": tracked})
     assert sample[VALID_KEY].all()
+
+
+# ------------------------------------------------------------ the v2 prompts: boundary, off-object
+
+
+def _two_cubes_and_background() -> torch.Tensor:
+    labels = torch.zeros(24, 24, 24, dtype=torch.long)
+    labels[2:10, 2:10, 2:10] = 7           # 512 voxels
+    labels[12:22, 12:22, 12:22] = 9        # 1000 voxels
+    labels[0, 0, 0] = -1                    # an ignore voxel: never background
+    return labels
+
+
+@pytest.mark.unit
+def test_boundary_shell_is_exactly_the_voxels_touching_another_label():
+    labels = torch.zeros(8, 8, 8, dtype=torch.long)
+    labels[2:6, 2:6, 2:6] = 5
+    shell = boundary_shell(labels, radius=1)
+    # The cube's outer layer is in the shell, its 2x2x2 interior is not ...
+    assert int(shell[2:6, 2:6, 2:6].sum()) == 64 - 8
+    assert not shell[3:5, 3:5, 3:5].any()
+    # ... and so is the layer of background touching the cube, but nothing further out.
+    assert shell[1, 3, 3] and shell[6, 3, 3]
+    assert not shell[0, 3, 3] and not shell[7, 3, 3]
+    # A wider radius reaches two voxels deep on both sides.
+    wide = boundary_shell(labels, radius=2)
+    assert wide[0, 3, 3] and wide[3, 3, 3]
+    # A crop face is not a boundary.
+    flat = torch.full((6, 6, 6), 3, dtype=torch.long)
+    assert not boundary_shell(flat, 1).any()
+    with pytest.raises(ValueError, match="radius"):
+        boundary_shell(labels, 0)
+
+
+@pytest.mark.unit
+def test_random_background_voxels_are_distinct_label_zero_voxels_and_never_ignore():
+    labels = torch.full((4, 4, 4), 2, dtype=torch.long)
+    labels[0, 0, :3] = 0                    # three background voxels
+    labels[3, 3, 3] = -1                    # ignore, must never be drawn
+    torch.manual_seed(0)
+    points = random_background_voxels(labels, 10)
+    assert points.shape == (3, 3), "asks for 10, gets the 3 that exist"
+    assert len({tuple(p.tolist()) for p in points}) == 3
+    assert all(labels[tuple(p.tolist())] == 0 for p in points)
+    assert random_background_voxels(labels, 0).shape == (0, 3)
+    assert random_background_voxels(torch.ones(4, 4, 4, dtype=torch.long), 5).shape == (0, 3)
+
+
+@pytest.mark.unit
+def test_offobject_slots_click_on_background_and_carry_no_object():
+    torch.manual_seed(0)
+    labels = _two_cubes_and_background()
+    targets = PromptTargets(masks_per_sample=6, min_object_voxels=8, offobject_prob=1.0)
+    out = targets({"label": labels.unsqueeze(0)})
+    assert out[OFFOBJECT_KEY].all() and not out[VALID_KEY].any()
+    assert (out[IDS_KEY] == 0).all()
+    split = out[SPLIT_LABEL_KEY]
+    for point in out[POINTS_KEY]:
+        assert split[tuple(point.tolist())] == 0
+    # Distinct voxels, since the crop has far more background than slots.
+    assert len({tuple(p.tolist()) for p in out[POINTS_KEY]}) == 6
+
+
+@pytest.mark.unit
+def test_a_mix_puts_objects_first_and_off_object_clicks_last():
+    torch.manual_seed(1)
+    labels = _two_cubes_and_background()
+    targets = PromptTargets(masks_per_sample=8, min_object_voxels=8, offobject_prob=0.5)
+    out = targets({"label": labels.unsqueeze(0)})
+    off = out[OFFOBJECT_KEY]
+    assert 0 < int(off.sum()) < 8
+    assert (out[VALID_KEY] == ~off).all(), "every slot is exactly one of: object, off-object"
+    # Object slots come first, off-object slots last, and neither kind leaks into the other.
+    assert not off[: int((~off).sum())].any() and off[int((~off).sum()):].all()
+    split = out[SPLIT_LABEL_KEY]
+    for slot in range(8):
+        label = int(split[tuple(out[POINTS_KEY][slot].tolist())])
+        if off[slot]:
+            assert label == 0
+        else:
+            assert label == int(out[IDS_KEY][slot]) > 0
+
+
+@pytest.mark.unit
+def test_boundary_clicks_land_in_the_rim_of_their_own_object():
+    torch.manual_seed(2)
+    labels = _two_cubes_and_background()
+    targets = PromptTargets(
+        masks_per_sample=8, min_object_voxels=8, boundary_prob=1.0, boundary_radius=1
+    )
+    out = targets({"label": labels.unsqueeze(0)})
+    assert out[VALID_KEY].all() and not out[OFFOBJECT_KEY].any()
+    split = out[SPLIT_LABEL_KEY]
+    shell = boundary_shell(split, 1)
+    for slot in range(8):
+        voxel = tuple(out[POINTS_KEY][slot].tolist())
+        assert int(split[voxel]) == int(out[IDS_KEY][slot])
+        assert shell[voxel], "a boundary click sits in the rim, not the interior"
+
+
+@pytest.mark.unit
+def test_an_object_filling_the_crop_keeps_its_interior_click_under_boundary_sampling():
+    labels = torch.full((8, 8, 8), 4, dtype=torch.long)
+    targets = PromptTargets(masks_per_sample=2, min_object_voxels=8, boundary_prob=1.0)
+    out = targets({"label": labels.unsqueeze(0)})
+    assert out[VALID_KEY].all()
+    assert (out[SPLIT_LABEL_KEY][tuple(out[POINTS_KEY][0].tolist())] == out[IDS_KEY][0]).all()
+
+
+@pytest.mark.unit
+def test_the_default_recipe_is_unchanged_and_the_knobs_are_validated():
+    torch.manual_seed(3)
+    labels = _two_cubes_and_background()
+    out = PromptTargets(masks_per_sample=4, min_object_voxels=8)({"label": labels.unsqueeze(0)})
+    assert out[VALID_KEY].all() and not out[OFFOBJECT_KEY].any()
+    for bad in (dict(offobject_prob=1.5), dict(boundary_prob=-0.1), dict(boundary_radius=0)):
+        with pytest.raises(ValueError):
+            PromptTargets(**bad)
+

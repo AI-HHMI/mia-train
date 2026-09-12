@@ -17,12 +17,14 @@ from algorithms.promptable.amg import (
     Canvas,
     PromptGridPredictor,
     boxes_intersect,
+    interior_points,
     mask_boxes,
     mask_nms,
     pairwise_intersection,
     point_grid,
     resolve_containment,
     stability_score,
+    tiled_wholes,
 )
 
 
@@ -581,3 +583,302 @@ def test_a_continuation_is_accepted_on_coverage_not_on_the_iou_head():
 
     with pytest.raises(ValueError, match="propagate_min_coverage"):
         PromptGridPredictor(oracle, propagate_min_coverage=0.0)
+
+
+# --------------------------------------------------------------------- the merge-aware filters
+
+
+class _MergingOracle(_Oracle):
+    """An oracle with the failure the labelling diagnostic found: a click on either of two
+    touching objects also offers their UNION as a confident candidate.
+
+    Candidates per click: the true object (0.9), the union with its partner (0.85), an empty mask.
+    Both pass the gates, so without a merge-aware filter `prefer="whole"` keeps the union and
+    drops the objects. An object without a partner behaves as in `_Oracle`.
+    """
+
+    def __init__(self, labels: torch.Tensor, partners: dict[int, int]) -> None:
+        super().__init__(labels)
+        self.partners = partners
+
+    def decode_points(self, image, image_coords, grid, coords, labels, multimask, mask_input=None):
+        extent = torch.tensor(self.labels.shape, dtype=torch.float32)
+        voxels = ((coords[:, 0] + 1) * extent / 2 - 0.5).round().long()
+        pooled_shape = tuple(e // 2 for e in self.labels.shape)
+        out = torch.full((coords.shape[0], 3, *pooled_shape), -10.0)
+        ious = torch.zeros(coords.shape[0], 3)
+        for index, voxel in enumerate(voxels.tolist()):
+            identifier = int(self.labels[tuple(voxel)])
+            if identifier == 0:
+                continue
+            whole = self.labels == identifier
+            candidates = [(whole, 0.9)]
+            if identifier in self.partners:
+                candidates.append((whole | (self.labels == self.partners[identifier]), 0.85))
+            for k, (mask, score) in enumerate(candidates):
+                pooled = torch.nn.functional.avg_pool3d(mask.float()[None, None], 2)[0, 0] > 0.5
+                out[index, k][pooled] = 10.0
+                ious[index, k] = score
+        return out, ious
+
+
+def _touching_pair_and_a_loner() -> tuple[torch.Tensor, dict[int, int]]:
+    labels = torch.zeros(32, 32, 32, dtype=torch.long)
+    labels[2:14, 2:14, 2:14] = 11          # A
+    labels[14:26, 2:14, 2:14] = 22         # B, touching A on one face, same size
+    labels[4:14, 20:30, 20:30] = 33        # C, alone
+    return labels, {11: 22, 22: 11}
+
+
+def _object_sets(masks: torch.Tensor, labels: torch.Tensor) -> set[frozenset[int]]:
+    """Which true objects each output mask covers (>= 25% of the object), as a set of sets."""
+    pooled = torch.nn.functional.max_pool3d(labels.float()[None, None], 2)[0, 0].long()
+    out = set()
+    for mask in masks:
+        ids = set()
+        for identifier in (11, 22, 33):
+            inside = pooled == identifier
+            if (mask & inside).sum().item() >= 0.25 * inside.sum().item():
+                ids.add(identifier)
+        out.add(frozenset(ids))
+    return out
+
+
+@pytest.mark.unit
+def test_interior_points_start_at_the_confident_cell_and_spread_into_both_lobes():
+    mask = torch.zeros(20, 4, 4, dtype=torch.bool)
+    mask[:8] = True                  # lobe 1
+    mask[12:] = True                 # lobe 2
+    mask[8:12, 1:3, 1:3] = True      # a thin bridge
+    logits = torch.full(mask.shape, 1.0)
+    logits[3, 2, 2] = 9.0            # the most confident cell, in lobe 1
+    points = interior_points(mask, logits, 3)
+    assert points.shape == (3, 3)
+    assert points[0].tolist() == [3, 2, 2]
+    assert all(mask[tuple(p.tolist())] for p in points)
+    assert points[1, 0] >= 12, "the second point must land in the other lobe"
+    assert interior_points(torch.zeros(4, 4, 4, dtype=torch.bool), logits[:4], 3).shape[0] == 0
+    assert interior_points(mask, logits, 0).shape[0] == 0
+
+
+@pytest.mark.unit
+def test_tiled_wholes_flags_a_union_of_disjoint_parts_but_not_a_cell_with_a_nucleus():
+    grid = (16, 16, 16)
+    a = torch.zeros(grid, dtype=torch.bool)
+    a[:8, :8, :8] = True
+    b = torch.zeros(grid, dtype=torch.bool)
+    b[8:, :8, :8] = True
+    merge = a | b
+    cell = torch.zeros(grid, dtype=torch.bool)
+    cell[:, 8:, 8:] = True
+    nucleus = torch.zeros(grid, dtype=torch.bool)
+    nucleus[4:8, 10:14, 10:14] = True
+    near_duplicate = cell.clone()
+    near_duplicate[0] = False
+    masks = torch.stack([merge, a, b, cell, nucleus, near_duplicate])
+    scores = torch.tensor([0.85, 0.9, 0.9, 0.9, 0.8, 0.88])
+    flagged = tiled_wholes(masks, scores, containment_thresh=0.8, cover_thresh=0.8,
+                           duplicate_iou=0.7)
+    assert flagged.tolist() == [True, False, False, False, False, False]
+    # Two parts covering too little of the whole are a whole with organelles, not a merge.
+    partial = torch.zeros(grid, dtype=torch.bool)
+    partial[:3, :8, :8] = True
+    masks = torch.stack([merge, partial, b])
+    assert not tiled_wholes(masks, torch.tensor([0.85, 0.9, 0.9]), 0.8, 0.8, 0.7)[0]
+
+
+@pytest.mark.unit
+def test_without_a_merge_aware_filter_the_generator_keeps_the_merge():
+    labels, partners = _touching_pair_and_a_loner()
+    predictor = PromptGridPredictor(
+        _MergingOracle(labels, partners), points_per_side=8, points_per_batch=16,
+        pred_iou_thresh=0.5, stability_thresh=0.5, min_mask_voxels=8, prefer="whole",
+    )
+    masks, _ = predictor.segment_tile(torch.zeros(1, 1, 32, 32, 32))
+    assert _object_sets(masks, labels) == {frozenset({11, 22}), frozenset({33})}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "settings",
+    [
+        dict(split_tiled_wholes=True),
+        dict(consistency_clicks=3, consistency_thresh=0.6, consistency_pick="top"),
+        dict(split_tiled_wholes=True, consistency_clicks=3, consistency_thresh=0.6),
+    ],
+    ids=["tiled", "consistency-top", "both"],
+)
+def test_merge_aware_filters_return_one_mask_per_true_object(settings):
+    labels, partners = _touching_pair_and_a_loner()
+    predictor = PromptGridPredictor(
+        _MergingOracle(labels, partners), points_per_side=8, points_per_batch=16,
+        pred_iou_thresh=0.5, stability_thresh=0.5, min_mask_voxels=8, prefer="whole", **settings,
+    )
+    masks, _ = predictor.segment_tile(torch.zeros(1, 1, 32, 32, 32))
+    assert _object_sets(masks, labels) == {frozenset({11}), frozenset({22}), frozenset({33})}
+    assert masks.shape[0] == 3
+    for key, value in settings.items():
+        assert predictor.settings()[key] == value
+
+
+@pytest.mark.unit
+def test_consistency_best_is_lenient_and_lets_a_reproducible_merge_through():
+    """`"best"` asks only whether the model can reproduce the mask from inside; the merging
+    oracle can, so this documents what the lenient pick does NOT catch."""
+    labels, partners = _touching_pair_and_a_loner()
+    predictor = PromptGridPredictor(
+        _MergingOracle(labels, partners), points_per_side=8, points_per_batch=16,
+        pred_iou_thresh=0.5, stability_thresh=0.5, min_mask_voxels=8, prefer="whole",
+        consistency_clicks=3, consistency_thresh=0.6, consistency_pick="best",
+    )
+    masks, _ = predictor.segment_tile(torch.zeros(1, 1, 32, 32, 32))
+    assert frozenset({11, 22}) in _object_sets(masks, labels)
+
+
+@pytest.mark.unit
+def test_merge_aware_filters_are_off_by_default_and_validated():
+    predictor = PromptGridPredictor(_Oracle(_labels_with_blobs()))
+    assert predictor.consistency_clicks == 0 and predictor.split_tiled_wholes is False
+    with pytest.raises(ValueError, match="consistency_pick"):
+        PromptGridPredictor(_Oracle(_labels_with_blobs()), consistency_pick="median")
+    with pytest.raises(ValueError, match="consistency_clicks"):
+        PromptGridPredictor(_Oracle(_labels_with_blobs()), consistency_clicks=-1)
+
+
+# --------------------------------------------------------------------------- consensus_labelling
+
+
+def _line(z_lo: int, z_hi: int, tile: tuple[int, int, int] = (2, 2, 8)) -> torch.Tensor:
+    """A `(1, *tile)` mask filling the tile's cross-section between two z indices."""
+    mask = torch.zeros((1, *tile), dtype=torch.bool)
+    mask[0, :, :, z_lo:z_hi] = True
+    return mask
+
+
+def _tile(*masks: torch.Tensor) -> torch.Tensor:
+    from algorithms.promptable.amg import tile_labelling
+
+    stacked = torch.cat(masks) if masks else torch.zeros((0, 2, 2, 8), dtype=torch.bool)
+    return tile_labelling(stacked, torch.arange(stacked.shape[0], 0, -1).float())
+
+
+def test_consensus_joins_an_object_that_crosses_two_windows():
+    """Both windows see the shared z 4..8 and agree there, so the object gets one id end to end."""
+    from algorithms.promptable.amg import consensus_labelling
+
+    tiles = [((0, 0, 0), _tile(_line(2, 8))), ((0, 0, 4), _tile(_line(0, 6)))]   # z 2..8 and 4..10
+    labels, count = consensus_labelling(tiles, (2, 2, 12), agree_thresh=0.5)
+    assert count == 1
+    assert labels[0, 0].tolist() == [0, 0] + [1] * 8 + [0, 0]
+
+
+def test_consensus_neutralises_a_spill_instead_of_merging():
+    """Window 1 sees A (z 0..4) and B (z 4..8); window 2's one mask spans z 2..8, A's tail and B.
+
+    In the shared region z 2..8 the spill matches B best (IoU 4/6) and A only 2/6, and mutual-best
+    lets it join B alone. Where window 1 says A and window 2 says (spill = B) the cell is disputed
+    and left unlabelled; nothing of A is ever painted under B's id.
+    """
+    from algorithms.promptable.amg import consensus_labelling
+
+    tiles = [
+        ((0, 0, 0), _tile(_line(0, 4), _line(4, 8))),
+        ((0, 0, 2), _tile(_line(0, 6))),
+    ]
+    labels, count = consensus_labelling(tiles, (2, 2, 10), agree_thresh=0.5)
+    assert count == 2
+    line = labels[0, 0].tolist()
+    assert line[0:2] == [line[0]] * 2 and line[0] > 0          # A survives where undisputed
+    assert line[2:4] == [0, 0]                                  # disputed: A vs the spill
+    assert line[4:8] == [line[4]] * 4 and line[4] not in (0, line[0])   # B, one id, not A's
+    assert line[8:10] == [0, 0]
+
+
+def test_consensus_joins_a_truncated_piece_with_the_fuller_mask():
+    """Window 1's mask stopped short (z 5..8 of an object spanning 4..10); window 2 saw z 4..10.
+
+    In the shared region z 4..8 the piece covers 3 of the fuller mask's 4 cells: IoU 0.75, joined.
+    """
+    from algorithms.promptable.amg import consensus_labelling
+
+    tiles = [((0, 0, 0), _tile(_line(5, 8))), ((0, 0, 4), _tile(_line(0, 6)))]
+    labels, count = consensus_labelling(tiles, (2, 2, 12), agree_thresh=0.5)
+    assert count == 1
+    assert labels[0, 0].tolist() == [0] * 4 + [1] * 6 + [0, 0]
+
+
+def test_consensus_disagreement_leaves_both_claims_unlabelled_where_they_overlap():
+    """Two windows, two masks that overlap by a sliver (IoU 1/5 in the shared region): no join.
+
+    The sliver is disputed and dropped; each mask keeps the rest under its own id.
+    """
+    from algorithms.promptable.amg import consensus_labelling
+
+    tiles = [((0, 0, 0), _tile(_line(0, 5))), ((0, 0, 0), _tile(_line(4, 8)))]
+    labels, count = consensus_labelling(tiles, (2, 2, 8), agree_thresh=0.5)
+    assert count == 2
+    line = labels[0, 0].tolist()
+    assert line[4] == 0 and line[:4] == [line[0]] * 4 and line[5:] == [line[5]] * 3
+    assert line[0] != line[5]
+
+
+def test_consensus_min_support_is_capped_by_how_many_windows_looked():
+    """min_support=2: a lone claim in a doubly-covered region goes; one at the border stays."""
+    from algorithms.promptable.amg import consensus_labelling
+
+    tiles = [
+        ((0, 0, 0), _tile(_line(0, 2), _line(5, 7))),      # z 0..2 seen once; z 5..7 seen twice
+        ((0, 0, 4), _tile()),                              # window 2 drew nothing
+    ]
+    labels, count = consensus_labelling(tiles, (2, 2, 12), agree_thresh=0.5, min_support=2)
+    assert count == 1
+    assert labels[0, 0].tolist() == [1, 1] + [0] * 10
+
+
+def test_consensus_handles_no_tiles_and_rejects_bad_thresholds():
+    from algorithms.promptable.amg import consensus_labelling
+
+    labels, count = consensus_labelling([], (2, 2, 2), agree_thresh=0.5)
+    assert count == 0 and labels.shape == (2, 2, 2) and int(labels.sum()) == 0
+    with pytest.raises(ValueError, match="agree_thresh"):
+        consensus_labelling([], (1, 1, 1), agree_thresh=0.0)
+    with pytest.raises(ValueError, match="min_support"):
+        consensus_labelling([], (1, 1, 1), agree_thresh=0.5, min_support=0)
+
+
+def test_tile_labelling_gives_the_better_score_the_overlap():
+    from algorithms.promptable.amg import tile_labelling
+
+    masks = torch.cat([_line(0, 5), _line(3, 8)])
+    out = tile_labelling(masks, torch.tensor([0.2, 0.9]))
+    assert out[0, 0].tolist() == [1, 1, 1, 2, 2, 2, 2, 2]
+
+
+def test_consensus_report_separates_joined_disagreed_and_unmet():
+    """Windows 1 (z 0..8), 2 (z 4..12), 3 (z 8..16). Window 1: A1 = z 4..8. Window 2: A2 = z 4..6,
+    B2 = z 6..8, D2 = z 8..12. Window 3: nothing.
+
+    In the 1/2 shared region A1 meets A2 and B2 at IoU 0.5 each; A2 comes first, so A1-A2 are
+    mutual best and join, while B2's best (A1) does not return the favour: disagreed. D2 reaches the
+    2/3 shared region and window 3 drew nothing there: unmet. B2's cells conflict with A1 and are
+    dropped, so the result is A (z 4..6) and D (z 8..12).
+    """
+    from algorithms.promptable.amg import MIN_SHARED_CELLS, consensus_labelling
+
+    assert MIN_SHARED_CELLS <= 8            # the smallest fixture mask has 2 x 2 x 2 cells
+    tiles = [
+        ((0, 0, 0), _tile(_line(4, 8))),
+        ((0, 0, 4), _tile(_line(0, 2), _line(2, 4), _line(4, 8))),
+        ((0, 0, 8), _tile()),
+    ]
+    report: dict = {}
+    labels, count = consensus_labelling(tiles, (2, 2, 16), agree_thresh=0.5, report=report)
+    assert report["joined"] == 2            # A1 from window 1's side, A2 from window 2's
+    assert report["disagreed"] == 1         # B2
+    assert report["unmet"] == 1             # D2, against the empty window 3
+    assert report["tile_masks"] == 4
+    assert count == 2
+    line = labels[0, 0].tolist()
+    assert line[4:6] == [line[4]] * 2 and line[4] > 0
+    assert line[6:8] == [0, 0]              # disputed between A1 and B2
+    assert line[8:12] == [line[8]] * 4 and line[8] not in (0, line[4])

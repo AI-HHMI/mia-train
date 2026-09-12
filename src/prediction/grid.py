@@ -47,30 +47,42 @@ import torch
 import torch.nn.functional as F
 
 
-def aligned_tiling(extent: int, read: int, patch: int) -> tuple[list[int], list[int], int]:
+def aligned_tiling(
+    extent: int, read: int, patch: int, steps_per_patch: int = 2
+) -> tuple[list[int], list[int], int]:
     """Native tile origins, output tile origins, and the output extent, all on one lattice.
 
-    `read` must be even so a native stride of `read / 2` maps to an output stride of exactly
-    `patch / 2`. The covered native extent is `read + (n - 1) * read / 2`, at most `extent`: the
-    tail that does not complete a stride is dropped rather than padded, so no voxel is predicted
-    from data invented to fill a tile.
+    The window advances by `patch / steps_per_patch` output voxels: 2 (the default) is the
+    half-window overlap every scored run used, 4 a quarter-window step. `read` and `patch` must
+    both divide by `steps_per_patch` so a native stride of `read / steps` maps to an output stride
+    of exactly `patch / steps` -- one lattice, no drift between tiles. The covered native extent
+    is `read + (n - 1) * read / steps`, at most `extent`: the tail that does not complete a stride
+    is dropped rather than padded, so no voxel is predicted from data invented to fill a tile.
     """
-    if read % 2:
-        raise ValueError(f"read shape must be even to halve into a stride, got {read}")
-    if patch % 2:
-        raise ValueError(f"patch size must be even to halve into a stride, got {patch}")
+    if steps_per_patch < 1:
+        raise ValueError(f"steps_per_patch must be at least 1, got {steps_per_patch}")
+    if read % steps_per_patch:
+        raise ValueError(
+            f"read shape must divide by {steps_per_patch} to step by read / {steps_per_patch}, "
+            f"got {read}"
+        )
+    if patch % steps_per_patch:
+        raise ValueError(
+            f"patch size must divide by {steps_per_patch} to step by patch / {steps_per_patch}, "
+            f"got {patch}"
+        )
     if extent < read:
         raise ValueError(
             f"the region spans {extent} native voxels but one patch needs {read}: the bounding box "
             "is smaller than a patch at this resolution. Predict at a finer target resolution, or "
             "with a model trained at a smaller patch."
         )
-    stride = read // 2
+    stride = read // steps_per_patch
     count = (extent - read) // stride + 1
     return (
         [k * stride for k in range(count)],
-        [k * (patch // 2) for k in range(count)],
-        patch + (count - 1) * (patch // 2),
+        [k * (patch // steps_per_patch) for k in range(count)],
+        patch + (count - 1) * (patch // steps_per_patch),
     )
 
 
@@ -140,19 +152,26 @@ def storage_axes_of(config: Any, volume_name: str) -> str:
 class VolumeGrid:
     """The aligned lattice for one volume, and the reads that fill it. All in storage axis order."""
 
+    #: How many window steps span one patch: the window advances by `patch / steps_per_patch`.
+    #: 2 is the half-window overlap every scored run used; a class default so a geometry built
+    #: without `__init__` (the tests) has one.
+    steps_per_patch: int = 2
+
     def __init__(
         self,
         config: Any,
         volume_name: str,
         patch: list[int],
         box: list[list[int]] | None = None,
+        steps_per_patch: int = 2,
     ) -> None:
         """`box` restricts the region to a sub-box of the volume's own `bounding_box`.
 
         In level-0 image voxels, storage axis order, as `[[lo, hi], ...]`. Used to predict one
         block of a large volume at a time -- pseudo-labelling walks a volume in blocks because a
         whole one does not fit in memory -- and clipped to the annotated box, so a caller cannot
-        widen the region past what the data config declares.
+        widen the region past what the data config declares. `steps_per_patch` sets the window
+        step, see `aligned_tiling`.
         """
         from miao.dataset import VolumeDataset
         from miao.store import create_context
@@ -184,6 +203,7 @@ class VolumeGrid:
             if info.scales.label_chosen_levels is not None else None
         )
         self.image_voxel = [float(v) for v in info.img_level_voxels[self.image_level]]
+        self.steps_per_patch = int(steps_per_patch)
 
         self._resolve_geometry(box, volume_name)
 
@@ -238,17 +258,20 @@ class VolumeGrid:
         self.box_low = low
         self.box_extent = [h - lo for lo, h in zip(low, high, strict=True)]
 
+        steps = self.steps_per_patch
         read = [int(r) for r in info.scales.read_shapes[0]]
-        self.read = [r + r % 2 for r in read]
+        # Rounded up to a multiple of the step count so the native stride is a whole number of
+        # voxels (for the default 2 this is the "make it even" rule every scored run used).
+        self.read = [r + (-r) % steps for r in read]
         tiled = [
-            aligned_tiling(extent, r, p)
+            aligned_tiling(extent, r, p, steps)
             for extent, r, p in zip(self.box_extent, self.read, self.patch, strict=True)
         ]
         self.native_origins = [t[0] for t in tiled]
         self.output_origins = [t[1] for t in tiled]
         self.output_shape = tuple(t[2] for t in tiled)
         self.native_extent = [
-            r + (len(o) - 1) * (r // 2)
+            r + (len(o) - 1) * (r // steps)
             for r, o in zip(self.read, self.native_origins, strict=True)
         ]
         # Centre the lattice in the bounding box rather than anchoring it at the low corner. The
