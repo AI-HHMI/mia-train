@@ -476,3 +476,16 @@ def test_a_volume_read_above_level_zero_is_refused_not_mislocated():
     grid = _geometry_only_grid(chosen_levels=[1], label_chosen_levels=[0])
     with pytest.raises(SystemExit, match="pyramid level 1"):
         VolumeGrid._resolve_geometry(grid, None, "fine-store")
+
+
+def test_every_volume_in_the_config_is_predicted_unless_one_is_named():
+    """`--volume` is optional: the data config already lists the split, so one command covers it."""
+    from types import SimpleNamespace
+
+    from predict import volumes_to_predict
+
+    config = SimpleNamespace(volumes=[SimpleNamespace(name="a"), SimpleNamespace(name="b")])
+    assert volumes_to_predict(config, None) == ["a", "b"]
+    assert volumes_to_predict(config, "b") == ["b"]
+    with pytest.raises(SystemExit, match="no volume named 'c'"):
+        volumes_to_predict(config, "c")

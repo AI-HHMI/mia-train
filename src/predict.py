@@ -1,8 +1,9 @@
 """Run a trained checkpoint over a whole OME-NGFF volume and write the prediction as an artifact.
 
-    python src/predict.py <run_dir> --data-config <miao.yaml> --volume <name> --out <dir> [--step N]
+    python src/predict.py <run_dir> --data-config <miao.yaml> --out <dir> [--step N] [--volume <name>]
 
-Writes two artifacts per volume, on one shared grid:
+Runs over every volume in the data config, or over the one named by `--volume`, and writes two
+artifacts per volume, on one shared grid:
 
     <dir>/<volume>.zarr        the prediction, kind from the algorithm
     <dir>/<volume>.gt.zarr     the co-registered ground truth, kind="instances"
@@ -32,6 +33,7 @@ Every input to the chain is recorded in the artifact's attrs, so the result stay
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import tomllib
 from pathlib import Path
@@ -297,14 +299,81 @@ def write_array(path: Path, array: np.ndarray, **attrs: Any) -> Path:
     return path
 
 
+def volumes_to_predict(config: Any, requested: str | None) -> list[str]:
+    """Every volume in the data config, or the one named -- so a split is predicted in one command.
+
+    The eval sets here are the data config: a task's volumes *are* the YAML's volumes. Predicting
+    them one `--volume` at a time was the only option, and it meant either a hand-written loop or a
+    per-experiment driver script for something the config already spells out. `--volume` remains
+    for when one volume is worth its own job -- the volumes of one split differ ~100x in cost.
+    """
+    names = [str(v.name) for v in config.volumes]
+    if requested is None:
+        return names
+    if requested not in names:
+        raise SystemExit(f"no volume named {requested!r} in the data config; it holds {names}")
+    return [requested]
+
+
+def run_volume(
+    config: Any,
+    name: str,
+    out: Path,
+    run_dir: Path,
+    data_config: Path,
+    step: int,
+    resolved: dict[str, Any],
+    predictor: VolumePredictor | None,
+    device: torch.device,
+    patch_override: int | None,
+) -> None:
+    """Predict one volume (unless `predictor` is None) and write its ground truth beside it."""
+    grid = VolumeGrid(config, name, resolve_patch(config, resolved, name, patch_override))
+
+    if predictor is not None:
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        prediction = predictor.run(grid, device)
+        if device.type == "cuda":
+            properties = torch.cuda.get_device_properties(0)
+            print(f"peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB of "
+                  f"{properties.total_memory / 2**30:.0f} GiB ({properties.name})", flush=True)
+
+        path = write_array(
+            out / f"{name}.zarr", prediction.array,
+            kind=prediction.kind,
+            **prediction.attrs,
+            **shared_attrs(grid, run_dir, step, data_config),
+        )
+        print(f"wrote {path}  {prediction.array.shape} {prediction.array.dtype}", flush=True)
+        del prediction
+
+    truth = grid.read_ground_truth()
+    instances = int((np.unique(truth) != 0).sum())
+    path = write_array(
+        out / f"{name}.gt.zarr", truth,
+        kind="instances",
+        # 0 is background in every label store in this corpus, and -1 never occurs in one, so
+        # nothing here is unannotated. Stated rather than assumed: for a thresholded-components
+        # prediction 0 means "no edge survived", which is a different claim entirely.
+        background_id=0,
+        instances=instances,
+        **shared_attrs(grid, run_dir, step, data_config),
+    )
+    print(f"wrote {path}  {truth.shape} int64, {instances} instances, "
+          f"{100.0 * float((truth != 0).mean()):.1f}% annotated", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("run_dir", type=Path, help="a mia-train run directory")
     parser.add_argument("--data-config", type=Path, required=True,
-                        help="the miao YAML describing the volume (e.g. an eval split's config)")
-    parser.add_argument("--volume", type=str, required=True, help="which volume in it to predict")
+                        help="the miao YAML describing the volumes (e.g. an eval split's config)")
+    parser.add_argument("--volume", type=str, default=None,
+                        help="predict only this volume of the data config; default is every "
+                             "volume in it, one after another")
     parser.add_argument("--out", type=Path, required=True,
-                        help="output directory; artifacts are named after the volume")
+                        help="output directory; artifacts are named after each volume")
     parser.add_argument("--step", type=int, default=None,
                         help="checkpoint step to load; default is the newest")
     parser.add_argument("--patch", type=int, default=None,
@@ -343,41 +412,18 @@ def main() -> None:
         # here in a second rather than after the reads.
         predictor = select_predictor(algorithm)
 
-    grid = VolumeGrid(
-        config, args.volume, resolve_patch(config, resolved, args.volume, args.patch)
-    )
-
-    if predictor is not None:
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats()
-        prediction = predictor.run(grid, device)
-        if device.type == "cuda":
-            properties = torch.cuda.get_device_properties(0)
-            print(f"peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB of "
-                  f"{properties.total_memory / 2**30:.0f} GiB ({properties.name})", flush=True)
-
-        path = write_array(
-            args.out / f"{args.volume}.zarr", prediction.array,
-            kind=prediction.kind,
-            **prediction.attrs,
-            **shared_attrs(grid, args.run_dir, step, args.data_config),
+    names = volumes_to_predict(config, args.volume)
+    for index, name in enumerate(names, 1):
+        if len(names) > 1:
+            print(f"[{index}/{len(names)}] {name}", flush=True)
+        run_volume(
+            config, name, args.out, args.run_dir, args.data_config, step, resolved,
+            predictor, device, args.patch,
         )
-        print(f"wrote {path}  {prediction.array.shape} {prediction.array.dtype}", flush=True)
-
-    truth = grid.read_ground_truth()
-    instances = int((np.unique(truth) != 0).sum())
-    path = write_array(
-        args.out / f"{args.volume}.gt.zarr", truth,
-        kind="instances",
-        # 0 is background in every label store in this corpus, and -1 never occurs in one, so
-        # nothing here is unannotated. Stated rather than assumed: for a thresholded-components
-        # prediction 0 means "no edge survived", which is a different claim entirely.
-        background_id=0,
-        instances=instances,
-        **shared_attrs(grid, args.run_dir, step, args.data_config),
-    )
-    print(f"wrote {path}  {truth.shape} int64, {instances} instances, "
-          f"{100.0 * float((truth != 0).mean()):.1f}% annotated", flush=True)
+        # One volume's blend buffers can be hundreds of GB; release them before the next.
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
