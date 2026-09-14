@@ -26,12 +26,16 @@ spatial detail a mask can carry, each as a full chain identical to `base` but fo
     bash experiments/sam_lmd_v1/predict_eval.sh feat64 0              # eight volumes -> instances
     bash experiments/sam_lmd_v1/score.sh feat64 0                     # -> the leaderboard table
 
-**Status (2026-09-12, version 3).** Two full launches were stopped and their artifacts deleted;
-what they taught is in "What versions 1 and 2 established" below, with every number. Version 3
-trains ONE arm (`feat64`) for round 0 only, 200k steps, the original prompting recipe, with the
-mask loss fixed to ignore unlabelled voxels and the labeller reconciling windows by agreement.
-The data-engine rounds and the other arms wait until that model's single-window recall says it
-is worth labelling with.
+**Status (2026-09-13 evening, version 4 launched).** Three arms on the encoder's scale (below);
+version 3's single arm is superseded and its round-0 checkpoints remain for reference.
+
+**Version 3 (2026-09-13, round 0 done).** Two full launches were stopped and their
+artifacts deleted; what they taught is in "What versions 1 and 2 established" below, with every
+number. Version 3 trained ONE arm (`feat64`) for round 0 only, 200k steps, the original prompting
+recipe, with the mask loss fixed to ignore unlabelled voxels and the labeller reconciling windows
+by agreement. Results in "Version 3" below: single-window recall 0.135 -> 0.215 from 100k to 200k
+at ceiling precision, assembled pseudo-labels 0.32 precision / 0.15 recall (purity 0.89, merges
+6%), curve not converged. The data-engine rounds and the other arms are the next decision.
 
 Configs are generated: `make_configs.py` emits the 24 TOMLs (8 arms x 3 rounds); an arm's identity
 is its entry in `ARMS` and nothing else. `unlabeled_corpus.yaml` is a pinned copy of the data config
@@ -508,6 +512,173 @@ where two gated masks agree in their shared overlap (symmetric IoU, one partner 
 `edge_discard` a face margin so a truncated mask cannot pass as complete, turn anything ambiguous
 into ignore (-1) rather than a guess, and gate continuations before using them. `predict_eval.sh` uses the same `propagate` assembly, so the
 leaderboard number is exposed to the same loss.
+
+## Version 3 (2026-09-12/13): `feat64`, round 0, 200k steps
+
+One arm, ground truth only, v1 recipe, loss ignoring unlabelled voxels (job 154276643, run
+`sam1__feat64_r0_20260912_180421`, 0.42 s/step, 16 checkpoints). Validation one-click IoU per 25k
+window: 0.27, 0.33, 0.36, 0.40, 0.41, 0.41, 0.42, 0.46 (last evaluation 0.52); training IoU
+0.27 -> 0.53, so a train-val gap (~0.07) opened for the first time and the curve was still rising
+at the schedule's floor. Label quality on the same four GT blocks as every earlier table
+(H100, gates 0.7 / 0.8):
+
+| checkpoint | single window prec / recall | consensus block prec / recall | merges | fragments | purity | claimed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 50k | 0.668 / 0.145 | 0.214 / 0.085 | 8.0% | 7.9% | 0.88 | 33% |
+| 100k | 0.758 / 0.135 | 0.256 / 0.089 | 7.7% | 8.4% | 0.90 | 31% |
+| 150k | 0.803 / 0.148 | 0.380 / 0.107 | 5.8% | 11.5% | 0.90 | 40% |
+| **200k** | **0.759 / 0.215** | **0.324 / 0.148** | 6.1% | 14.2% | 0.89 | 47% |
+| v2 `deep4` 100k | 0.834 / 0.126 | 0.306 / 0.078 | 4.2% | 10.0% | 0.91 | 33% |
+| perfect model | 0.765 / 0.952 | 0.750 / 0.957 | 2.6% | 12.8% | 0.90 | 78% |
+
+Per volume at 200k, consensus precision@0.5 / merges / fragments: hemibrain 0.227 / 23 / 126,
+kasthuri 0.414 / 2 / 1, liconn 0.562 / 3 / 7, zebrafish 0.308 / 1 / 14.
+
+**Window step 64 instead of 128** (a quarter window; 125 windows per 512 block instead of 27,
+4.7x the labelling time), consensus:
+
+| checkpoint | step | masks | prec / recall | merges | fragments | purity | claimed | s / block |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100k | 128 | 363 | 0.256 / 0.089 | 7.7% | 8.4% | 0.90 | 31% | 71 |
+| 100k | 64 | 522 | 0.222 / 0.104 | 8.6% | 12.7% | 0.87 | 38% | 390 |
+| 200k | 128 | 476 | 0.324 / 0.148 | 6.1% | 14.2% | 0.89 | 47% | 139 |
+| 200k | 64 | 677 | 0.282 / 0.171 | 8.9% | 18.5% | 0.85 | 54% | 654 |
+
+Per volume at 200k, step 128 -> 64: hemibrain 0.227 -> 0.248, kasthuri 0.414 -> 0.322, liconn
+0.562 -> 0.488, zebrafish 0.308 -> 0.205. The finer step buys recall (+16%) at the price of
+precision (-13%), merges (29 -> 60) and fragments (148 -> 206): with a real model, every extra
+window is also an extra chance for a spill mask to be painted where no other window contradicts
+it, and at ~20-30% per-window recall the extra views bring fewer partners than the half-recall
+oracle enjoyed (it gained recall 0.71 -> 0.88 AND precision). Not worth 4.7x the time at this
+model quality; the half-window step stays the default. `min_support = 2` at step 64 is the untested
+knob against exactly this failure (a cell claimed by one window only is dropped).
+
+The per-candidate probe (100k -> 200k): candidates passing the gates per grid click 0.19 -> 0.50;
+precision of what passes 0.970 -> 0.967 (at the ceiling both times); on-object clicks answered
+with a mask of IoU >= 0.5 by the head's top pick 0.54 -> 0.66 (oracle pick 0.59 -> 0.71); head
+correlation 0.83 -> 0.85; on hemibrain, passing candidates per click 0.12 -> 0.47. The share of
+BACKGROUND clicks that pass the gate rose 0.050 -> 0.113 (liconn 0.14 -> 0.32) -- the quantity
+the retired v2 recipe trained down to 0.003 -- but they contribute 6.7% of the kept masks and
+the passing precision did not move, so most of them are masks of the neighbouring object.
+
+Read:
+
+- **Training longer improved the labels, mostly in recall.** Single-window recall 0.135 -> 0.215
+  between 100k and 200k, block recall 0.089 -> 0.148, twice the objects found per window; precision
+  held at the metric's ceiling for single windows (0.76 vs 0.77 for a perfect model) and rose from
+  0.26 to 0.32 assembled. Against the version 2 model at its 100k end point, recall is up 70%
+  (single window) and 90% (assembled).
+- **It is still a long way from a perfect model's 0.95 recall**, and the assembled precision is
+  low for the reason established before: pieces found in one window and missed in the next.
+  Fragments grew with recall (87 -> 148) because more pieces reach a seam without a partner.
+- **What the low IoU-precision now costs is less than it reads.** Since the loss ignores unlabelled
+  voxels and consensus leaves disputed cells unlabelled, a truncated piece is a valid target for
+  the voxels it covers and teaches no boundary at the seam. The numbers that bound the damage a
+  pseudo-label round would do are purity (0.89: 11% of a mask's voxels belong to something else)
+  and merges (6%), not precision@0.5 against whole objects.
+- **The curve had not converged.** The last 50k steps produced the largest recall gain, the
+  validation IoU was still rising at the floor, and the train-val gap says the four volumes are
+  now being fit -- the point at which more data (a pseudo-label round, or a longer schedule with
+  the same data) is the next lever.
+
+### The single-crop tests (2026-09-13): can the model fit one crop at all?
+
+`overfit/`: `feat64_r0.toml` with ONE fixed hemibrain crop as both training and validation data,
+no augmentation, 2000 steps, one B300 GPU, from the LVD checkpoint. `8nm` is a 256^3 crop at the
+experiment's resolution (token 128 nm, mask cell 32 nm); `4nm` is the central 1 um of the same
+crop read at 4 nm (2x upsampled: token 64 nm, cell 16 nm). Same objects, same pipeline.
+
+| test | one-click IoU (grid) | one-click IoU (voxel) | after 2 corrections | loss (round 0) |
+| --- | ---: | ---: | ---: | ---: |
+| `8nm`, mean of steps 1500-2000 | 0.49 | 0.46 | 0.57 | 0.51 |
+| `4nm`, mean of steps 1500-2000 | 0.80 | 0.78 | 0.83 | 0.20 |
+| reference: the 200k run on its training crops | 0.55 | 0.53 | 0.63 | 0.45 |
+
+| `8nm_stride2` (mask cell 16 nm, token unchanged), at step 1500, killed | 0.57 | 0.55 | 0.62 | 0.41 |
+| for comparison at step 1500: `8nm` / `4nm` | 0.49 / 0.83 | 0.43 / 0.79 | 0.57 / 0.87 | 0.55 / 0.21 |
+
+Read: at 8 nm the model cannot fit even one crop it sees every step -- it reaches the same
+0.5-0.6 the 200k run reached on the whole corpus, with the loss flattening. The same objects,
+read at twice the resolution, fit to 0.8+ in the same 2000 steps. So the plateau is not data
+scale, not batch size, not augmentation and not the schedule: it is what the model can represent
+when a neurite is about one encoder token (128 nm) wide. The 4 nm test halves both the token and
+the mask cell; `overfit_8nm_stride2.toml` (mask cell 16 nm, token unchanged) separated the two:
+a finer mask grid alone recovers a fraction (0.49 -> 0.57 at step 1500, against 0.83 at 4 nm),
+in line with the `stride2` arms of versions 1 and 2, which never beat the base head. The token
+is the constraint; the mask head is not where the fix is. Killed at step 1500 on that evidence.
+
+### The data at the token's scale (2026-09-13)
+
+`figures/token_scale.py` (output: `$STAGE/figures/token_scale_slices.png`, `token_scale_stats.png`,
+`token_scale_stats.json`) measures, on the single-window diagnostic block of each volume, how the
+labelled objects compare with the encoder's 128 nm token. No model involved.
+
+| volume | objects in 256^3 | local thickness, median | object voxels within 64 nm of another label | objects per occupied token | tokens holding >= 2 objects |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| hemibrain | 104 | 121 nm | 52% | 2.11 | 62% |
+| kasthuri | 54 | 120 nm | 53% | 2.02 | 58% |
+| zebrafish | 99 | 56 nm | 82% | 2.07 | 74% |
+| liconn | 26 | 167 nm | 42% | 1.31 | 28% |
+
+Local thickness is twice the distance from an object voxel to the nearest voxel of a different
+label, over all object voxels (a boundary-weighted proxy). Read with the probe's per-volume result
+(share of on-object clicks answered at IoU >= 0.5, 200k: liconn 0.96, hemibrain 0.64, zebrafish
+0.56, kasthuri 0.47): liconn is the one volume where a token usually holds ONE object (72% of
+tokens) and objects are thickest, and it is the one volume the model handles. The other three
+put two or more objects in most tokens. The contrast in thickness is about 1.4x, not an order of
+magnitude; the sharper contrast is crowding per token (1.3 vs 2.0-2.1). Thickness alone does not
+order the other three (zebrafish is thinnest yet mid-table; kasthuri is 29 nm sections upsampled
+3.6x in z), so the token-scale argument explains liconn-versus-the-rest, not the full ranking.
+
+## Version 4 (2026-09-13): the token against the neurite, on the real task
+
+The single-crop tests said the version-3 model could not represent the masks at a 128 nm token
+and could at 64 nm; the token-scale figures said liconn, the one volume it handles, is the one
+where a token usually holds one object. Version 4 tests that on the whole corpus, with three arms
+that differ from version 3 in the encoder's scale and share everything else: `feat64` head, LVD
+start, v1 prompting recipe, loss ignoring unlabelled voxels, 200k steps linear 3e-4 -> 3e-7,
+round 0 only, one B300 node each, and **3D axial RoPE** (`pos_embed_rope_type = "vanilla"`, each
+axis a third of the rotary channels) instead of superposition. That last change was requested
+for all three arms; it perturbs the pretrained attention weights, which expect the 2D channel
+layout, so the arms compare with each other and not with version 3.
+
+| arm | config | lattice | patch | tokens / window | token | mask cell | window | global batch |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | `arm1_4nm_r0.toml` | 4 nm (2x upsampled) | 16 | 4,096 | 64 nm | 16 nm | 1 um | 8 |
+| 2 | `arm2_4nm_gb16_r0.toml` | 4 nm | 16 | 4,096 | 64 nm | 16 nm | 1 um | 16 (2 per rank) |
+| 3 | `arm3_p8_r0.toml` | 8 nm | 8 | 32,768 | 64 nm | 16 nm | 2 um | 8 |
+| 4 | `arm4_8nm_gb16_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | 16 (2 per rank) |
+| 5 | `arm5_8nm_gb32_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | 32 (4 per rank), 16 workers |
+
+Arms 1 and 3 put the same token and the same mask cell on the tissue; they differ in field of
+view (1 vs 2 um), tokens per window (8x) and native vs interpolated voxels. Arm 2 is arm 1 at
+twice the samples per step at the same LR. Arms 4 and 5 (added 2026-09-13 evening, after arm 2's
+first hours looked strong) ask the batch-size question at version 3's own geometry, 128 nm token
+and 32 nm cell, at 2 and 4 crops per rank; against version 3 they differ only in the RoPE and the
+batch, so together with arm 1 vs arm 2 they separate "the token was too coarse" from "the batch
+was too small". Read a batch-16 arm at step N against a batch-8 arm at step 2N as well as at N.
+Arm 5 runs 16 dataloader workers per rank instead of the usual 8: at 8 its node delivered ~28
+crops/s, the same as arm 4 with half the crops per step, and the GPUs waited 15% of every step;
+it was restarted with 16 after 300 steps (2026-09-13 22:40). `min_object_voxels` is a physical size, so it is 4096
+voxels at 4 nm (= 512 at 8 nm); `mask_upscale = 4` at patch 8 is stride 2, i.e. the 16 nm cell.
+
+**How the patch-8 encoder is initialised.** The released kernel is `(1024, 3, 16, 16)`. The
+loader averages RGB to one channel, spreads the kernel over 16 depth slices divided by 16 (a
+z-constant volume reproduces the 2D response), and then, because the model's patch is 8, resizes
+the 16^3 cube to 8^3 by FlexiViT's pseudo-inverse rule specialised to block-mean downsampling:
+the least-squares kernel whose response to a half-resolution patch matches the full kernel's is
+the SUM over each 2x2x2 block (`utils.pretrained.resize_patch_kernel`). It is exact for any patch
+that is constant over those blocks, so the patch-8 model starts as the pretrained model would
+respond to the same tissue seen at half resolution -- the 4 nm runs' trick folded into the first
+layer. RoPE needs nothing: coordinates are normalised to the runtime grid, so 32^3 positions are
+as valid as 16^3. Tests in `tests/unit/test_pretrained.py`.
+
+Data configs at 4 nm are generated copies of lmd_ssl_v1's splits with `resolutions` rewritten
+(`data/lmd_{finetune,val}_singlescale_4nm.yaml`); boxes are in the stores' own voxels and unchanged.
+Reading them: `tensorboard.sh` (the three arms only). Scoring them needs the diagnostics told the
+lattice: for arms 1/2 the GT config is the 4 nm copy and a 1024-voxel block is the 512-voxel
+block of every earlier table (`--gt-config`, `--block 1024`, single-tile blocks 576), and the
+labeller's `min_mask_voxels` is 4096 there; arm 3 scores as before.
 
 ## Core changes this experiment needed
 

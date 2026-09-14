@@ -56,10 +56,11 @@ SAMPLES_PER_EPOCH = 100_000
 VAL_SAMPLES = 32                # what arms 1/2 validated on; see lmd_ssl_v1/make_configs.py
 
 # The encoder block of lmd_ssl_v1 arm 2, verbatim except for the attention kernel (see comment).
+# Version 4 arms parametrise the patch size and the RoPE type (see `render`).
 MODEL = '''[model]
 name = "dinov3_vit3d"
-img_size = 256            # 16^3 = 4096 tokens at patch 16
-patch_size = 16
+img_size = 256            # %(grid)d^3 = %(tokens)d tokens at patch %(patch)d
+patch_size = %(patch)d
 in_chans = 1
 embed_dim = 1024          # ViT-L/16, 303M parameters
 depth = 24
@@ -68,10 +69,8 @@ n_storage_tokens = 4
 layerscale_init = 1.0e-05 # NOT optional: the released weights were trained with LayerScale
 mask_k_bias = true
 pos_embed_rope_dtype = "fp32"
-# Forced by the initialisation, as in arm 2: the released weights are 2D and superposition is the
-# variant that inflates. Its depth term sits behind a ZERO-INITIALISED scalar, so
-# layerwise_lr_decay and patch_embed_lr_mult stay at 1.0 below, or z-position never learns.
-pos_embed_rope_type = "superposition"
+%(rope_note)s
+pos_embed_rope_type = "%(rope)s"
 # 0.0 where arms 1/2 wrote 0.1 -- functionally the same setting. DINOv3's drop path is SAMPLE-level
 # stochastic depth (whole samples leave a block's residual branch), and at one sample per rank the
 # subset is always the whole batch, so 0.1 dropped nothing in arms 1/2 either. Written as 0.0 so the
@@ -85,10 +84,28 @@ use_fa4 = false
 
 INIT_LVD = f'''[init]
 path = "{DINOV3_LVD}"
-inflate_2d_to_3d = true   # the 2D (1024,3,16,16) patch kernel, averaged over RGB, spread over z
+# The 2D (1024,3,16,16) patch kernel, averaged over RGB and spread over z; for a patch smaller than
+# the checkpoint's 16 it is then pseudo-inverse resized (block sums), see utils.pretrained.
+inflate_2d_to_3d = true
 skip = ["rope_embed."]    # derived from `base` in init_weights; 2D and 3D split channels apart
 strict = true
 '''
+
+ROPE_NOTES = {
+    "superposition": (
+        "# Forced by the initialisation, as in arm 2: the released weights are 2D and "
+        "superposition is the\n# variant that inflates. Its depth term sits behind a "
+        "ZERO-INITIALISED scalar, so\n# layerwise_lr_decay and patch_embed_lr_mult stay at 1.0 "
+        "below, or z-position never learns."
+    ),
+    "vanilla": (
+        "# 3D AXIAL RoPE (version 4): each axis owns a third of the rotary channels. The "
+        "pretrained attention\n# weights expect the 2D channel layout, so the encoder starts "
+        "perturbed and adapts; every version-4\n# arm shares this, so they compare with each "
+        "other, not with "
+        "version 3."
+    ),
+}
 
 INIT_WARM = '''[init]
 # A TRUE warm start: encoder, neck, prompt encoder and mask decoder, from the round that labelled
@@ -171,6 +188,34 @@ ARMS: list[dict] = [
                "the image before the mask is read out (the paper's data-engine model used three)."),
     dict(name="wide512", knobs={"prompt_dim": 512},
          blurb="a 512-wide neck and decoder instead of 256."),
+    # ---- VERSION 4 (2026-09-13): the encoder's token against the neurite. Round 0 only, feat64
+    # head, 3D axial RoPE. `arm1` and `arm3` both put a 64 nm token and a 16 nm mask cell on the
+    # tissue; arm1 by reading at 4 nm (1 um window, 4096 tokens), arm3 by patch 8 at 8 nm (2 um
+    # window, 32768 tokens). `arm2` is arm1 at twice the global batch. The 512-voxel object floor
+    # is a physical size, so it is 4096 voxels at 4 nm.
+    dict(name="arm1_4nm", knobs={"mask_feature_dim": 64, "min_object_voxels": 4096},
+         nm=4, rope="vanilla", rounds=0,
+         blurb="version 4 arm 1: the finetune volumes read at 4 nm (2x upsampled), so a token is "
+               "64 nm and a mask cell 16 nm over a 1 um window; feat64 head; 3D axial RoPE."),
+    dict(name="arm2_4nm_gb16", knobs={"mask_feature_dim": 64, "min_object_voxels": 4096},
+         nm=4, rope="vanilla", batch=2, rounds=0,
+         blurb="version 4 arm 2: arm 1 with two crops per rank, global batch 16 at the same LR."),
+    dict(name="arm3_p8", knobs={"mask_feature_dim": 64},
+         patch=8, rope="vanilla", rounds=0,
+         blurb="version 4 arm 3: patch 8 at 8 nm -- the same 64 nm token and 16 nm mask cell as "
+               "arm 1 (mask_upscale 4 at patch 8 is stride 2) over the full 2 um window, 32768 "
+               "tokens per crop; the checkpoint's 16^3 patch kernel is pseudo-inverse resized to "
+               "8^3 at load."),
+    # The batch-size question on its own: version 3's geometry (8 nm, patch 16, 32 nm cells) with
+    # 2 and 4 crops per rank, axial RoPE like the other version-4 arms, same LR.
+    dict(name="arm4_8nm_gb16", knobs={"mask_feature_dim": 64}, rope="vanilla", batch=2, rounds=0,
+         blurb="version 4 arm 4: version 3's geometry (8 nm, patch 16, 128 nm token, 32 nm cell) "
+               "at two crops per rank, global batch 16, same LR; 3D axial RoPE."),
+    dict(name="arm5_8nm_gb32", knobs={"mask_feature_dim": 64}, rope="vanilla", batch=4, rounds=0,
+         workers=16,
+         blurb="version 4 arm 5: as arm 4 at four crops per rank, global batch 32. 16 dataloader "
+               "workers per rank instead of 8: at 8 the loader capped the node at ~28 crops/s, the "
+               "same as arm 4, and the GPUs waited 15% of every step (measured at launch)."),
 ]
 
 AUGMENT = '''[augment]
@@ -197,7 +242,7 @@ warmup_steps = %(warmup)d
 min_lr_ratio = %(min_lr_ratio)s
 weight_decay = 0.05
 grad_clip_norm = 1.0
-layerwise_lr_decay = 1.0  # MUST stay 1.0: superposition RoPE's depth gate is a zero-init scalar
+layerwise_lr_decay = 1.0  # 1.0 for every arm: superposition RoPE's depth gate is a zero-init scalar
 patch_embed_lr_mult = 1.0
 lr_schedule = "linear"
 precision = "bf16"
@@ -219,24 +264,53 @@ tp = 1
 '''
 
 
-def head_block(knobs: dict[str, object]) -> str:
+def head_block(knobs: dict[str, object], patch: int = 16, nm: int = 8) -> str:
     settings = dict(BASE_HEAD)
     settings.update(knobs)
+    notes = dict(HEAD_NOTES)
+    stride = patch // int(settings["mask_upscale"])
+    notes["mask_upscale"] = (f"masks come out at patch_size / mask_upscale voxels; "
+                             f"{settings['mask_upscale']} -> stride {stride} = {stride * nm} nm")
     lines = ['[algorithm]', 'name = "promptable_seg"']
     for key, value in settings.items():
         literal = f'"{value}"' if isinstance(value, str) else str(value).lower() \
             if isinstance(value, bool) else str(value)
         marker = "   # <-- THIS ARM'S KNOB" if key in knobs else ""
-        lines.append(f"{key} = {literal}{marker}  # {HEAD_NOTES[key]}")
+        lines.append(f"{key} = {literal}{marker}  # {notes[key]}")
     return "\n".join(lines) + "\n"
 
 
-def data_blocks(round_index: int) -> str:
+def split_path(which: str, nm: int) -> str:
+    """The data config of one split at one lattice: lmd_ssl_v1's own at 8 nm, a generated copy
+    with `resolutions` replaced at 4 nm (`data/` beside this file)."""
+    if nm == 8:
+        return f"{SPLITS}/lmd_{which}_singlescale.yaml"
+    return f"experiments/sam_lmd_v1/data/lmd_{which}_singlescale_{nm}nm.yaml"
+
+
+def split_copies() -> dict[str, str]:
+    """The 4 nm split configs: the 8 nm YAMLs with `resolutions` rewritten, nothing else."""
+    files = {}
+    for which in ("finetune", "val"):
+        text = (HERE.parents[1] / SPLITS / f"lmd_{which}_singlescale.yaml").read_text()
+        old = "resolutions:\n- - 8.0\n  - 8.0\n  - 8.0\n"
+        assert old in text, f"{which}: resolutions block not found"
+        new = ("# GENERATED by experiments/sam_lmd_v1/make_configs.py from " + SPLITS +
+               f"/lmd_{which}_singlescale.yaml:\n# the same volumes, boxes and weights read at "
+               "4 nm (the stores' 8 nm level 0, upsampled 2x), so a 256-voxel\n# window is 1 um "
+               "and an "
+               "encoder token 64 nm. Edit the generator, not this.\n"
+               "resolutions:\n- - 4.0\n  - 4.0\n  - 4.0\n")
+        files[f"data/lmd_{which}_singlescale_4nm.yaml"] = text.replace(old, new, 1)
+    return files
+
+
+def data_blocks(round_index: int, nm: int = 8) -> str:
     if round_index == 0:
-        source = f'config_path = "{SPLITS}/lmd_finetune_singlescale.yaml"'
+        source = f'config_path = "{split_path("finetune", nm)}"'
         note = ("# The four ground-truth finetune volumes of lmd_ssl_v1 (kasthuri15_ac3, zebrafish "
-                "quadcube1,\n# liconn_mouse_dg, hemibrain_ellipsoid_body), equally weighted, 8 nm, "
-                "patch 256.")
+                f"quadcube1,\n# liconn_mouse_dg, hemibrain_ellipsoid_body), equally weighted, "
+                f"{nm} nm, patch 256.")
     else:
         source = 'config_path = "ROUND_CONFIG"'
         note = ("# The round's mixture -- the same four ground-truth volumes plus one entry per "
@@ -260,7 +334,7 @@ defer_image_ops = false
 # round is scored at its final step, as arms 1/2 were, so nothing here leaks into the reported
 # number.
 name = "miao_volumes"
-config_path = "{SPLITS}/lmd_val_singlescale.yaml"
+config_path = "{split_path("val", nm)}"
 samples_per_epoch = {VAL_SAMPLES}
 defer_image_ops = false
 '''
@@ -268,6 +342,13 @@ defer_image_ops = false
 
 def render(arm: dict, round_index: int) -> str:
     name = arm["name"]
+    patch = arm.get("patch", 16)
+    rope = arm.get("rope", "superposition")
+    nm = arm.get("nm", 8)
+    batch = arm.get("batch", BATCH_PER_RANK)
+    workers = arm.get("workers", WORKERS)
+    model = MODEL % dict(patch=patch, grid=256 // patch, tokens=(256 // patch) ** 3, rope=rope,
+                         rope_note=ROPE_NOTES[rope])
     if round_index == 0:
         steps, lr, init = R0_STEPS, LR_R0, INIT_LVD
         what = (f"round 0 -- ground truth only. From the released DINOv3 LVD-1689M checkpoint, "
@@ -285,20 +366,20 @@ def render(arm: dict, round_index: int) -> str:
 # GENERATED by experiments/sam_lmd_v1/make_configs.py -- edit that, not this.
 experiment_name = "{PREFIX}{name}_r{round_index}"
 
-{MODEL}
+{model}
 {init}
-{head_block(arm['knobs'])}
-{data_blocks(round_index)}
+{head_block(arm['knobs'], patch, nm)}
+{data_blocks(round_index, nm)}
 {TRAINER % dict(max_steps=steps, lr=lr, warmup=WARMUP, min_lr_ratio=MIN_LR_RATIO,
-                batch=BATCH_PER_RANK, dp_shard=DP_SHARD, global_batch=BATCH_PER_RANK * DP_SHARD,
-                workers=WORKERS)}
+                batch=batch, dp_shard=DP_SHARD, global_batch=batch * DP_SHARD,
+                workers=workers)}
 {AUGMENT}"""
 
 
 def outputs() -> dict[str, str]:
-    files = {}
+    files = dict(split_copies())
     for arm in ARMS:
-        for round_index in range(3):
+        for round_index in range(1 + arm.get("rounds", 2)):
             files[f"{arm['name']}_r{round_index}.toml"] = render(arm, round_index)
     return files
 
@@ -307,9 +388,11 @@ def main(argv: list[str]) -> int:
     check = "--check" in argv
     stale = []
     for name, text in outputs().items():
-        parsed = tomllib.loads(text)             # a file that does not parse is a bug here
-        assert parsed["algorithm"]["name"] == "promptable_seg"
+        if name.endswith(".toml"):
+            parsed = tomllib.loads(text)         # a file that does not parse is a bug here
+            assert parsed["algorithm"]["name"] == "promptable_seg"
         path = HERE / name
+        path.parent.mkdir(exist_ok=True)
         if check:
             if not path.is_file() or path.read_text() != text:
                 stale.append(name)

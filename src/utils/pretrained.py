@@ -119,6 +119,31 @@ def read_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
     return _unwrap(torch.load(path, map_location="cpu", weights_only=False))
 
 
+def resize_patch_kernel(kernel: torch.Tensor, ratio: int) -> torch.Tensor:
+    """A patch kernel (E, C, kd, kh, kw) -> one for a patch `ratio` times smaller on every axis.
+
+    FlexiViT's pseudo-inverse resize, specialised to an integer factor. The question it answers:
+    the model will now see a patch of `k / ratio` voxels where the checkpoint saw `k`; treat the
+    new patch as the old one viewed at `1 / ratio` the resolution, and ask for the kernel `w'`
+    whose response to the downsampled patch best reproduces the old kernel's response to the
+    full one, `<B x, w'> ~ <x, w>` over inputs `x`, with `B` the block-mean downsampler. The
+    least-squares answer is `(B B^T)^-1 B w`; for block means `B B^T = I / ratio^3`, so `w'` is
+    simply the SUM of `w` over each `ratio^3` block. Exact for any patch that is constant over
+    those blocks, which is what a 2x-upsampled image is -- the same operation the 4 nm runs apply
+    to the data, folded into the first layer instead.
+    """
+    if ratio < 1:
+        raise ValueError(f"ratio must be a positive integer, got {ratio}")
+    if ratio == 1:
+        return kernel
+    e, c, d, h, w = kernel.shape
+    if d % ratio or h % ratio or w % ratio:
+        raise ValueError(f"kernel {tuple(kernel.shape)} does not divide by {ratio}")
+    return kernel.reshape(e, c, d // ratio, ratio, h // ratio, ratio, w // ratio, ratio).sum(
+        dim=(3, 5, 7)
+    )
+
+
 def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size) -> torch.Tensor:
     """A 2D patch-embedding kernel (E, C, kh, kw) -> a 3D one (E, C', kd, kh, kw).
 
@@ -132,6 +157,11 @@ def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size) -> torch.Tensor:
     is constant in z reproduces the 2D model's output on that slice exactly. Dividing matters: a
     plain repeat would multiply every activation by the patch depth and push the first layer far
     outside the range the rest of the pretrained stack expects.
+
+    A third, only when the model's patch is SMALLER than the checkpoint's by an integer factor
+    (a 16-pixel release into a patch-8 model): the inflated cube is pseudo-inverse resized with
+    `resize_patch_kernel`, so the patch-8 model starts as the 2D model would respond to the same
+    tissue seen at half resolution. A larger patch, or a non-integer factor, is refused.
     """
     if weight.ndim != 4 or len(target) != 5:
         raise ValueError(
@@ -141,12 +171,25 @@ def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size) -> torch.Tensor:
     out_channels, in_channels, height, width = weight.shape
     target_out, target_in, depth, target_height, target_width = target
 
-    if (out_channels, height, width) != (target_out, target_height, target_width):
+    if out_channels != target_out:
         raise ValueError(
             f"cannot inflate a {tuple(weight.shape)} kernel into {tuple(target)}: the output "
-            "channels and the in-plane kernel must already match. Configure the model with the "
-            "checkpoint's patch size, or resize the kernel yourself first."
+            "channels must match."
         )
+    if (height, width) != (target_height, target_width):
+        divisible = (
+            height % target_height == 0 and width % target_width == 0
+            and height // target_height == width // target_width
+            and height >= target_height
+        )
+        if not divisible:
+            raise ValueError(
+                f"cannot inflate a {tuple(weight.shape)} kernel into {tuple(target)}: the in-plane "
+                "kernel must match, or be a whole multiple of the target's (a smaller patch, "
+                "resized by block sums). Configure the model with the checkpoint's patch size, or "
+                "resize the kernel yourself first."
+            )
+    ratio = height // target_height
 
     if in_channels != target_in:
         if target_in == 1:
@@ -160,7 +203,10 @@ def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size) -> torch.Tensor:
             )
 
     # (E, C, kh, kw) -> (E, C, kd, kh, kw), each z-slice carrying 1/kd of the original kernel.
-    return (weight.unsqueeze(2).expand(-1, -1, depth, -1, -1) / depth).contiguous()
+    # The cube is built at the checkpoint's kernel size (depth * ratio) and only then resized, so
+    # the depth normalisation and the resize compose as two independent, exact steps.
+    cube = weight.unsqueeze(2).expand(-1, -1, depth * ratio, -1, -1) / (depth * ratio)
+    return resize_patch_kernel(cube, ratio).contiguous()
 
 
 def merge_lora_tensors(

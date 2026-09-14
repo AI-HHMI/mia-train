@@ -1,74 +1,58 @@
 #!/usr/bin/env bash
-# Serve every sam_lmd_v1 stage that exists in one TensorBoard, beside the 150k-step reference run.
+# Serve the five version-4 arms of sam_lmd_v1 in one TensorBoard.
 #
 #   bash experiments/sam_lmd_v1/tensorboard.sh [port]
 #   bash experiments/sam_lmd_v1/tensorboard.sh 6008 --smoke     # the 20-step checks instead
 #   bash experiments/sam_lmd_v1/tensorboard.sh 6006 --list      # rebuild the tree, print, do not serve
 #
-# Rebuilds the symlink tree each time, so a stage appears as soon as its run directory exists.
-# Runs are named `r<round>_<arm>` so the legend sorts by ROUND first. Version 3 (2026-09-12) runs
-# ONE stage, `r0_feat64`, for 200k steps; the other 23 stages are listed as absent until the model
-# earns them (README, "Status"). `ref_promptable_lmd_v2` is the finished 150k-step run of the base
-# head on five native-resolution volumes at LR 1e-4 -- a different corpus and schedule, so a
-# reference curve for the metric names and plausible values, not a comparison.
+# Rebuilds the symlink tree each time, so an arm appears as soon as its run directory exists (the
+# newest run of an arm wins if it was rerun). Only the version-4 arms are served; the version-3
+# `feat64` run and the version 1/2 arms are superseded (README, "Status" and "Version 4").
 #
-# WHAT TO READ IN VERSION 3
+# THE FIVE ARMS (all: feat64 head, LVD start, 3D axial RoPE, v1 prompting recipe, loss ignoring
+# unlabelled voxels, 200k steps linear 3e-4 -> 3e-7, round 0 only)
 #
-#   first_voxel_iou     THE curve. One interior click, no correction, scored at voxel resolution on
-#                       the 32 held-out crops. Versions 1 and 2 ended at 0.44-0.45 (v1 recipe) and
-#                       0.43 (v2 recipe, harder prompt mix) after 100k steps with the curve still
-#                       rising as the linear schedule hit its floor; 200k steps exist to find out
-#                       how much further it goes. Comparable across arms and versions ONLY for the
-#                       v1 recipe (v2 mixed in boundary clicks). The reference run ends near 0.50.
+#   arm1_4nm        the four volumes read at 4 nm (2x upsampled): token 64 nm, mask cell 16 nm,
+#                   window 1 um, 4096 tokens, one crop per rank (global batch 8)
+#   arm2_4nm_gb16   arm 1 with two crops per rank (global batch 16), same LR
+#   arm3_p8         patch 8 at 8 nm: token 64 nm, mask cell 16 nm, window 2 um, 32768 tokens,
+#                   global batch 8; ~3x the step cost of arm 1
+#   arm4_8nm_gb16   version 3's geometry (8 nm, patch 16: token 128 nm, cell 32 nm, window 2 um)
+#                   at two crops per rank, global batch 16 -- the batch-size question alone
+#   arm5_8nm_gb32   the same at four crops per rank, global batch 32
 #
-#   train/first_voxel_iou vs val/first_voxel_iou
-#                       Identical in versions 1 and 2 (0.43 both): the model had not fit even the
-#                       four training volumes. A gap opening in version 3 is the first sign of
-#                       fitting them, and the moment the data engine's extra volumes start to matter.
+# WHAT TO READ
 #
-#   WHAT TENSORBOARD CANNOT SHOW  The number that decides the restart is single-window RECALL: how
-#                       many of the objects in a 256^3 window get a mask at IoU >= 0.5 (0.13 at 100k
-#                       against a perfect model's 0.95). It comes from the probe and the sweep, not
-#                       from validation IoU, which averages over prompts that were placed on objects
-#                       for it. At each 12.5k checkpoint of interest (50k, 100k, 150k, 200k):
-#                           bash experiments/sam_lmd_v1/calibration_probe.sh feat64
-#                           SETTINGS_ONLY="single_tile consensus" bash experiments/sam_lmd_v1/assembly_sweep.sh feat64
-#                       (both take the arm's newest checkpoint; pass --step to pseudolabel.py for
-#                       an older one).
+#   train/first_iou       One click, the min-loss candidate, on the mask grid. Arms 1-3 have 16 nm
+#                         cells and arms 4-5 the version-3 32 nm cells, so compare within those two
+#                         groups on this number (`first_voxel_iou` bridges them). The version-3 model
+#                         (128 nm token, 32 nm cells) plateaued at 0.53-0.55 on its training crops
+#                         and could not fit even one crop (0.49); the same crop read at 4 nm fit to
+#                         0.80. The arms exist to find out whether that holds on the whole corpus.
+#   val/first_iou         The same on 32 held-out crops. Version 3 ended at 0.52 (last eval), 0.46
+#                         (last 25k-window mean), on 8 nm crops with 32 nm cells -- not the same
+#                         target, so compare the arms with each other, not with that number.
+#   train - val gap       Version 3 opened a 0.07 gap only at the very end; with 4 nm crops each
+#                         training sample covers 1/8 of the tissue, so watch whether arms 1/2
+#                         start to fit their (smaller) windows sooner.
+#   arm1 vs arm2, arm4 vs arm5 (vs version 3's 0.53 train / 0.46 val at 200k)
+#                         The batch-size question, at equal steps AND at equal samples (a batch-16
+#                         arm sees twice the crops per step, so compare it at step N with the
+#                         batch-8 arm at 2N too). Arms 4/5 answer it at version 3's own geometry,
+#                         with only the RoPE differing from version 3.
+#   arm1 vs arm3          Same token and cell; the difference is field of view (1 vs 2 um) and
+#                         native vs interpolated voxels.
+#   first_voxel_iou       Voxel-resolution IoU; at 4 nm the voxels are finer than at 8 nm, so the
+#                         quantisation ceiling differs slightly between arms 1/2 and arm 3.
+#   first_iou_error       |predicted - achieved| of the IoU head, round 0; sat at 0.12-0.13 in every
+#                         earlier run.
+#   samples_per_s, mfu    Arm 1 should run ~0.42 s/step like version 3; arm 2 somewhat more per
+#                         step; arm 3 is the one to read off and check against its 288 h wall.
+#   data_wait_frac        Near 0.001; spikes at the epoch period (100,000 / global batch steps)
+#                         are worker respawns; a rank stuck near 1 is the stall that hit version 2.
 #
-#   final_voxel_iou     After two correction clicks. Its gap over `first_voxel_iou` (~0.10-0.13 so
-#                       far) is what interaction buys; the labeller never uses it (one click per
-#                       prompt), so it is a health signal for the training loop, not a result.
-#
-#   first_iou_error     |predicted IoU - achieved IoU| of the IoU head, round 0. Flat at 0.12-0.13
-#                       through versions 1 and 2, i.e. it did not improve with training. The
-#                       probe showed the head IS well ranked on grid prompts (precision 0.93 in the
-#                       0.7-0.8 bin), so read this as a calibration width, not a defect. Off-object
-#                       metrics (`offobject_*`) are absent in version 3: the v2 recipe is off.
-#
-#   valid_fraction      Share of prompt slots holding an object. ~1.0 on ground truth with the v1
-#                       recipe (v2's off-object slots pulled it to 0.67-0.77). In a data-engine
-#                       round it also measures the pseudo-labels: crops with nothing to prompt for
-#                       are excluded from the loss, so a lower value is wasted steps, not a worse
-#                       loss.
-#
-#   loss, loss_round_*  Focal + dice + IoU per interactive round; round 2 < round 1 < round 0 is
-#                       the healthy shape. Not comparable between recipes (v2 averaged over harder
-#                       prompts) or between round 0 and a pseudo-label round (softer, sparser
-#                       targets, and since version 3 unlabelled voxels weigh nothing).
-#
-#   lr                  One linear ramp: 3k warmup to 3e-4, then down to 3e-7 at 200k.
-#
-#   samples_per_s, mfu  feat64 ran at 0.40 s/step (20 samples/s, 8 x B300) in version 1; the same
-#                       is expected here. The v2 recipe's extra worker CPU cost ~0.13 s/step.
-#
-#   data_wait_frac      Should sit near 0.001. Spikes at the epoch period -- samples_per_epoch /
-#                       global batch = 100,000 / 8 = 12,500 steps -- are worker respawns (~4 s).
-#                       A rank stuck near 1 is the failure that stalled version 2's `base` run at
-#                       step 70k (8 s/step); if it recurs, kill and `--resume`.
-#
-# WHAT NOT TO READ ACROSS: `first_iou` between stride arms (different grids); v2 curves against v1
-# or v3 (different prompt mix); anything against `ref_promptable_lmd_v2` as a result.
+# WHAT NOT TO READ ACROSS: any of these against version 1-3 curves (different RoPE, cells and
+# voxels); `loss` between arm 3 and arms 1/2 (different voxel counts per object in the targets).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,50 +62,42 @@ RUNS=/nrs/scicompsoft/orhane/mia-train-runs
 SMOKE=/nrs/scicompsoft/orhane/mia-train-scratch/sam_lmd_v1/smoke
 VIEW=$RUNS/tb_sam_lmd_v1
 VENV=/groups/scicompsoft/home/orhane/myvenv
-ARMS=(base stride2 stride1 stride2_small feat64 refine4 deep4 wide512)
-REF=$RUNS/promptable_lmd_v2_20260910_104156
+ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32)
 
 port_busy () { ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1$"; }
 if [[ "$MODE" != "--list" ]]; then
   while port_busy "$PORT"; do echo "port $PORT is in use, trying $((PORT + 1))"; PORT=$((PORT + 1)); done
 fi
 
-rm -rf "$VIEW"; mkdir -p "$VIEW"
+# Replace the links in place rather than removing the directory: a TensorBoard already serving
+# it holds files open, and on NFS that leaves the directory undeletable.
+mkdir -p "$VIEW"; find "$VIEW" -maxdepth 1 -type l -delete
 missing=()
 link () {
   local name=$1 dir
   dir=$(ls -dt $2 2>/dev/null | head -1 || true)
   if [[ -n "$dir" && -d "${dir%/}/tensorboard" ]]; then
-    ln -sfn "${dir%/}/tensorboard" "$VIEW/$name"; printf '  %-24s -> %s\n' "$name" "$(basename "${dir%/}")"
+    ln -sfn "${dir%/}/tensorboard" "$VIEW/$name"; printf '  %-16s -> %s\n' "$name" "$(basename "${dir%/}")"
   else
     missing+=("$name")
   fi
 }
 
-echo "stages found:"
-for round in 0 1 2; do
-  for arm in "${ARMS[@]}"; do
-    if [[ "$MODE" == "--smoke" ]]; then
-      link "r${round}_${arm}" "$SMOKE/smoke_sam1__${arm}_r${round}_*/"
-    else
-      link "r${round}_${arm}" "$RUNS/sam1__${arm}_r${round}_*/"
-    fi
-  done
+echo "arms found:"
+for arm in "${ARMS[@]}"; do
+  if [[ "$MODE" == "--smoke" ]]; then
+    link "$arm" "$SMOKE/smoke_sam1__${arm}_r0_*/"
+  else
+    link "$arm" "$RUNS/sam1__${arm}_r0_*/"
+  fi
 done
-[[ "$MODE" == "--smoke" ]] || link "ref_promptable_lmd_v2" "$REF/"
-(( ${#missing[@]} )) && echo "  not run (${#missing[@]}): ${missing[*]}"
+(( ${#missing[@]} )) && echo "  not started: ${missing[*]}"
 
 echo
-echo "version 3 = r0_feat64 only: 200k steps, v1 prompting recipe, loss ignores unlabelled voxels,"
-echo "checkpoints every 12.5k; the other arms and the data-engine rounds wait on its single-window recall."
-echo "arms (one knob each, otherwise identical; see make_configs.py::ARMS):"
-echo "  base           stride 4 (32 nm masks), 32 features, 2 decoder layers, dim 256"
-echo "  stride2        masks at stride 2 (16 nm)        stride1        masks at voxel resolution"
-echo "  stride2_small  stride 2 + objects >= 64 voxels  feat64         64 mask features   <- VERSION 3"
-echo "  refine4        4 refinement convs at mask res   deep4          4-layer two-way decoder"
-echo "  wide512        512-wide neck and decoder"
-echo
-echo "rounds: r0 = GT only from the LVD checkpoint (200k)   r1 = +1 block/volume (50k)   r2 = +4 blocks/volume (50k)"
+echo "arm1_4nm = 4 nm read, 64 nm token, 1 um window, gb 8 | arm2_4nm_gb16 = arm 1 at gb 16 |"
+echo "arm3_p8 = patch 8 at 8 nm, 64 nm token, 2 um window, 32k tokens, gb 8 |"
+echo "arm4_8nm_gb16 / arm5_8nm_gb32 = version 3's geometry (8 nm, patch 16, 32 nm cells) at gb 16 / 32."
+echo "All: feat64 head, 3D axial RoPE, v1 recipe, 200k steps, LR 3e-4."
 [[ "$MODE" == "--list" ]] && exit 0
 echo; echo "http://localhost:$PORT"
 exec "$VENV/bin/tensorboard" --logdir "$VIEW" --port "$PORT"

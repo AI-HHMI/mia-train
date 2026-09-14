@@ -3,6 +3,7 @@
 #
 #   bash experiments/sam_lmd_v1/assembly_sweep.sh deep4            # every setting, teacher = newest sam1__deep4_r0
 #   SETTINGS_ONLY="propagate_s64 canvas_s64" bash experiments/sam_lmd_v1/assembly_sweep.sh deep4
+#   STEP=50000 SETTINGS_ONLY="single_tile consensus" bash experiments/sam_lmd_v1/assembly_sweep.sh feat64
 #   bash experiments/sam_lmd_v1/assembly_sweep.sh deep4 --dry-run
 #
 # `pseudolabel.py diagnose` on the SAME 512^3 block of each of the four finetune volumes that the
@@ -17,8 +18,9 @@
 # pseudo ids), `pseudo_purity` and `truth_best_share`, which is what separates wrong joins from
 # failed joins.
 #
-# Results: $STAGE/assembly_sweep/<arm>/<setting>/{<volume>.json,summary.json}, table in
-# $STAGE/assembly_sweep/<arm>/table.txt (every setting with results, whichever run produced it).
+# Results: $STAGE/assembly_sweep/<arm>_step<N>/<setting>/{<volume>.json,summary.json}, table in
+# $STAGE/assembly_sweep/<arm>_step<N>/table.txt (every setting with results, whichever run produced
+# it). The deep4 version-2 results predate the step suffix and live in assembly_sweep/deep4/.
 # Default queue gpu_h100 (B300 is admin-closed); the rows are compared with each other, and a GPU
 # generation moves instance counts by ~2%, so the `propagate` row is expected near, not at, the
 # B300 L1 diagnostic.
@@ -62,14 +64,16 @@ for name in "${RUN[@]}"; do [[ -n "${FLAGS[$name]:-}" ]] || { echo "unknown sett
 run=$(ls -dt "$RUNS"/sam1__${ARM}_r0_*/ 2>/dev/null | head -1) || true
 [[ -n "${run:-}" ]] || { echo "no run matching sam1__${ARM}_r0_*" >&2; exit 1; }
 run=${run%/}
-STEP=$(ls -d "$run"/checkpoints/step_* | sed 's|.*step_||' | sort -n | tail -1)
-OUT="$STAGE/assembly_sweep/$ARM"
+NEWEST=$(ls -d "$run"/checkpoints/step_* | sed 's|.*step_||' | sort -n | tail -1)
+STEP=${STEP:-$NEWEST}                     # STEP=50000 scores an older checkpoint of the same run
+[[ -d "$run/checkpoints/step_$STEP" ]] || { echo "no checkpoints/step_$STEP in $run" >&2; exit 1; }
+OUT="$STAGE/assembly_sweep/${ARM}_step${STEP}"
 mkdir -p "$OUT" "$LOGS" "$STAGE/cmd"
 echo "teacher $run step $STEP -> $OUT"
 echo "settings: ${RUN[*]}"
 
 STAMP=$(date +%H%M%S)
-WORKER="$STAGE/cmd/assembly_sweep_${ARM}_${STAMP}.sh"
+WORKER="$STAGE/cmd/assembly_sweep_${ARM}_step${STEP}_${STAMP}.sh"
 { echo "#!/usr/bin/env bash"
   echo "set -euo pipefail"
   echo "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
@@ -86,7 +90,7 @@ WORKER="$STAGE/cmd/assembly_sweep_${ARM}_${STAMP}.sh"
   echo "$VENV/bin/python experiments/sam_lmd_v1/pseudolabel.py diagnose '$run' --step $STEP --volume \"\$V\" \\"
   echo "  --out '$OUT'/\"\$S\"/\"\$V\".json --pred-iou $PRED_IOU --stability $STABILITY \${FLAGS[\$S]}"
 } > "$WORKER"
-FINAL="$STAGE/cmd/assembly_sweep_${ARM}_final.sh"
+FINAL="$STAGE/cmd/assembly_sweep_${ARM}_step${STEP}_final.sh"
 { echo "#!/usr/bin/env bash"
   echo "set -euo pipefail"
   printf 'cd %q\n' "$REPO"
@@ -124,11 +128,11 @@ PY
 chmod +x "$WORKER" "$FINAL"
 
 TOTAL=$(( ${#RUN[@]} * ${#GT_VOLUMES[@]} ))
-AARGS=(-P "$PROJECT" -q "$QUEUE" -gpu "num=1" -n 6 -W 3:00 -J "sam1_asweep_${ARM}[1-$TOTAL]" -cwd "$REPO"
+AARGS=(-P "$PROJECT" -q "$QUEUE" -gpu "num=1" -n 6 -W 3:00 -J "sam1_asweep_${ARM}_${STEP}[1-$TOTAL]" -cwd "$REPO"
        -o "$LOGS/sam1_asweep_${ARM}_%J_%I.log" -e "$LOGS/sam1_asweep_${ARM}_%J_%I.err")
 if (( DRY )); then printf 'bsub %s bash %q\n' "${AARGS[*]}" "$WORKER"; cat "$WORKER"; exit 0; fi
 arr=$(bsub "${AARGS[@]}" "bash '$WORKER'" | sed -n 's/^Job <\([0-9]*\)>.*/\1/p')
-fin=$(bsub -P "$PROJECT" -q local -n 2 -W 0:30 -J "sam1_asweep_${ARM}_final" -w "ended($arr)" -cwd "$REPO" \
+fin=$(bsub -P "$PROJECT" -q local -n 2 -W 0:30 -J "sam1_asweep_${ARM}_${STEP}_final" -w "ended($arr)" -cwd "$REPO" \
       -o "$LOGS/sam1_asweep_${ARM}_final_%J.log" -e "$LOGS/sam1_asweep_${ARM}_final_%J.err" "bash '$FINAL'" \
       | sed -n 's/^Job <\([0-9]*\)>.*/\1/p')
 echo "array $arr [1-$TOTAL]  ->  table job $fin  ->  $OUT/table.txt"

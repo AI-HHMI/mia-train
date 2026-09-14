@@ -3,11 +3,13 @@
 #
 #   bash experiments/sam_lmd_v1/calibration_probe.sh deep4 feat64          # newest r0 run of each arm
 #   QUEUE=gpu_b300 bash experiments/sam_lmd_v1/calibration_probe.sh deep4
+#   STEP=100000 bash experiments/sam_lmd_v1/calibration_probe.sh feat64     # an older checkpoint
 #   bash experiments/sam_lmd_v1/calibration_probe.sh deep4 --dry-run
 #
 # One LSF array element per (arm, GT volume) runs `calibration_probe.py probe` over every tile of
 # the volume's diagnostic block; a CPU job per arm then pools the four records into a table.
-# Results: $STAGE/probe/<arm>/{<volume>.npz,summary.json,table.txt}.
+# Results: $STAGE/probe/<arm>_r<round>_step<N>/{<volume>.npz,summary.json,table.txt} (the deep4 and
+# feat64 version-2 probes predate the step suffix: probe/deep4_r0, probe/feat64_r0).
 #
 # Default queue is gpu_h100: the probe compares stages of one pipeline against each other, and a
 # GPU generation shifts the decoded masks by well under the effects it looks for (memory note:
@@ -40,12 +42,14 @@ for ARM in "${ARMS[@]}"; do
   run=$(ls -dt "$RUNS"/sam1__${ARM}_r${ROUND}_*/ 2>/dev/null | head -1) || true
   [[ -n "${run:-}" ]] || { echo "no run matching sam1__${ARM}_r${ROUND}_*" >&2; exit 1; }
   run=${run%/}
-  STEP=$(ls -d "$run"/checkpoints/step_* | sed 's|.*step_||' | sort -n | tail -1)
-  OUT="$STAGE/probe/${ARM}_r${ROUND}"
+  NEWEST=$(ls -d "$run"/checkpoints/step_* | sed 's|.*step_||' | sort -n | tail -1)
+  STEP=${STEP:-$NEWEST}                   # STEP=50000 probes an older checkpoint of the same run
+  [[ -d "$run/checkpoints/step_$STEP" ]] || { echo "no checkpoints/step_$STEP in $run" >&2; exit 1; }
+  OUT="$STAGE/probe/${ARM}_r${ROUND}_step${STEP}"
   mkdir -p "$OUT"
   echo "teacher $run step $STEP -> $OUT"
 
-  WORKER="$STAGE/cmd/probe_${ARM}_r${ROUND}.sh"
+  WORKER="$STAGE/cmd/probe_${ARM}_r${ROUND}_step${STEP}.sh"
   { echo "#!/usr/bin/env bash"
     echo "set -euo pipefail"
     echo "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
@@ -57,7 +61,7 @@ for ARM in "${ARMS[@]}"; do
     echo "$VENV/bin/python experiments/sam_lmd_v1/calibration_probe.py probe '$run' --step $STEP --volume \"\$V\" \\"
     echo "  --out '$OUT'/\"\$V\".npz --block $BLOCK --max-tiles $MAX_TILES"
   } > "$WORKER"
-  FINAL="$STAGE/cmd/probe_${ARM}_r${ROUND}_final.sh"
+  FINAL="$STAGE/cmd/probe_${ARM}_r${ROUND}_step${STEP}_final.sh"
   { echo "#!/usr/bin/env bash"
     echo "set -euo pipefail"
     printf 'cd %q\n' "$REPO"
@@ -68,10 +72,10 @@ for ARM in "${ARMS[@]}"; do
     echo "  would submit: array [1-${#GT_VOLUMES[@]}] of $WORKER on $QUEUE, then $FINAL"
     continue
   fi
-  arr=$(bsub -P "$PROJECT" -q "$QUEUE" -gpu "num=1" -n 12 -W 2:00 -J "sam1_probe_${ARM}[1-${#GT_VOLUMES[@]}]" \
+  arr=$(bsub -P "$PROJECT" -q "$QUEUE" -gpu "num=1" -n 12 -W 2:00 -J "sam1_probe_${ARM}_${STEP}[1-${#GT_VOLUMES[@]}]" \
         -cwd "$REPO" -o "$LOGS/sam1_probe_${ARM}_%J_%I.log" -e "$LOGS/sam1_probe_${ARM}_%J_%I.err" \
         "bash '$WORKER'" | jobid)
-  fin=$(bsub -P "$PROJECT" -q local -n 4 -W 0:30 -J "sam1_probe_${ARM}_final" -w "done($arr)" \
+  fin=$(bsub -P "$PROJECT" -q local -n 4 -W 0:30 -J "sam1_probe_${ARM}_${STEP}_final" -w "done($arr)" \
         -cwd "$REPO" -o "$LOGS/sam1_probe_${ARM}_final_%J.log" -e "$LOGS/sam1_probe_${ARM}_final_%J.err" \
         "bash '$FINAL'" | jobid)
   echo "  array $arr (4 volumes) -> summarize $fin;  table: $OUT/table.txt"

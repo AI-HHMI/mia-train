@@ -33,7 +33,9 @@ use_fa4 = false
 
 [init]
 path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
-inflate_2d_to_3d = true   # the 2D (1024,3,16,16) patch kernel, averaged over RGB, spread over z
+# The 2D (1024,3,16,16) patch kernel, averaged over RGB and spread over z; for a patch smaller than
+# the checkpoint's 16 it is then pseudo-inverse resized (block sums), see utils.pretrained.
+inflate_2d_to_3d = true
 skip = ["rope_embed."]    # derived from `base` in init_weights; 2D and 3D split channels apart
 strict = true
 
@@ -83,7 +85,7 @@ warmup_steps = 3000
 min_lr_ratio = 0.001
 weight_decay = 0.05
 grad_clip_norm = 1.0
-layerwise_lr_decay = 1.0  # MUST stay 1.0: superposition RoPE's depth gate is a zero-init scalar
+layerwise_lr_decay = 1.0  # 1.0 for every arm: superposition RoPE's depth gate is a zero-init scalar
 patch_embed_lr_mult = 1.0
 lr_schedule = "linear"
 precision = "bf16"

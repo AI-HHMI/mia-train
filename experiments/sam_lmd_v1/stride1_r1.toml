@@ -52,7 +52,7 @@ prompt_dim = 256  # width of the neck and the two-way decoder
 decoder_depth = 2  # two-way transformer layers between prompt tokens and the image
 decoder_heads = 8  # 8 heads; head_dim = prompt_dim / 8
 num_multimask_outputs = 3  # whole / part / subpart: the nesting a single click is ambiguous over
-mask_upscale = 16   # <-- THIS ARM'S KNOB  # masks come out at patch_size / mask_upscale voxels; 4 -> stride 4 = 32 nm
+mask_upscale = 16   # <-- THIS ARM'S KNOB  # masks come out at patch_size / mask_upscale voxels; 16 -> stride 1 = 8 nm
 mask_feature_dim = 32  # channels of the upscaled feature volume the mask token is dotted against
 mask_refine_depth = 2  # 3-wide convolutions AT mask resolution after the sub-pixel expansion
 masks_per_sample = 16  # objects drawn per crop, all decoded against one encoder pass
@@ -92,7 +92,7 @@ warmup_steps = 3000
 min_lr_ratio = 0.001
 weight_decay = 0.05
 grad_clip_norm = 1.0
-layerwise_lr_decay = 1.0  # MUST stay 1.0: superposition RoPE's depth gate is a zero-init scalar
+layerwise_lr_decay = 1.0  # 1.0 for every arm: superposition RoPE's depth gate is a zero-init scalar
 patch_embed_lr_mult = 1.0
 lr_schedule = "linear"
 precision = "bf16"

@@ -40,6 +40,7 @@ STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/sam_lmd_v1     # NOT /tmp: that 
 LOGS="$RUNS/jobs"
 
 ALL_ARMS=(base stride2 stride1 stride2_small feat64 refine4 deep4 wide512)
+V4_ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32)   # version 4: round 0 only (`--rounds 0`)
 PREFIX=sam1__                                                    # matches make_configs.PREFIX
 
 QUEUE=${QUEUE:-gpu_b300}
@@ -70,7 +71,7 @@ WALL_R0=${WALL_R0:-72:00}
 WALL_ROUND=${WALL_ROUND:-48:00}
 WALL_LABEL=${WALL_LABEL:-8:00}
 wall_scale () {                        # arm -> multiplier applied to the walls above
-  case "$1" in stride1) echo 2 ;; stride2|stride2_small) echo 1.5 ;; *) echo 1 ;; esac
+  case "$1" in stride1) echo 2 ;; stride2|stride2_small) echo 1.5 ;; arm3_p8) echo 4 ;; *) echo 1 ;; esac
 }
 scaled () {                            # H:MM x factor -> H:MM
   local h=${1%%:*} f=$2; printf '%d:00' "$(awk -v h="$h" -v f="$f" 'BEGIN{printf "%d", h*f+0.5}')"
@@ -158,7 +159,7 @@ stage () {
         -e 's/^max_steps = .*/max_steps = 20/'   -e 's/^warmup_steps = .*/warmup_steps = 2/' \
         -e 's/^val_every = .*/val_every = 10/'   -e 's/^checkpoint_every = .*/checkpoint_every = 20/' \
         -e 's/^samples_per_epoch = .*/samples_per_epoch = 20/' -e 's/^dp_shard = .*/dp_shard = 1/' \
-        -e 's/^num_workers = .*/num_workers = 2/' \
+        -e 's/^num_workers = .*/num_workers = 2/' -e 's/^log_every = .*/log_every = 5/' \
         "$config" > "$cfg"
   fi
 

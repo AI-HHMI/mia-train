@@ -50,9 +50,45 @@ def test_inflation_averages_rgb_down_to_one_channel():
 
 
 @pytest.mark.unit
-def test_inflation_rejects_a_different_in_plane_kernel():
-    with pytest.raises(ValueError, match="in-plane kernel must already match"):
-        inflate_2d_to_3d(torch.randn(4, 1, 8, 8), torch.Size((4, 1, 16, 16, 16)))
+def test_inflation_rejects_a_larger_or_non_integer_in_plane_kernel():
+    with pytest.raises(ValueError, match="in-plane kernel must match"):
+        inflate_2d_to_3d(torch.randn(4, 1, 8, 8), torch.Size((4, 1, 16, 16, 16)))   # larger
+    with pytest.raises(ValueError, match="in-plane kernel must match"):
+        inflate_2d_to_3d(torch.randn(4, 1, 12, 12), torch.Size((4, 1, 8, 8, 8)))    # 1.5x
+
+
+@pytest.mark.unit
+def test_inflation_into_a_smaller_patch_sums_the_kernel_over_blocks():
+    """16 -> 8: the pseudo-inverse resize for block-mean downsampling is the block SUM, and the
+    resized kernel's response to a half-resolution patch equals the full kernel's response to the
+    2x-upsampled (block-constant) patch."""
+    torch.manual_seed(0)
+    weight = torch.randn(4, 3, 16, 16)
+    small = inflate_2d_to_3d(weight, torch.Size((4, 1, 8, 8, 8)))
+    full = inflate_2d_to_3d(weight, torch.Size((4, 1, 16, 16, 16)))
+    assert small.shape == (4, 1, 8, 8, 8)
+    blocks = full.reshape(4, 1, 8, 2, 8, 2, 8, 2).sum(dim=(3, 5, 7))
+    assert torch.allclose(small, blocks, atol=1e-6)
+
+    patch = torch.randn(1, 1, 8, 8, 8)
+    upsampled = torch.nn.functional.interpolate(patch, scale_factor=2, mode="nearest")
+    response_small = torch.nn.functional.conv3d(patch, small)
+    response_full = torch.nn.functional.conv3d(upsampled, full)
+    assert torch.allclose(response_small, response_full, atol=1e-4)
+
+
+@pytest.mark.unit
+def test_a_2d_release_transfers_into_a_model_with_half_its_patch(tmp_path):
+    """A patch-8 release into a patch-4 3D model (the arm3_p8 situation, scaled down)."""
+    torch.manual_seed(0)
+    path, _ = _released_checkpoint(tmp_path)                       # patch 8, RGB
+    small = {**DINO, "patch_size": 4}
+    model = DinoVisionTransformer3D(in_chans=1, pos_embed_rope_type="vanilla", **small)
+    report = load_pretrained(model, path, inflate=True, skip=["rope_embed."])
+    assert "patch_embed.proj.weight" in report.inflated
+    assert model.patch_embed.proj.weight.shape == (96, 1, 4, 4, 4)
+    tokens, grid = model.eval().patch_features(torch.rand(1, 1, 32, 32, 32))
+    assert tuple(grid) == (8, 8, 8) and tokens.shape[-1] == 96
 
 
 @pytest.mark.unit
