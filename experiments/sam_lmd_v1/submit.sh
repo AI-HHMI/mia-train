@@ -35,12 +35,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
 PROJECT=miaai
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/sam_lmd_v1     # NOT /tmp: that is node-local
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/sam_lmd_v1   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+STAGE=$EXP     # NOT /tmp: that is node-local
+LOGS="$EXP/jobs"
 
 ALL_ARMS=(base stride2 stride1 stride2_small feat64 refine4 deep4 wide512)
-V4_ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32)   # version 4: round 0 only (`--rounds 0`)
+V4_ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32 arm6_8nm_gb16_musam arm7_8nm_gb16_musam64)   # version 4: round 0 only (`--rounds 0`)
 PREFIX=sam1__                                                    # matches make_configs.PREFIX
 
 QUEUE=${QUEUE:-gpu_b300}
@@ -71,7 +72,7 @@ WALL_R0=${WALL_R0:-72:00}
 WALL_ROUND=${WALL_ROUND:-48:00}
 WALL_LABEL=${WALL_LABEL:-8:00}
 wall_scale () {                        # arm -> multiplier applied to the walls above
-  case "$1" in stride1) echo 2 ;; stride2|stride2_small) echo 1.5 ;; arm3_p8) echo 4 ;; *) echo 1 ;; esac
+  case "$1" in stride1|arm7_8nm_gb16_musam64) echo 2 ;; stride2|stride2_small|arm6_8nm_gb16_musam) echo 1.5 ;; arm3_p8) echo 4 ;; *) echo 1 ;; esac
 }
 scaled () {                            # H:MM x factor -> H:MM
   local h=${1%%:*} f=$2; printf '%d:00' "$(awk -v h="$h" -v f="$f" 'BEGIN{printf "%d", h*f+0.5}')"
@@ -93,7 +94,7 @@ GT_VOLUMES=(kasthuri15_ac3 zebrafish_fish2_quadcube1 liconn_mouse_dg hemibrain_e
 # masks rather than the empty output of a 20-step model. The r1/r2 smoke stages still warm-start
 # from the smoke r0/r1 of their own arm, so the `target = "algorithm"` load path is exercised on
 # the arm's own architecture.
-SMOKE_TEACHER=${SMOKE_TEACHER:-$RUNS/promptable_lmd_v2_20260910_104156}
+SMOKE_TEACHER=${SMOKE_TEACHER:-/nrs/scicompsoft/orhane/mia-train-experiments/promptable_seg_v1/runs/promptable_lmd_v2_20260910_104156}
 SMOKE_VOLUME=${SMOKE_VOLUME:-em-zebrafish-fish2/crop-005_quadcube3_x9638_y10314_z0}
 SMOKE_GT=${SMOKE_GT:-kasthuri15_ac3}
 
@@ -149,7 +150,7 @@ stage () {
   local name; name=$(basename "$config" .toml)
   local exp="${PREFIX}${name}" tag="$name" procs=$GPUS slots=$SLOTS
   local wall; wall=$(scaled "$([[ $round -eq 0 ]] && echo "$WALL_R0" || echo "$WALL_ROUND")" "$(wall_scale "$arm")")
-  local cfg="$config" runs_root=$RUNS tail_args="--resume"
+  local cfg="$config" runs_root=$RUNS tail_args="--output-root $RUNS --resume"
 
   if [[ $SMOKE -eq 1 ]]; then
     exp="smoke_${PREFIX}${name}"; tag="smoke_$name"; wall=1:00; procs=1; slots=12

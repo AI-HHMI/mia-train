@@ -37,7 +37,7 @@ drop_path_rate = 0.1
 # The same reset point as round 1 -- that is the arm's definition. Round 2 differs from round
 # 1 in its *data* alone, so any change in the val number is attributable to pseudo-label
 # quality rather than to another 50k steps of drift on top of round 1's weights.
-path = "/nrs/scicompsoft/orhane/mia-train-runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000"
+path = "/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity/runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000"
 prefix = "model."
 strict = true
 

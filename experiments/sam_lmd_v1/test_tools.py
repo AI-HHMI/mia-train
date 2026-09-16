@@ -382,6 +382,26 @@ def test_compare_labellings_counts_merges_fragments_share_and_purity():
     assert r["pseudo_purity"] == pytest.approx((1.0 + 1.0 + 0.5 + 1.0) / 4)
     assert r["claimed_on_background"] == pytest.approx(50 / 350)
     assert r["mean_best_iou"] == pytest.approx((0.6 + 0.4 + 0.5 + 0.0) / 4)
+    assert r["swallowed"] == 2 and r["swallowed_rate"] == pytest.approx(2 / 3)   # 22 and 33 in id 3
+
+
+def test_a_piece_that_swallowed_many_small_objects_is_counted_even_though_no_merge_is():
+    from pseudolabel import compare_labellings
+
+    # One 1000-voxel object and five 20-voxel objects, all under a single pseudo id. Each small
+    # object is 1.8% of the piece, so the 10%-of-the-piece rule sees no merge and precision is 1.0
+    # (IoU with the big object 0.91); `swallowed` says six objects were lost into it.
+    truth = np.zeros(1200, dtype=np.int64)
+    truth[0:1000] = 1
+    for k in range(5):
+        truth[1000 + 20 * k:1020 + 20 * k] = 2 + k
+    pred = np.zeros(1200, dtype=np.int64)
+    pred[0:1100] = 1
+    r = compare_labellings(pred.reshape(12, 10, 10), truth.reshape(12, 10, 10), min_truth_voxels=1)
+
+    assert r["merges"] == 0 and r["precision"] == 1.0
+    assert r["swallowed"] == 6 and r["swallowed_rate"] == 1.0
+    assert r["recall"] == pytest.approx(1 / 6)
 
 
 def test_compare_labellings_with_nothing_claimed_reports_zeros_for_every_field():
@@ -389,10 +409,11 @@ def test_compare_labellings_with_nothing_claimed_reports_zeros_for_every_field()
 
     truth = np.ones((2, 4, 4), dtype=np.int64)
     r = compare_labellings(np.zeros_like(truth), truth, min_truth_voxels=1)
-    for key in ("precision", "recall", "merge_rate", "fragment_rate", "truth_best_share",
-                "pseudo_purity", "mean_best_iou"):
+    for key in ("precision", "recall", "merge_rate", "fragment_rate", "swallowed_rate",
+                "truth_best_share", "pseudo_purity", "mean_best_iou"):
         assert r[key] == 0.0
-    assert r["merges"] == 0 and r["fragments"] == 0 and r["pseudo_instances"] == 0
+    assert r["merges"] == 0 and r["fragments"] == 0 and r["swallowed"] == 0
+    assert r["pseudo_instances"] == 0
 
 
 # ------------------------------------------------------------------------------ oracle assembly

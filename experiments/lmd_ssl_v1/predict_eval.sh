@@ -34,9 +34,10 @@ set -euo pipefail
 
 REPO=/groups/scicompsoft/home/orhane/projects/mia-train
 VENV=/groups/scicompsoft/home/orhane/myvenv
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-OUT_ROOT=/nrs/scicompsoft/orhane/mia-train-scratch/lmd1_arm2_eval
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/lmd_ssl_v1   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+OUT_ROOT=$EXP/eval/arm2_eval
+LOGS="$EXP/jobs"
 PROJECT=miaai
 STEP=50000
 

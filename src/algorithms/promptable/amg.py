@@ -43,7 +43,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from layers.common.prompt import FOREGROUND
 from layers.common.rope import voxel_coords
@@ -310,6 +309,21 @@ TILE_MERGE = ("canvas", "none", "propagate", "consensus")
 #: A mask counts as reaching into a shared region when at least this many of its cells lie there;
 #: below it, two windows' boundary jitter would be read as a disagreement.
 MIN_SHARED_CELLS = 8
+
+
+def upsample_cells(cells: np.ndarray, stride: Sequence[int]) -> np.ndarray:
+    """A `(*cell grid)` labelling -> voxels, each cell repeated over its `stride` block, on the CPU.
+
+    Not `F.interpolate(mode="nearest")` on the GPU: its CUDA kernel indexes the output with 32-bit
+    arithmetic and silently corrupts everything past 2^32 elements -- measured 2026-09-15 on a
+    1920^3 volume (7.1 G voxels): 61% of the voxels wrong, the artifact full of garbage ids, while
+    a 4.25 G-voxel volume came through intact. Repetition is exact for integer strides and numpy
+    indexes with 64 bits; the cost is one pass over the output on the host.
+    """
+    out = cells
+    for axis, step in enumerate(stride):
+        out = np.repeat(out, int(step), axis=axis)
+    return out
 
 
 def tile_labelling(masks: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
@@ -1035,12 +1049,13 @@ class PromptGridPredictor:
                   f"{report['disagreed']} disagreed (best IoU {mean_iou:.2f}), "
                   f"{report['unmet']} met no mask in the other window; "
                   f"{report['disputed_cells']} cells disputed", flush=True)
-        # Back to voxel resolution with nearest-neighbour: the labelling has no information below
-        # the mask stride, and interpolating ids would invent new ones.
-        labels = F.interpolate(
-            labels[None, None].float(), size=tuple(grid.output_shape), mode="nearest"
-        )[0, 0].to(torch.int64)
-        array: np.ndarray = labels.cpu().numpy()
+        # Back to voxel resolution by repeating each cell over its stride^3 block: the labelling
+        # has no information below the mask stride, and the strides divide the output exactly.
+        array = upsample_cells(labels.cpu().numpy(), stride)
+        if array.shape != tuple(grid.output_shape):
+            raise RuntimeError(
+                f"upsampled labelling {array.shape} does not match the output {grid.output_shape}"
+            )
         return VolumePrediction(
             array=array,
             kind="instances",

@@ -26,7 +26,7 @@ pos_embed_rope_type = "superposition"
 # `self.encoder` is the same object, so torch stores it once under the name it saw first. The
 # checkpoint's own `decoder.*`/`decoder_out.*` keys do not start with the prefix and are dropped
 # before the unused-key check, which is what leaves the new head at its initialisation.
-path = "/nrs/scicompsoft/orhane/mia-train-runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000"
+path = "/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity/runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000"
 prefix = "model."
 strict = true
 

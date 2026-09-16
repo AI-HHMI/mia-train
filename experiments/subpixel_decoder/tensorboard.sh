@@ -10,8 +10,9 @@
 set -euo pipefail
 
 PORT=${1:-6006}
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-VIEW=$RUNS/tb_subpixel_decoder
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/subpixel_decoder   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
 
 # TensorBoard fails outright on a taken port, which is the normal case here: the arms of a
@@ -39,7 +40,7 @@ link () {           # link <short name> <run directory glob>
 
 echo "arms found:"
 link subpixel  "$RUNS/subpixel_decoder__subpixel_256_*/"
-link control   "$RUNS/banis_parity__finetune_256_long_*/"
+link control   "/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity/runs/banis_parity__finetune_256_long_*/"
 
 echo
 echo "http://localhost:$PORT"

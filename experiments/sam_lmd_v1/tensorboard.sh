@@ -20,6 +20,15 @@
 #   arm4_8nm_gb16   version 3's geometry (8 nm, patch 16: token 128 nm, cell 32 nm, window 2 um)
 #                   at two crops per rank, global batch 16 -- the batch-size question alone
 #   arm5_8nm_gb32   the same at four crops per rank, global batch 32
+#   arm6_8nm_gb16_musam
+#                   arm 4 with Archit et al. 2025's training changes: 32 objects per crop (was 16),
+#                   a foreground AND a background click per correction round, the previous mask fed
+#                   back with probability 0.5 (was always). Compare with arm 4 at equal steps; its
+#                   `final_iou` is measured half the time without the mask prompt, so read
+#                   `first_iou` for the model and `final_iou` only against itself.
+#   arm7_8nm_gb16_musam64
+#                   arm 6 with 64 objects per crop instead of 32, otherwise identical: arm 7 vs
+#                   arm 6 vs arm 4 is 64 vs 32 vs 16 objects (arm 4 also lacks the click pairs).
 #
 # WHAT TO READ
 #
@@ -58,11 +67,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT=${1:-6006}
 MODE=${2:-}
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-SMOKE=/nrs/scicompsoft/orhane/mia-train-scratch/sam_lmd_v1/smoke
-VIEW=$RUNS/tb_sam_lmd_v1
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/sam_lmd_v1   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+SMOKE=$EXP/smoke
+VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
-ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32)
+ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32 arm6_8nm_gb16_musam arm7_8nm_gb16_musam64)
 
 port_busy () { ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1$"; }
 if [[ "$MODE" != "--list" ]]; then
@@ -97,6 +107,8 @@ echo
 echo "arm1_4nm = 4 nm read, 64 nm token, 1 um window, gb 8 | arm2_4nm_gb16 = arm 1 at gb 16 |"
 echo "arm3_p8 = patch 8 at 8 nm, 64 nm token, 2 um window, 32k tokens, gb 8 |"
 echo "arm4_8nm_gb16 / arm5_8nm_gb32 = version 3's geometry (8 nm, patch 16, 32 nm cells) at gb 16 / 32."
+echo "arm6_8nm_gb16_musam = arm 4 + 32 objects/crop, click pairs, mask fed back at p=0.5 (Archit et al. 2025)."
+echo "arm7_8nm_gb16_musam64 = arm 6 with 64 objects/crop."
 echo "All: feat64 head, 3D axial RoPE, v1 recipe, 200k steps, LR 3e-4."
 [[ "$MODE" == "--list" ]] && exit 0
 echo; echo "http://localhost:$PORT"

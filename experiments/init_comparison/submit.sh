@@ -31,9 +31,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
 PROJECT=miaai
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/init_comparison
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/init_comparison   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+STAGE=$EXP
+LOGS="$EXP/jobs"
 CLAIM="$STAGE/claim.sh"
 mkdir -p "$LOGS" "$STAGE/locks" "$STAGE/cmd"
 
@@ -54,7 +55,7 @@ THREADS="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4"
 
 # A trained ViT-L encoder of this exact shape, used only to exercise the phase-2 load path in a
 # smoke run, where none of the run's own predecessors exists yet.
-SMOKE_ENCODER=/nrs/scicompsoft/orhane/mia-train-runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_300000
+SMOKE_ENCODER=/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity/runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_300000
 
 QUEUES=(gpu_h100 gpu_h200)
 [[ -n "${QUEUE:-}" && "${QUEUE:-}" != "auto" ]] && QUEUES=("$QUEUE")
@@ -112,7 +113,7 @@ sed \"s|PREV_CHECKPOINT|\${RUN}checkpoints/step_\$STEP|\" '$cfg' > '$resolved'"
     [[ -n "$prologue" ]] && echo "$prologue"
     printf '%s --standalone --nproc_per_node=%s src/train.py --config %q %s\n' \
       "$VENV/bin/torchrun" "$procs" "$cfg" \
-      "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--resume")"
+      "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--output-root $RUNS --resume")"
   } > "$cmd"
 
   local ids=() q id

@@ -34,9 +34,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
 PROJECT=miaai
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/lora_vs_fullft
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/lora_vs_fullft   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+STAGE=$EXP
+LOGS="$EXP/jobs"
 CLAIM="$STAGE/claim.sh"
 mkdir -p "$LOGS" "$STAGE/locks" "$STAGE/cmd"
 
@@ -44,7 +45,7 @@ mkdir -p "$LOGS" "$STAGE/locks" "$STAGE/cmd"
 # experiment. Copied rather than referenced across experiments, so this one keeps working if another
 # experiment's scratch directory is ever cleaned.
 if [[ ! -f "$CLAIM" ]]; then
-  for src in /nrs/scicompsoft/orhane/mia-train-scratch/{new_ssl_recipe,init_comparison}/claim.sh; do
+  for src in /nrs/scicompsoft/orhane/mia-train-experiments/{new_ssl_recipe,init_comparison}/claim.sh; do
     [[ -f "$src" ]] && { cp "$src" "$CLAIM"; break; }
   done
   [[ -f "$CLAIM" ]] || { echo "missing claim.sh; expected one to copy under mia-train-scratch" >&2; exit 2; }
@@ -136,7 +137,7 @@ sed \"s|PREV_CHECKPOINT|\${RUN}checkpoints/step_\$STEP|\" '$cfg' > '$resolved'"
     [[ -n "$prologue" ]] && echo "$prologue"
     printf '%s --standalone --nproc_per_node=%s src/train.py --config %q %s\n' \
       "$VENV/bin/torchrun" "$procs" "$cfg" \
-      "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--resume")"
+      "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--output-root $RUNS --resume")"
   } > "$cmd"
 
   local ids=() q id

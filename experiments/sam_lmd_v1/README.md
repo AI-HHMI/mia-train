@@ -26,8 +26,21 @@ spatial detail a mask can carry, each as a full chain identical to `base` but fo
     bash experiments/sam_lmd_v1/predict_eval.sh feat64 0              # eight volumes -> instances
     bash experiments/sam_lmd_v1/score.sh feat64 0                     # -> the leaderboard table
 
-**Status (2026-09-13 evening, version 4 launched).** Three arms on the encoder's scale (below);
-version 3's single arm is superseded and its round-0 checkpoints remain for reference.
+**Status (2026-09-16; version 4: arms 1, 2, 4 and 5 done and scored, arms 4 and 5 on the
+leaderboard at 0.2094 and 0.2038, arms 3, 6 and 7 training).** Seven arms on the encoder's scale, the
+batch size and the training recipe (below); version 3's single arm is superseded and its round-0
+checkpoints remain for reference. Arm 5 (8 nm, batch 32) has the best assembled labels so far,
+0.596 / 0.361.
+**First leaderboard row: `sam1_arm4_8nm_gb16_r0_step200000` pq 0.2094 against the affinity rows'
+0.2369 (1c) and 0.2287 (2c)** -- third place, with fewer splits (voi_split 0.97 vs 1.31) and more
+merges (voi_merge 3.45 vs 2.08), mask quality 0.69 vs 0.71, recognition 0.29 vs 0.32. Per volume:
+kasthuri15_ac4 0.385 (1c 0.496), liconn hippocampus 0.317 (0.308), liconn expid82 0.057 (0.056),
+zebrafish doublecube1 0.078 (0.088). Finetune half at each row's chosen filter: 0.308 vs 0.344. Arm 4 (8 nm, batch 16): assembled 0.483 / 0.343,
+the highest precision and fewest swallowed objects so far; arm 2 (4 nm, batch 16): 0.406 / 0.496,
+the highest recall. Arm 1 (4 nm) at 200k: single-window precision 0.842 / recall
+0.626 (version 3: 0.759 / 0.215; ceiling 0.885 / 0.988), assembled pseudo-labels 0.370 / 0.443
+(version 3: 0.324 / 0.148; ceiling 0.760 / 0.983), merges 9%, fragments 20%, purity 0.83. Recall
+tripled; assembled precision barely moved, and the seam bookkeeping says why ("Version 4").
 
 **Version 3 (2026-09-13, round 0 done).** Two full launches were stopped and their
 artifacts deleted; what they taught is in "What versions 1 and 2 established" below, with every
@@ -76,17 +89,106 @@ departures, each stated in the generated TOML where it applies:
 `num_workers` is 8 rather than 6, since here the workers also run the connected-components pass
 and prompt sampling. Neither touches what the model sees.
 
+## How the model is prompted during training, step by step
+
+`PromptableSegmentation._step` (`src/algorithms/promptable_seg.py`) with `PromptTargets`
+(`src/algorithms/promptable/targets.py`) drawing the prompts in the dataloader worker. This is the
+original ("v1") recipe, used by version 3 and every version-4 arm; the v2 additions (below) are
+off. Per training crop of 256^3 voxels:
+
+1. **Pick objects.** The worker splits the crop's labels into connected pieces and draws up to
+   `masks_per_sample` = 16 objects at random from those of at least `min_object_voxels` (512 at
+   8 nm, 4096 at 4 nm: the same physical size the labeller's size floor uses). A crop with no
+   eligible object contributes nothing to the loss rather than being dropped.
+2. **One first prompt per object.** With probability `box_prob` = 0.5 a single positive click at a
+   voxel drawn uniformly inside the object; otherwise the object's bounding box with each corner
+   jittered by normal noise of `box_noise` = 10% of that side, capped at `box_noise_max` = 20
+   voxels, so the model also learns from boxes that are too loose or too tight. No negative
+   click, no boundary or off-object click, in this round.
+3. **Three candidates.** The decoder answers the first prompt with `num_multimask_outputs` = 3
+   masks and a predicted IoU for each. The candidate with the lowest mask loss against the true
+   object is the one that receives the gradient (`best_of`); the IoU head is trained on every
+   candidate to predict its real IoU (squared error).
+4. **Two correction rounds** (`rounds` = 3 in total). Each round adds exactly one click, drawn at
+   random among the mask-grid cells where the current mask is wrong: a positive click in a cell
+   the mask missed, a negative click in a cell it spilled into -- never in unlabelled space. The
+   previous round's best mask is fed back to the decoder as logits, and the decoder now returns
+   one mask, not three. An object whose mask is already right gets a padding token, not an
+   invented click.
+5. **Loss.** Per round, `focal_weight` = 20 x focal + `dice_weight` = 1 x dice over the LABELLED
+   cells of the chosen candidate, plus `iou_weight` = 1 x the head's error; the three rounds are
+   averaged. Unlabelled voxels (-1) are silence in all three terms since version 3.
+
+So an object sees one click or one box and then at most two more clicks, positive or negative:
+at most three prompts. TensorBoard's `first_iou` is the chosen candidate after step 3,
+`final_iou` after the two corrections, `first_iou_error` the head's calibration; the validation
+set (32 crops) reports the same. The gap to labelling time (next section) is steps 2 and 4: the
+labeller issues only single positive clicks on a grid, no boxes, no corrections, and takes the
+model's first answer.
+
+## How a checkpoint becomes labels, step by step
+
+`PromptGridPredictor` (`src/algorithms/promptable/amg.py`), with the labeller's settings
+(`LABEL_AMG` in `pseudolabel.py`; since 2026-09-15 the evaluation pass reads the same settings).
+The same code labels the unlabeled corpus, scores the GT blocks, produces the pictures and
+writes the leaderboard artifacts.
+
+1. **Cut the block into windows.** The model only ever sees a window of 256 voxels on a side:
+   1 um at the 4 nm lattice, 2 um at 8 nm. Windows step by half a window, so every spot of tissue
+   is seen by several. A 4 um block holds 343 windows at 4 nm and 27 at 8 nm.
+2. **Encode each window once.** One encoder pass per window; everything below reuses that
+   embedding.
+3. **Click on a regular grid.** `points_per_side = 14` clicks per axis, cell-centred, so 14^3 =
+   2744 clicks per window, one every 73 nm at 4 nm (146 nm at 8 nm). Every click is a single
+   positive point. No negative clicks, no boxes, no second click on the same object, no correction
+   round: the multi-round positive and negative clicks exist only in training. For each click the
+   decoder returns 3 candidate masks (`num_multimask_outputs`), each with the IoU the head predicts
+   for it, so 8232 candidates per window. Masks live on the mask-cell grid (16 nm at 4 nm, 32 nm
+   at 8 nm) and are expanded to voxels when painted.
+4. **Gate every candidate on three tests.** Predicted IoU >= `pred_iou_thresh` (0.7);
+   stability >= `stability_thresh` (0.8) -- the mask
+   thresholded at logit +1 and at -1 must overlap by at least that IoU, so a mask whose boundary
+   moves under a small change of threshold is dropped whatever the head said; size between
+   `min_mask_voxels` (4096 at 4 nm = 512 at 8 nm = a 64 nm cube) and `max_mask_fraction` (0.95)
+   of the window. In arm 1 about 1.3 candidates per click survive, a few thousand per window.
+5. **Remove nesting, then duplicates.** A mask lying >= `containment_thresh` (0.8) inside a
+   larger one, and not a near-duplicate of it, is dropped in favour of the larger (`prefer =
+   "whole"`: the targets are whole cells, so a nucleus inside a cell must not become a second
+   object). Then greedy NMS on mask IoU at `nms_iou` (0.7): of two masks that overlap that much,
+   the higher predicted IoU stays. Ten to thirty masks per window remain.
+6. **Paint the window's own label map.** Highest predicted IoU first; where two survivors still
+   overlap, the first painted keeps the voxel (`tile_labelling`).
+7. **Glue the windows** (`tile_merge = "consensus"`, `consensus_labelling`). For every pair of
+   windows that overlap, look only at the region both saw: a mask from one and a mask from the
+   other are the same object if each is the other's best match there and their IoU in that region
+   is >= `agree_thresh` (0.5). Joins are transitive (union-find): A = B and B = C makes one object
+   of all three, which is how one bad mask can glue two chains (Version 4). Each voxel then takes
+   the object its windows agree on; where the windows that see it disagree it is left unlabelled
+   (written as -1 in the sidecars, never 0); `min_support` (1) is how many windows must have seen
+   a piece for it to be kept. The run prints, per block, how many overlap checks joined, disagreed,
+   or found no mask in the other window.
+
+Two checks exist in the code and are off by default: `consistency_clicks` (click inside a
+finished mask and ask whether the model gives the same mask back; a merge gives back a lobe) and
+`split_tiled_wholes` (drop a mask that is the union of several other survivors). Both were
+measured in version 2 against a model whose failure lay elsewhere; neither has been re-tried on
+the version-4 models.
+
+Where each stage is measured: `calibration_probe.py` scores every candidate of step 3 against
+the truth (per-candidate precision, calibration, gate pass rate); the `single_tile` row of the
+assembly sweep scores one window after step 6; the `consensus` row scores the assembled block
+after step 7; the gallery draws all of them.
+
 ## The data engine
 
 The paper's fully automatic stage, with the model where the annotators were:
 
 1. **Label.** `pseudolabel.py label` runs `PromptGridPredictor` -- the same segment-everything
-   pass `predict.py` uses -- over a block of an unlabeled volume: 14^3 clicks per tile, masks kept
-   only if the IoU head predicts >= **0.7** and the boundary is stable under a +-1 logit shift
-   (>= **0.8**), NMS at 0.7, windows reconciled by **agreement** (`tile_merge = "consensus"`: two
-   windows' masks are one object only where they agree in the region both saw; disputed cells stay
-   unlabelled -- see the sweep below for why the earlier `propagate` rule was replaced). Stricter
-   gates than at eval (0.5 / 0.5), because a training target is judged
+   pass `predict.py` uses, described step by step in the section above -- over a block of an
+   unlabeled volume: 14^3 single positive clicks per window, masks kept only if the IoU head
+   predicts >= **0.7** and the boundary is stable under a +-1 logit shift (>= **0.8**), NMS at
+   0.7, windows reconciled by **agreement** (`tile_merge = "consensus"`; see the sweep below for
+   why the earlier `propagate` rule was replaced). The gates were chosen for a training target, which is judged
    by precision: a missed object costs nothing (its voxels stay unclaimed and are never prompted
    for), a merged or truncated one is trained on.
 2. **Store.** Labels go into a **sidecar** OME-Zarr per volume -- `raw` symlinked to the read-only
@@ -126,7 +228,8 @@ not tuned on it.
 ## The v2 prompting recipe (retired in version 3; knobs default to off)
 
 Version 3 trains with the original recipe -- interior click or noised box, then two correction
-rounds of one click each (foreground where the mask missed, background where it spilled). The v2
+rounds of one click each (foreground where the mask missed, background where it spilled); it is
+spelled out step by step in "How the model is prompted during training" above. The v2
 additions below were built for a head-calibration failure that the probe later showed did not
 exist (the head was calibrated; the precision was lost in tile assembly), and in an undertrained
 model they cost what is scarcest: a quarter of the prompt slots train only the head, and a third
@@ -233,13 +336,27 @@ The MWS leaderboard rows are scored from stored labellings through
 through exactly those files with no watershed. Same region, same metric, same fitted parameter:
 **the SAM row and the MWS row differ only in what wrote the labelling.**
 
-Mask-generator settings at eval are fixed (`predict_eval.sh`: 14^3 clicks, gates 0.5/0.5, taken
-from promptable_seg_v1/RESULTS.md; windows reconciled by agreement, `consensus`, since version 3,
-because the earlier `propagate` rule measured worst of every rule on the GT blocks) and applied
-identically to every arm; the size filter is the only fitted parameter, as it was for MWS. Every round is scored
-at its final step, as arms 1/2 were, so the validation set selects nothing.
+Mask-generator settings at eval are the labeller's, fixed (`predict_eval.sh` reads
+`pseudolabel.LABEL_AMG`: 14^3 clicks, gates 0.7 / 0.8, NMS 0.7, windows reconciled by agreement),
+applied identically to every arm; the size filter is the only fitted parameter, as it was for MWS.
+Until 2026-09-15 the eval gates were 0.5 / 0.5, from a seven-setting sweep in
+promptable_seg_v1/RESULTS.md on one 384-voxel block of liconn_expid82 with an early model, where
+they beat 0.5 / 0.8 by 0.003 pq -- within noise -- and no artifact was ever scored with them; the
+probe shows the 0.5 -> 0.7 step drops 7% of passing candidates that are right 62-77% of the
+time, and one protocol means every diagnostic describes the pass that is scored. Every round is
+scored at its final step, as arms 1/2 were, so the validation set selects nothing.
 
 ## Caveats, in the order they would bite
+
+- **Label upsampling past 2^32 voxels.** Until 2026-09-15 the labeller brought its mask-cell
+  labelling back to voxels with `F.interpolate(mode="nearest")` on the GPU, whose CUDA kernel
+  indexes the output with 32 bits: on zebrafish doublecube1 (1920^3 = 7.1 G voxels) 61% of the
+  voxels came out wrong and the artifact held 93 M negative ids, and mia-evals' size filter
+  crashed on them (`np.bincount`, "negative elements"). Every smaller artifact was intact (the
+  4.25 G-voxel quadcube1 included; the limit is 2^32 elements, 1626^3). `amg.upsample_cells`
+  now repeats cells on the host with numpy. Measured with a 480^3 -> 1920^3 GPU test, exact
+  against `repeat_interleave`; test in `tests/unit/test_amg.py`. No table or picture in this
+  README is affected: the scored blocks are at most 1024^3.
 
 - **Init differs from arm 1.** Arm 1 started from random weights; every SAM chain starts from the
   LVD checkpoint, because the engine needs a labelled-data teacher to begin and the paper's SAM
@@ -649,6 +766,8 @@ layout, so the arms compare with each other and not with version 3.
 | 3 | `arm3_p8_r0.toml` | 8 nm | 8 | 32,768 | 64 nm | 16 nm | 2 um | 8 |
 | 4 | `arm4_8nm_gb16_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | 16 (2 per rank) |
 | 5 | `arm5_8nm_gb32_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | 32 (4 per rank), 16 workers |
+| 6 | `arm6_8nm_gb16_musam_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | 16 (2 per rank); 32 objects/crop, click pairs, mask fed back at p = 0.5 |
+| 7 | `arm7_8nm_gb16_musam64_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | as arm 6 with 64 objects/crop |
 
 Arms 1 and 3 put the same token and the same mask cell on the tissue; they differ in field of
 view (1 vs 2 um), tokens per window (8x) and native vs interpolated voxels. Arm 2 is arm 1 at
@@ -661,6 +780,16 @@ Arm 5 runs 16 dataloader workers per rank instead of the usual 8: at 8 its node 
 crops/s, the same as arm 4 with half the crops per step, and the GPUs waited 15% of every step;
 it was restarted with 16 after 300 steps (2026-09-13 22:40). `min_object_voxels` is a physical size, so it is 4096
 voxels at 4 nm (= 512 at 8 nm); `mask_upscale = 4` at patch 8 is stride 2, i.e. the 16 nm cell.
+Arm 6 (added 2026-09-15) is arm 4 with the three training changes taken from Archit et al. 2025,
+Segment Anything for Microscopy: `masks_per_sample` 16 -> 32 (their ablation's most important
+hyperparameter), `correction_pairs` (each correction round adds a foreground click where the mask
+missed AND a background click where it spilled, padding where that error is absent, instead of one
+or the other) and `mask_prompt_prob = 0.5` (the previous mask is fed back to the decoder half the
+time rather than always; a model that always sees it leans on it and degrades when given points
+alone). Both knobs are new algorithm arguments whose defaults reproduce the old behaviour, tested
+in `tests/unit/test_promptable_seg.py`. Arm 6 against arm 4 is the three changes together;
+`final_iou` in its curves is measured half the time without the mask prompt and is comparable
+only with itself.
 
 **How the patch-8 encoder is initialised.** The released kernel is `(1024, 3, 16, 16)`. The
 loader averages RGB to one channel, spreads the kernel over 16 depth slices divided by 16 (a
@@ -673,9 +802,162 @@ respond to the same tissue seen at half resolution -- the 4 nm runs' trick folde
 layer. RoPE needs nothing: coordinates are normalised to the runtime grid, so 32^3 positions are
 as valid as 16^3. Tests in `tests/unit/test_pretrained.py`.
 
+**Ceilings at the 4 nm lattice** (`pseudolabel.py oracle`, perfect masks, 2026-09-14; the
+reference for every arm-1/arm-2 number): single 1 um windows precision 0.885 / recall 0.988 pooled
+(hemibrain 0.96, kasthuri 0.91, liconn 0.83, zebrafish 0.83); consensus on the 4 um blocks 0.760 /
+0.983 (hemibrain 0.88, kasthuri 0.78, liconn 0.57, zebrafish 0.64). The assembled ceiling is the
+same as at 8 nm (0.750) although a block now has 343 windows instead of 27: the agreement rule
+does not lose precision on perfect masks as the seam count grows.
+
+**Arm 1 at 200k** (scored 2026-09-14/15; `assembly_sweep/arm1_4nm_step200000/table.txt`,
+`probe/arm1_4nm_r0_step200000/table.txt`; the probe and single-window rows ran on H100, the
+consensus row on B300, so allow the ~2% architecture effect when comparing them). Probe, pooled:
+the head-top candidate reaches IoU >= 0.5 for 94.5% of on-object clicks (version 3 66.4%, oracle
+97.0%), 1.30 passing candidates per click (version 3 0.50), precision of passing 0.988. Single
+1 um windows (32 blocks of 320 lattice voxels per volume): precision 0.842 / recall 0.626
+(ceiling 0.885 / 0.988; version 3's 2 um windows 0.759 / 0.215), merges 2.4%, fragments 4.5%;
+per volume hemibrain 0.92, kasthuri 0.87, liconn 0.88, zebrafish 0.78. Consensus on the 4 um
+blocks (216-343 windows each, 3830 s per block on one B300): precision 0.370 / recall 0.443
+(ceiling 0.760 / 0.983; version 3 0.324 / 0.148), 1336 pieces for 1115 objects, merges 9.0%,
+fragments 19.6%, purity 0.828, 78% of the voxels claimed; per volume hemibrain 0.373 (88 merges /
+100 fragments; ceiling 0.88), kasthuri 0.355 (17 / 38; 0.78), liconn 0.554 (3 / 11; 0.57, i.e.
+at its ceiling), zebrafish 0.336 (12 / 70; 0.64). Seam bookkeeping on hemibrain: 58,511
+mask-in-shared-region checks, 85% joined, 13% disagreed (mean best IoU 0.11), 1.4% met no mask in
+the other window (version 3: 71% / 24% / 5% of 5,383). So the partner is now almost always there
+-- the missing-detection loss that dominated versions 2 and 3 is gone -- but in one overlap in
+eight the two windows still draw the same tissue differently, and a 4 um block has 343 windows
+instead of 27, so every object crosses many more overlaps than before. Single-window quality is
+at 95% of its precision ceiling and 63% of its recall ceiling; the assembled labels are at 49%
+and 45% of theirs.
+
+**What the pictures show** (`figures/labelling_gallery.py`; `$STAGE/viz/arm1_4nm_step200000/`;
+the re-run on B300 reproduced the table exactly). The assembled failure differs per volume.
+Hemibrain: gluing is transitive, and ONE piece ends up holding 62% of the block's true
+foreground and most of 51 true objects. The `merges` column does not register it, because a
+merge partner must be a tenth of the piece and no single object is, so the table now also
+reports `swallowed`: true objects most of which sit inside a piece that also holds most of
+another (hemibrain 98 of 573 = 17%, kasthuri 17 = 11%, zebrafish 28 = 9%, liconn 5 = 6%).
+Inside a single hemibrain window the model already merges the two largest processes and labels
+12 of 42 objects, so this is the model's dense-neuropil failure amplified by the gluing, not the
+gluing alone. Kasthuri and zebrafish: inside a window the pieces have the true objects' shapes
+and there are no merges; the assembled block turns them into two pieces per object -- 14% of
+overlap checks find no mask at all in the neighbouring window -- and the pieces leak into
+unlabelled space (the model claims 52% of kasthuri's and 27% of zebrafish's label-0 voxels). The
+"spill" pieces are not slivers: median 19-29k saved voxels, purity ~0.8, i.e. partial pieces that
+also bleed. Liconn: every small round profile is matched; the block's largest process is merged
+with one neighbour. The zebrafish raw has blank sections, with interpolated ground truth there.
+For the assembly work this means two separate fixes: a merge guard (refuse to glue a mask that
+matches two masks in the neighbour, split it along their boundary instead) for dense tissue,
+and for the sparser volumes a way to supply the missing partner (a second look that clicks the
+neighbour inside the unmatched piece, or a denser click grid) plus dropping pieces only one
+window ever saw (`min_support 2`). Every window's own labelling is saved beside the pictures
+(`<volume>_windows.npz`), so rule variants can be tried offline in minutes.
+
+**Arm 4 on the leaderboard** (2026-09-15; `predict_eval.sh` with the labeller's gates, `score.sh`;
+record `sam1_arm4_8nm_gb16_r0_step200000` in mia-evals; pictures beside the affinity rows in
+`$STAGE/viz/leaderboard_arm4_vs_mws/`, `figures/leaderboard_gallery.py`). Test half, unweighted
+mean over the four held-out volumes: **pq 0.2094**, against 0.2369 (1c) and 0.2287 (2c); size
+filter fitted on the finetune half chose 5000 voxels (finetune-half pq 0.2948 / 0.2974 / 0.3075 /
+0.2909 for none / 500 / 5000 / 50000; the affinity rows chose 50000 at 0.344, their unfiltered
+output being 0.004). Per volume, arm 4 vs 1c vs 2c: kasthuri15_ac4 0.385 / 0.496 / 0.442; liconn
+hippocampus 0.317 / 0.308 / 0.306; liconn expid82 0.057 / 0.056 / 0.082; doublecube1 0.078 /
+0.088 / 0.085. Components: sq 0.691 vs 0.708 (the 32 nm cell staircase and the partial pieces),
+rq 0.295 vs 0.324 (fewer objects found), voi_merge 3.45 vs 2.08 (more merges), voi_split 0.97 vs
+1.31 (fewer splits). Predicting the eight volumes took 2 h on B300 (doublecube1 twice: the first
+artifact was corrupted by the interpolation bug in "Caveats"). The pictures put the two families
+side by side on the same sections: the watershed labels every voxel, smooth boundaries, merges
+through unannotated space; the SAM arm leaves a third of the objects unlabelled, its boundaries
+step in 4-voxel cells, and its errors are merges of neighbouring processes. The assessment drawn
+from this is in the discussion of 2026-09-15: as an automatic segmenter the prompt-grid design is
+structurally behind (coarse mask grid, click grid, transitive gluing, no use for prompts without
+a user), and the next experiment should test a dense head with LSD targets on the same encoders.
+
+**Arms 2 and 4 at 200k** (scored 2026-09-15, everything on B300, chained onto the training jobs by
+`score_when_done.sh`; tables under `assembly_sweep/<arm>_step200000/`, `probe/<arm>_r0_step200000/`,
+pictures under `viz/<arm>_step200000/`). Arm 2 (4 nm, global batch 16) against arm 1 (4 nm, batch 8):
+single 1 um windows 0.832 / 0.698 (arm 1 0.842 / 0.626); assembled 0.406 / 0.496 (0.370 / 0.443),
+merges 12.8% (9.0%), fragments 15.9% (19.6%), purity 0.83 (0.83), 80% claimed (78%); swallowed 181
+of 1115 objects (arm 1 148): hemibrain 105, kasthuri 29, liconn 13, zebrafish 34. Probe head-top >=
+0.5 0.965 (0.945), 1.43 passing candidates per click (1.30). Overlap checks on hemibrain 88% joined /
+10% disagreed / 2% unmet (arm 1 85 / 13 / 1.4), kasthuri 80 / 11 / 9.5 (71 / 15 / 14), zebrafish
+85 / 6 / 9 (79 / 7 / 14). Validation 175-200k mean 0.666 vs 0.646. Doubling the batch at 4 nm buys a
+little recall and a little assembled precision and costs merges; the hemibrain block is the same
+one mega-piece. Arm 4 (8 nm, patch 16, batch 16, axial RoPE) against version 3 (8 nm, batch 8,
+superposition RoPE): single 2 um windows 0.748 / 0.451 (version 3 0.759 / 0.215); assembled 0.483 /
+0.343 (0.324 / 0.148), merges 4.7% (6.1%), fragments 19.7% (14.2%), purity 0.85 (0.89), 71% claimed
+(47%); swallowed 68 of 1041 (hemibrain 57, kasthuri 4, liconn 0, zebrafish 7); probe head-top 0.911
+(0.664), 1.08 per click (0.50); hemibrain overlaps 85 / 12 / 3 (71 / 24 / 5); validation 0.550 vs
+0.476. Per volume assembled precision / recall: hemibrain 0.467 / 0.173 (version 3 0.227), kasthuri
+0.583 / 0.485 (0.414), liconn 0.566 / 0.833 (0.562), zebrafish 0.431 / 0.508 (0.308). Batch and RoPE
+are confounded in that comparison; arm 5 shares the RoPE. Across arms: arm 4, with 27 windows per
+block, has the highest assembled precision so far (0.483) and the fewest swallowed objects (6.5%
+against 13-16% for the 4 nm arms) despite the weakest per-window recall (0.451 against 0.63-0.70),
+and in its hemibrain picture no single piece dominates; arm 2 has the highest recall at both levels.
+Window count governs the merges, token size governs the recall. The arm that combines the 64 nm
+token with the 2 um window is arm 3 (patch 8), still training.
+
+**Arm 5 at 200k** (scored 2026-09-16, B300; `assembly_sweep/arm5_8nm_gb32_step200000/`,
+`probe/arm5_8nm_gb32_r0_step200000/`, `viz/arm5_8nm_gb32_step200000/`). Arm 5 is arm 4's geometry
+at global batch 32 (4 crops per rank, 16 workers). Against arm 4: single 2 um windows 0.801 / 0.433
+(arm 4 0.748 / 0.451); assembled 0.596 / 0.361 (0.483 / 0.343) -- the highest assembled precision
+of any arm so far -- merges 5.5% (4.7%), fragments 14.6% (19.7%), swallowed 67 of 1041 (68),
+purity 0.85, 74% claimed. Per volume assembled precision / recall: hemibrain 0.527 / 0.169 (arm 4
+0.467 / 0.173), kasthuri 0.743 / 0.577 (0.583 / 0.485), liconn 0.629 / 0.847 (0.566 / 0.833),
+zebrafish 0.574 / 0.538 (0.431 / 0.508). Validation IoU over the last 25k steps 0.556 vs 0.550:
+the curve barely moved, the labels did. The probe says why: the IoU head under-predicts (mean
+predicted 0.81 against true 0.92, error 0.20 vs arm 4's 0.13), so at the 0.7 gate fewer
+candidates pass (0.96 per click vs 1.08) and those that do are right 99.5% of the time; the
+head-top candidate hits the object for 94.9% of clicks (arm 4 91.1%). Batch 32 therefore buys a
+more selective labeller rather than a better mask model, and the same mechanism that took recall
+from 0.451 to 0.433 in a window took assembled precision from 0.48 to 0.60. Overlap checks on
+hemibrain 85 / 12 / 3%, as arm 4.
+
+**Arm 5 on the leaderboard** (2026-09-16; record `sam1_arm5_8nm_gb32_r0_step200000`): **pq 0.2038**,
+fourth, just below arm 4's 0.2094 (1c 0.2369, 2c 0.2287); size filter 5000 again; finetune-half fit
+0.3609 (arm 4 0.3075). Per volume against arm 4: kasthuri15_ac4 0.432 / 0.385, liconn hippocampus
+0.321 / 0.317, zebrafish doublecube1 0.057 / 0.078, liconn expid82 **0.005 / 0.057**. Components:
+sq 0.722 / 0.691, rq 0.278 / 0.295, voi_merge 3.94 / 3.45, voi_split 0.71 / 0.97. So the better
+mask quality and fewer splits are real and carry to the held-out volumes it resembles, but on
+expid82 the labeller nearly stopped labelling: 233 masks survived the gates over 320 windows
+(arm 4: 2604), 115 objects for 1036 true ones, 4 true positives. The block tables did not see
+this because expid82 is not a fit volume. The cause is the same head under-prediction the probe
+reported: arm 5's head scores masks ~0.1 lower than they deserve, and on a volume that looks
+unlike its training data almost nothing reaches the fixed 0.7 gate. The gate, fixed by protocol
+for every arm, is therefore not neutral between arms with differently calibrated heads; fitting
+it per arm on the finetune half, as the size filter is, would be the fair protocol and would
+likely lift arm 5 above arm 4 (a 0.6 gate for arm 5 is roughly arm 4's 0.7). Not done: it is a
+protocol change to make once, deliberately, for every row.
+
+**A stricter head gate, 0.9 instead of 0.7** (2026-09-15, `viz/<arm>_step200000_iou0.9/`, whole
+blocks, everything else unchanged). At 4 nm (arm 2) the gate is a merge lever with a heavy recall
+price: pooled merges 175 -> 18, swallowed objects 181 -> 45, hemibrain's mega-piece gone (390 ->
+180 pieces, 133 -> 16 merges), liconn's big process matched instead of merged; but recall 0.496 ->
+0.262 and precision only 0.406 -> 0.462, because half the surviving pieces are partial -- pure,
+under half their object -- where a neighbouring window had no confident mask to glue to. At 8 nm
+(arm 4) the same gate removes the labels of the sparse volumes almost entirely (kasthuri 108 -> 6
+pieces, zebrafish 313 -> 10; the head there rarely predicts 0.9) while hemibrain keeps its large
+merged processes (swallowed 57 -> 32, precision 0.467 -> 0.508, recall 0.173 -> 0.110). So the
+gate removes uncertain masks, and at 4 nm most merges are uncertain masks; at 8 nm the merges the
+head is confident about survive it. For a pseudo-label at 4 nm, 0.9 is a defensible setting if
+merges are the cost that matters and coverage is not; it is not a fix for the assembled precision.
+
+**The three existing merge filters, on arm 4's hemibrain block** (2026-09-15, `viz/arm4_8nm_gb16_
+step200000_{part,tiled,consist4,all3}/`; baseline assembled 212 pieces, 24 merges, 57 swallowed,
+recall 0.173, 90% claimed). Keeping the contained mask instead of the container (`prefer = "part"`)
+and dropping masks tiled by smaller confident ones (`split_tiled_wholes`) change nothing: 25 / 57 and
+22 / 55. The merges are therefore not the dedup rules discarding correct small masks -- those small
+masks never exist as candidates; the merged mask is what the model draws. Re-clicking inside each
+mask (`consistency_clicks = 4`, reject if any click's top answer disagrees) cuts swallowed objects to
+12 but does it by discarding most large masks, correct ones included: claimed 90% -> 50%, recall
+0.173 -> 0.094, precision 0.467 -> 0.250. All three together equal the consistency run. At the
+single-window level arm 4 swallows 4 of 119 objects (3%); assembled, 57 of 573 (10%), so at 8 nm
+the gluing's amplification is the larger of the two layers, and the window-level merges themselves
+are the model's belief, to be fixed in training (finer cells, more objects per crop) rather than
+by filtering.
+
 Data configs at 4 nm are generated copies of lmd_ssl_v1's splits with `resolutions` rewritten
 (`data/lmd_{finetune,val}_singlescale_4nm.yaml`); boxes are in the stores' own voxels and unchanged.
-Reading them: `tensorboard.sh` (the three arms only). Scoring them needs the diagnostics told the
+Reading them: `tensorboard.sh` (the five arms). Scoring them needs the diagnostics told the
 lattice: for arms 1/2 the GT config is the 4 nm copy and a 1024-voxel block is the 512-voxel
 block of every earlier table (`--gt-config`, `--block 1024`, single-tile blocks 576), and the
 labeller's `min_mask_voxels` is 4096 there; arm 3 scores as before.
@@ -724,6 +1006,12 @@ labeller's `min_mask_voxels` is 4096 there; arm 3 scores as before.
   assembly (now including `consensus` and window step 64) plus a no-assembly single-tile reference; `pseudolabel.compare_labellings` gained
   `fragments`, `truth_best_share` and `pseudo_purity` (tested in `test_tools.py`) and the CLI an
   `--edge-discard` flag. Results under `$STAGE/assembly_sweep/<arm>/`.
+- `experiments/sam_lmd_v1/figures/labelling_gallery.py` / `.sh`: re-labels the four scored blocks
+  and saves what the diagnostic discards -- image, truth, the central window's labelling, the
+  assembled labelling (all at 8 nm) and every window's own labelling -- then draws image | truth |
+  model coloured by the true object under each piece | error map (matched / partial / merge /
+  spill / unlabelled truth). `compare_labellings` gained `swallowed` (tested in `test_tools.py`);
+  `score_when_done.sh` chains sweep + probe + gallery onto a training job's end.
 - `experiments/sam_lmd_v1/calibration_probe.py` / `.sh`: every grid candidate of a teacher on the
   diagnostic blocks, with its predicted IoU, stability, true IoU (mask grid and voxel), merge
   partners and gate outcome; `summarize` prints calibration bins and a threshold sweep. Results

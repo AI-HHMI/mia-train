@@ -33,9 +33,10 @@ set -euo pipefail
 
 PORT=${1:-6007}
 MODE=${2:-}
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-OVERFIT=/nrs/scicompsoft/orhane/mia-train-scratch/sam_lmd_v1/overfit
-VIEW=$RUNS/tb_sam_lmd_v1_overfit
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/sam_lmd_v1   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+OVERFIT=/nrs/scicompsoft/orhane/mia-train-experiments/sam_lmd_v1/overfit
+VIEW=$EXP/overfit/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
 TESTS=(8nm 4nm 8nm_stride2)
 

@@ -20,9 +20,10 @@ done
 
 EVALS=/groups/scicompsoft/home/orhane/projects/mia-evals
 PY=/groups/scicompsoft/home/orhane/banisvenv/bin/python
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/sam_lmd_v1
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/sam_lmd_v1   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+STAGE=$EXP
+LOGS="$EXP/jobs"
 
 run=$(ls -dt "$RUNS"/sam1__${ARM}_r${ROUND}_*/ 2>/dev/null | head -1) || true
 [[ -n "${run:-}" ]] || { echo "no run matching sam1__${ARM}_r${ROUND}_*" >&2; exit 1; }

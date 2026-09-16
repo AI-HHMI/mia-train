@@ -31,7 +31,7 @@ drop_path_rate = 0.1  # deliberately different from teacher, data aug that lives
 
 [init]
 # The interpolation-trained encoder, NOT teacher_0. This is what makes arm 1 a reset.
-path = "/nrs/scicompsoft/orhane/mia-train-runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000"
+path = "/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity/runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000"
 prefix = "model."
 strict = true
 

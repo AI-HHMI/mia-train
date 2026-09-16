@@ -153,6 +153,12 @@ HEAD_NOTES: dict[str, str] = {
     "min_object_voxels": "smaller objects are never prompted for: at stride 4 they pool to ~1 cell",
     "rounds": "one click or box, then two correction rounds (the reference uses 11)",
     "box_prob": "round 0 is a noised box with this probability, else a click",
+    "correction_pairs": "each correction round adds a foreground AND a background click "
+                        "(padding where that error is absent) instead of one or the other -- "
+                        "the reference's recipe, Archit et al. 2025",
+    "mask_prompt_prob": "probability a correction round also sees the previous mask; fed always "
+                        "(1.0) the model leans on it and degrades when given points alone "
+                        "(Archit et al. 2025)",
     "attention_backend": "the DECODER's kernel; sdpa is the one torch.compile accepts",
 }
 
@@ -211,6 +217,27 @@ ARMS: list[dict] = [
     dict(name="arm4_8nm_gb16", knobs={"mask_feature_dim": 64}, rope="vanilla", batch=2, rounds=0,
          blurb="version 4 arm 4: version 3's geometry (8 nm, patch 16, 128 nm token, 32 nm cell) "
                "at two crops per rank, global batch 16, same LR; 3D axial RoPE."),
+    # Arm 4 plus the three training changes taken from Archit et al. 2025 (Segment Anything for
+    # Microscopy): twice the objects per crop (their most important hyperparameter), the
+    # reference's positive+negative click pair per correction round, and the previous mask fed
+    # back half the time. Everything else is arm 4, so arm 6 vs arm 4 is these three together.
+    dict(name="arm6_8nm_gb16_musam",
+         knobs={"mask_feature_dim": 64, "masks_per_sample": 32, "correction_pairs": True,
+                "mask_prompt_prob": 0.5},
+         rope="vanilla", batch=2, rounds=0,
+         blurb="version 4 arm 6: arm 4 with three changes from Archit et al. 2025 -- 32 objects "
+               "per crop (was 16), a foreground AND a background click per correction round, the "
+               "previous mask fed back with probability 0.5 (was always)."),
+    # Arm 6 with twice the objects again: does "more objects per crop" keep paying past 32?
+    # Everything else identical to arm 6, so arm 7 vs arm 6 vs arm 4 is 64 vs 32 vs 16 objects
+    # (the last also differing in the click recipe).
+    dict(name="arm7_8nm_gb16_musam64",
+         knobs={"mask_feature_dim": 64, "masks_per_sample": 64, "correction_pairs": True,
+                "mask_prompt_prob": 0.5},
+         rope="vanilla", batch=2, rounds=0,
+         blurb="version 4 arm 7: arm 6 with 64 objects per crop instead of 32; otherwise "
+               "identical (click pairs, mask fed back with probability 0.5, 8 nm, patch 16, "
+               "global batch 16, 3D axial RoPE)."),
     dict(name="arm5_8nm_gb32", knobs={"mask_feature_dim": 64}, rope="vanilla", batch=4, rounds=0,
          workers=16,
          blurb="version 4 arm 5: as arm 4 at four crops per rank, global batch 32. 16 dataloader "

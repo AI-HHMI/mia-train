@@ -9,7 +9,7 @@
 #   config_path = "configs/data/lmd_instances.yaml"
 #
 # Generated and verified by
-# /nrs/scicompsoft/orhane/mia-train-scratch/sam3d/make_instances_config.py -- every path below was
+# /nrs/scicompsoft/orhane/mia-train-experiments/promptable_seg_v1/make_instances_config.py -- every path below was
 # opened, and its image and label groups read, at generation time.
 #
 # THREE THINGS THIS FILE ENCODES THAT ARE EASY TO GET WRONG.

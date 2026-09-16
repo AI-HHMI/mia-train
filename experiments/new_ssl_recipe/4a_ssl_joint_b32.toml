@@ -28,8 +28,8 @@
 #   bsub -P miaai -q gpu_h100_parallel -app parallel-96 -gpu "num=8:mode=shared" \
 #     -n 192 -W 12:00 -r -J sslrec_4a \
 #     -cwd /groups/scicompsoft/home/orhane/projects/mia-train \
-#     -o /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_4a_%J.log \
-#     -e /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_4a_%J.err \
+#     -o /nrs/scicompsoft/orhane/mia-train-experiments/new_ssl_recipe/jobs/sslrec_4a_%J.log \
+#     -e /nrs/scicompsoft/orhane/mia-train-experiments/new_ssl_recipe/jobs/sslrec_4a_%J.err \
 #     "MIA_TRAIN=/groups/scicompsoft/home/orhane/projects/mia-train \
 #      VENV=/groups/scicompsoft/home/orhane/myvenv \
 #      /groups/scicompsoft/home/orhane/projects/mia-train/deploy/lsf/launch_multinode.sh 8 \

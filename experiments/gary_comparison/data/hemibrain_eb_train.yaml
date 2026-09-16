@@ -1,0 +1,42 @@
+# gary_comparison -- the TRAIN split of the FlyEM hemibrain Ellipsoid Body crop.
+#
+# One volume, split spatially the way the colleague split it, so both sets of models are trained,
+# selected and scored on the same voxels. The three files in this directory differ ONLY in `name`
+# and `bounding_box` (diff them to check); everything else is the volume.
+#
+#   train  [[0, 5000], [0, 5000], [0, 3000]]           z <  3000          75 G voxels
+#   val    [[0, 5000], [0, 5000], [3000, 4000]]        3000 <= z < 4000   25 G voxels
+#   test   [[4000, 5000], [4000, 5000], [4000, 5000]]  one corner          1 G voxels
+#
+# The store is OME-Zarr 0.5 (zarr v3), axes x,y,z, 8 nm isotropic, 5000^3 at level 0 with a
+# six-level pyramid. The label group is the proofread FlyEM hemibrain v1.2 neuron segmentation
+# (uint64), same shape, pyramid and axis order as the image. `bounding_box` is [lo, hi) in level-0
+# voxels in output_axes spatial order -- x, y, z, the order the store itself uses -- so the
+# colleague's boxes are copied verbatim. 8 nm is the stored level-0 voxel size, so miao stays on
+# level 0 and resamples nothing. miao keeps every window strictly inside the box, so a crop drawn
+# here never touches the other splits' tissue.
+#
+# Referenced from a run config with:
+#
+#   [data]
+#   name = "miao_volumes"
+#   config_path = "experiments/gary_comparison/data/hemibrain_eb_train.yaml"
+#   samples_per_epoch = <large>   # epoch boundaries respawn the workers; keep them rare
+#   defer_image_ops = true
+resolutions: [[8.0, 8.0, 8.0]]
+patch_size: [256, 256, 256]
+output_axes: lcxyz
+samples_per_epoch: 1000   # the run config's [data] / [val_data] section overrides this
+# Resampling and normalisation happen on the device, not in the loader workers (see
+# src/data/miao_dataset.py). Here as well as in the run config so the setting cannot be lost.
+defer_image_ops: true
+
+volumes:
+  - name: hemibrain_eb_train
+    path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-001_EllipsoidBody_x24000_y23000_z17000.zarr
+    image_key: raw
+    label_key: labels/proofread-cell-hemibrain-v1.2
+    zarr_version: zarr3
+    bounding_box: [[0, 5000], [0, 5000], [0, 3000]]
+    weight: 1.0
+    normalize: true   # uint8 on disk, so this maps to [0, 1] by dtype max

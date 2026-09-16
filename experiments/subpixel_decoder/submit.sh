@@ -13,8 +13,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
 PROJECT=miaai
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/subpixel_decoder   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+LOGS="$EXP/jobs"
 mkdir -p "$LOGS"
 
 THREADS="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4;"
@@ -25,7 +26,7 @@ if [[ "${1:-}" == "--smoke" ]]; then
   # and then the smoke test stops exercising what actually runs. `train.py` takes no override
   # flags, so the edit happens here. It must land on shared storage -- the job runs on another
   # host, where /tmp is a different disk.
-  SMOKE=/nrs/scicompsoft/orhane/mia-train-scratch/smoke
+  SMOKE=/nrs/scicompsoft/orhane/mia-train-experiments/simmim_vs_direct/smoke
   mkdir -p "$SMOKE"
   sed -e 's/^experiment_name = .*/experiment_name = "subpixel_smoke"/' \
       -e 's/^max_steps = .*/max_steps = 20/' \
@@ -52,4 +53,4 @@ bsub -P "$PROJECT" -q gpu_h100 -gpu "num=8" -n 96 -W 48:00 -r \
      -o "$LOGS/subpixel_decoder_%J.log" -e "$LOGS/subpixel_decoder_%J.err" \
      "$THREADS \
       $VENV/bin/torchrun --standalone --nproc_per_node=8 src/train.py \
-        --config '$HERE/subpixel_256.toml' --resume"
+        --config '$HERE/subpixel_256.toml' --output-root '$RUNS' --resume"

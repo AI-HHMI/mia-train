@@ -6,8 +6,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
 PROJECT=miaai
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+LOGS="$EXP/jobs"
 mkdir -p "$LOGS"
 
 QUEUE=gpu_h100
@@ -22,4 +23,4 @@ bsub -P "$PROJECT" -q "$QUEUE" -gpu "num=$GPUS" -n "$SLOTS" -W 48:00 -r \
      "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; \
       export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
       $VENV/bin/torchrun --standalone --nproc_per_node=$GPUS src/train.py \
-        --config '$HERE/finetune_256_long.toml' --resume"
+        --config '$HERE/finetune_256_long.toml' --output-root '$RUNS' --resume"

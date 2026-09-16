@@ -34,9 +34,10 @@ shift
 BANIS=/groups/scicompsoft/home/orhane/projects/banis
 MYVENV=/groups/scicompsoft/home/orhane/myvenv
 BANISVENV=/groups/scicompsoft/home/orhane/banisvenv
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-SCRATCH=/nrs/scicompsoft/orhane/mia-train-scratch
-EVAL=$SCRATCH/eval
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+SCRATCH=$EXP/jobs
+EVAL=$EXP/eval
 PROJECT=miaai
 
 RUN=""

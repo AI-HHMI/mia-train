@@ -11,7 +11,7 @@
 # Results: $STAGE/probe/<arm>_r<round>_step<N>/{<volume>.npz,summary.json,table.txt} (the deep4 and
 # feat64 version-2 probes predate the step suffix: probe/deep4_r0, probe/feat64_r0).
 #
-# Default queue is gpu_h100: the probe compares stages of one pipeline against each other, and a
+# Default queue is gpu_b300 (version-2 probes ran on H100 while B300 was closed); the probe compares stages, and a
 # GPU generation shifts the decoded masks by well under the effects it looks for (memory note:
 # 520 vs 530 instances on one block). The eval and labelling passes stay pinned to B300.
 set -euo pipefail
@@ -19,14 +19,18 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/sam_lmd_v1
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/sam_lmd_v1   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+STAGE=$EXP
+LOGS="$EXP/jobs"
 PROJECT=miaai
-QUEUE=${QUEUE:-gpu_h100}
+QUEUE=${QUEUE:-gpu_b300}   # the arms train here; H100 was used only while B300 was admin-closed
 ROUND=${ROUND:-0}
 BLOCK=${BLOCK:-512}
 MAX_TILES=${MAX_TILES:-0}
+GT_CONFIG=${GT_CONFIG:-experiments/lmd_ssl_v1/lmd_finetune_singlescale.yaml}
+MIN_MASK=${MIN_MASK:-512}     # the gate's size floor in lattice voxels; 4096 for a 4 nm model
+# A 4 nm model: GT_CONFIG=experiments/sam_lmd_v1/data/lmd_finetune_singlescale_4nm.yaml BLOCK=1024 MIN_MASK=4096
 GT_VOLUMES=(kasthuri15_ac3 zebrafish_fish2_quadcube1 liconn_mouse_dg hemibrain_ellipsoid_body)
 
 ARMS=(); DRY=0
@@ -59,7 +63,7 @@ for ARM in "${ARMS[@]}"; do
     echo "echo \"element \${LSB_JOBINDEX:-1}: volume \$V on \$(hostname)\""
     echo "nvidia-smi --query-gpu=name --format=csv,noheader | head -1"
     echo "$VENV/bin/python experiments/sam_lmd_v1/calibration_probe.py probe '$run' --step $STEP --volume \"\$V\" \\"
-    echo "  --out '$OUT'/\"\$V\".npz --block $BLOCK --max-tiles $MAX_TILES"
+    echo "  --out '$OUT'/\"\$V\".npz --block $BLOCK --max-tiles $MAX_TILES --gt-config '$GT_CONFIG' --min-mask-voxels $MIN_MASK"
   } > "$WORKER"
   FINAL="$STAGE/cmd/probe_${ARM}_r${ROUND}_step${STEP}_final.sh"
   { echo "#!/usr/bin/env bash"

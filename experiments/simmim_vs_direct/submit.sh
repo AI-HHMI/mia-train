@@ -7,8 +7,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
 PROJECT=miaai
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/simmim_vs_direct   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+LOGS="$EXP/jobs"
 
 QUEUE=gpu_h200
 GPUS=8
@@ -35,7 +36,7 @@ launch () {          # launch <name> <config> <hours> [dependency]
        "${wait_arg[@]}" \
        "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; \
         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
-        $VENV/bin/torchrun --standalone --nproc_per_node=$GPUS src/train.py --config $config"
+        $VENV/bin/torchrun --standalone --nproc_per_node=$GPUS src/train.py --config $config --output-root '$RUNS'"
 }
 
 if wanted A1; then
@@ -63,7 +64,7 @@ bsub -P "$PROJECT" -q "$QUEUE" -gpu "num=$GPUS" -n "$SLOTS" -W 24:00 \
       sed \"s|^path = \\\"/nrs/.*A1_simmim_pretrain.*\\\"|path = \\\"\$CKPT\\\"|\" \
           '$HERE/2A_finetune_from_simmim.toml' > '$RESOLVED'; \
       echo \"arm A2 initialising from \$CKPT\"; \
-      $VENV/bin/torchrun --standalone --nproc_per_node=$GPUS src/train.py --config '$RESOLVED'"
+      $VENV/bin/torchrun --standalone --nproc_per_node=$GPUS src/train.py --config '$RESOLVED' --output-root '$RUNS'"
 fi
 
 if wanted B; then
@@ -84,5 +85,5 @@ bsub -P "$PROJECT" -q gpu_h200_parallel -app parallel-96 -gpu "num=8:mode=shared
      -n 192 -W 24:00 -J simmim_D -cwd "$REPO" \
      -o "$LOGS/simmim_D_%J.log" -e "$LOGS/simmim_D_%J.err" \
      "MIA_TRAIN='$REPO' VENV='$VENV' \
-      '$REPO/deploy/lsf/launch_multinode.sh' 8 '$HERE/2D_finetune_dinov3_batch16.toml'"
+      '$REPO/deploy/lsf/launch_multinode.sh' 8 '$HERE/2D_finetune_dinov3_batch16.toml' --output-root '$RUNS'"
 fi

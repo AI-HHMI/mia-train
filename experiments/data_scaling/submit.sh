@@ -29,9 +29,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
 PROJECT=miaai
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/data_scaling   # NOT /tmp: that is node-local
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/data_scaling   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+STAGE=$EXP   # NOT /tmp: that is node-local
+LOGS="$EXP/jobs"
 mkdir -p "$LOGS" "$STAGE/cmd" "$STAGE/smoke"
 
 GPUS=8
@@ -47,7 +48,7 @@ WALL_B=20:00
 
 # Only used by --smoke, where no predecessor exists yet: a trained ViT-L of exactly stage B's
 # expected shape (3D, interpolating head), so the `prefix = "model."` load path is really exercised.
-SMOKE_ENCODER=/nrs/scicompsoft/orhane/mia-train-runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000
+SMOKE_ENCODER=/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity/runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000
 
 # Per-arm queue. 2 whole H100 nodes and 1 whole H200 node were free at submission time.
 declare -A ARM_QUEUE=( [1]=gpu_h100 [3]=gpu_h100 [5]=gpu_h200 )
@@ -107,7 +108,7 @@ sed \"s|PREV_CHECKPOINT|\${RUN}checkpoints/step_\$STEP|\" '$cfg' > '$resolved'"
     [[ -n "$prologue" ]] && echo "$prologue"
     printf '%s --standalone --nproc_per_node=%s src/train.py --config %q %s\n' \
       "$VENV/bin/torchrun" "$procs" "$cfg" \
-      "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--resume")"
+      "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--output-root $RUNS --resume")"
   } > "$cmd"
 
   local bsub_args=(-P "$PROJECT" -q "$queue" -gpu "num=$procs" -n "$slots" -W "$wall" -r

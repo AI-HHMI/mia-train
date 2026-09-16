@@ -27,9 +27,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
 PROJECT=miaai
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/lmd_ssl_v1   # NOT /tmp: that is node-local
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/lmd_ssl_v1   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+STAGE=$EXP   # NOT /tmp: that is node-local
+LOGS="$EXP/jobs"
 mkdir -p "$LOGS" "$STAGE/cmd" "$STAGE/smoke"
 
 GPUS=8
@@ -96,7 +97,7 @@ done
 
 # A trained encoder of each shape, so --smoke can exercise the PREV_CHECKPOINT load path before any
 # predecessor exists. Only the DINOv3 one exists today; arm 3's smoke stages skip [init].
-SMOKE_DINOV3=/nrs/scicompsoft/orhane/mia-train-runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000
+SMOKE_DINOV3=/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity/runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000
 
 SMOKE=0 DRY=0
 while [[ "${1:-}" == --* ]]; do
@@ -163,7 +164,7 @@ sed \"s|PREV_CHECKPOINT|\${RUN}checkpoints/step_\$STEP|\" '$cfg' > '$resolved'"
     echo "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
     [[ -n "$prologue" ]] && echo "$prologue"
     local tail_args
-    tail_args="$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--resume")"
+    tail_args="$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--output-root $RUNS --resume")"
     if [[ $multinode -eq 1 ]]; then
       printf 'MIA_TRAIN=%q VENV=%q %q %s %q %s\n' \
         "$REPO" "$VENV" "$REPO/deploy/lsf/launch_multinode.sh" "$procs" "$cfg" "$tail_args"

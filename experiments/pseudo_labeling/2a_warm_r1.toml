@@ -57,7 +57,7 @@ target = "algorithm"
 prefix = ""
 skip = ["encoder."]
 strict = true
-path = "/nrs/scicompsoft/orhane/mia-train-runs/subpixel_decoder__subpixel_256_20260811_143947/checkpoints/step_100000"
+path = "/nrs/scicompsoft/orhane/mia-train-experiments/subpixel_decoder/runs/subpixel_decoder__subpixel_256_20260811_143947/checkpoints/step_100000"
 
 [algorithm]
 name = "affinity_seg"

@@ -29,14 +29,15 @@ REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
 BANIS=/groups/scicompsoft/home/orhane/projects/banis
 PROJECT=miaai
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/pseudo_labeling
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/pseudo_labeling   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+STAGE=$EXP
+LOGS="$EXP/jobs"
 mkdir -p "$LOGS" "$STAGE/cmd" "$STAGE/configs" "$STAGE/locks"
 
 # teacher_0: the best checkpoint on this task, 0.4941 nERL whole-cube on seed100. Round 1's
 # pseudo-labels are only as good as this model, and every later round inherits that ceiling.
-TEACHER0="$RUNS/subpixel_decoder__subpixel_256_20260811_143947"
+TEACHER0="/nrs/scicompsoft/orhane/mia-train-experiments/subpixel_decoder/runs/subpixel_decoder__subpixel_256_20260811_143947"
 TEACHER0_STEP=100000
 
 CUBES=${CUBES:-/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/train_100/train}
@@ -297,7 +298,7 @@ sed -e \"s|ROUND_CONFIG|$roundcfg|\" -e \"s|PREV_CHECKPOINT|\${RUN}checkpoints/s
     echo "$prologue"
     printf '%s --standalone --nproc_per_node=%s src/train.py --config %q %s\n' \
       "$VENV/bin/torchrun" "$procs" "$resolved" \
-      "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--resume")"
+      "$([[ $SMOKE -eq 1 ]] && printf -- "--output-root %q" "$STAGE/smoke" || echo "--output-root $RUNS --resume")"
   } > "$cmd"
   chmod +x "$cmd"
 

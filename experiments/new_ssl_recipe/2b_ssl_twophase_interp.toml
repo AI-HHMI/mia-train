@@ -18,13 +18,13 @@
 #   RUNS=/nrs/scicompsoft/orhane/mia-train-runs
 #   RUN=$(ls -dt $RUNS/sslrec__2a_ssl_twophase_*/ | head -1)
 #   STEP=$(ls -d ${RUN}checkpoints/step_* | sed 's|.*step_||' | sort -n | tail -1)
-#   OUT=/nrs/scicompsoft/orhane/mia-train-scratch/new_ssl_recipe/2b_resolved.toml
+#   OUT=/nrs/scicompsoft/orhane/mia-train-experiments/new_ssl_recipe/2b_resolved.toml
 #   sed "s|PREV_CHECKPOINT|${RUN}checkpoints/step_${STEP}|" \
 #     experiments/new_ssl_recipe/2b_ssl_twophase_interp.toml > "$OUT"
 #
 #   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 20:00 -r -J sslrec_2b \
 #     -cwd /groups/scicompsoft/home/orhane/projects/mia-train -w "done(<2a job id>)" \
-#     -o /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_2b_%J.log \
+#     -o /nrs/scicompsoft/orhane/mia-train-experiments/new_ssl_recipe/jobs/sslrec_2b_%J.log \
 #     "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; \
 #      export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
 #      /groups/scicompsoft/home/orhane/myvenv/bin/torchrun --standalone --nproc_per_node=8 \

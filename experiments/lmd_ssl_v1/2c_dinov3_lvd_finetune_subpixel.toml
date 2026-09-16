@@ -52,7 +52,7 @@ decoder = "subpixel"
 decoder_hidden_dim = 256
 decoder_readout_dim = 16
 decoder_refine_depth = 2
- split_disconnected = true
+split_disconnected = true
 
 [data]
 name = "miao_volumes"

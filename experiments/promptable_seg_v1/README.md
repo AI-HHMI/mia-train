@@ -20,7 +20,7 @@ asked for a *particular* object.
 ## The corpus
 
 `configs/data/lmd_instances.yaml`, generated and verified by
-`/nrs/scicompsoft/orhane/mia-train-scratch/sam3d/make_instances_config.py`. Six training volumes
+`/nrs/scicompsoft/orhane/mia-train-experiments/promptable_seg_v1/make_instances_config.py`. Six training volumes
 plus one held out, from the 138 `cell`/`neurite` label groups in `lmd-v0.0.1`.
 
 Two measurements shaped it (`sam3d/instance_census.py`):
@@ -137,7 +137,7 @@ is static and nothing is read back. `tests/unit/test_promptable_targets.py` pins
 ## Submitting
 
 ```bash
-JOBS=/nrs/scicompsoft/orhane/mia-train-jobs
+JOBS=/nrs/scicompsoft/orhane/mia-train-experiments/promptable_seg_v1/jobs
 bsub -P miaai -q gpu_h100 -gpu "num=2" -n 24 -W 2:00 -J psv1_escape \
   -cwd $JOBS -o $JOBS/psv1_escape_%J.log -e $JOBS/psv1_escape_%J.err \
   $JOBS/sam3d_smoke.sh experiments/promptable_seg_v1/escape.toml

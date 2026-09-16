@@ -33,9 +33,10 @@ BANIS=/groups/scicompsoft/home/orhane/projects/banis
 TRAINVENV=/groups/scicompsoft/home/orhane/myvenv     # torch + mia-train, for prediction
 SCOREVENV=/groups/scicompsoft/home/orhane/banisvenv  # numba + the BANIS metrics, for scoring
 PROJECT=miaai
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-OUT=/nrs/scicompsoft/orhane/mia-train-scratch/data_scaling/eval
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/data_scaling   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+OUT=$EXP/eval
+LOGS="$EXP/jobs"
 NISB=/groups/miaai/miaai/lmd-v0.0.1/dev/nisb
 mkdir -p "$OUT" "$LOGS"
 

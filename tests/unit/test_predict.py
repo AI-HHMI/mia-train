@@ -450,6 +450,84 @@ def _geometry_only_grid(chosen_levels, label_chosen_levels):
     return grid
 
 
+def test_an_ome_artifact_carries_the_lattice_geometry_and_its_attrs(tmp_path):
+    """One level, axes in storage order, scale = lattice voxel, translation = first voxel's
+    centre; the attrs on the group and again on the array."""
+    import zarr
+
+    from prediction.artifact import LEVEL, multiscales, write_ome_artifact
+
+    labels = np.arange(2 * 3 * 4, dtype=np.uint32).reshape(2, 3, 4)
+    path = write_ome_artifact(
+        tmp_path / "v.zarr", labels, axes="zyx", voxel_nm=[8.0, 8.0, 8.0],
+        translation_nm=[112.0, 504.0, 504.0], attrs={"kind": "instances", "background_id": 0},
+    )
+    group = zarr.open_group(str(path), mode="r")
+    ome = dict(group.attrs)["ome"]
+    assert ome["version"] == "0.5" and len(ome["multiscales"]) == 1
+    (dataset,) = ome["multiscales"][0]["datasets"]
+    assert dataset["path"] == LEVEL
+    assert dataset["coordinateTransformations"] == [
+        {"type": "scale", "scale": [8.0, 8.0, 8.0]},
+        {"type": "translation", "translation": [112.0, 504.0, 504.0]},
+    ]
+    assert [a["name"] for a in ome["multiscales"][0]["axes"]] == ["z", "y", "x"]
+    assert dict(group.attrs)["kind"] == "instances"
+    assert dict(group[LEVEL].attrs)["kind"] == "instances"
+    assert np.array_equal(group[LEVEL][:], labels) and group[LEVEL].dtype == np.uint32
+
+    # A channel-first array gets a leading channel axis with unit scale.
+    ms = multiscales("zyx", [8.0, 8.0, 8.0], [0.0, 0.0, 0.0], channels=True, name="a")
+    assert ms["multiscales"][0]["axes"][0] == {"name": "c", "type": "channel"}
+    transforms = ms["multiscales"][0]["datasets"][0]["coordinateTransformations"]
+    assert transforms[0]["scale"] == [1.0, 8.0, 8.0, 8.0]
+    with pytest.raises(ValueError, match="rank"):
+        write_ome_artifact(tmp_path / "bad.zarr", np.zeros((2, 2)), axes="zyx", voxel_nm=[1, 1, 1],
+                           translation_nm=[0, 0, 0], attrs={})
+
+
+@pytest.mark.unit
+def test_ome_geometry_places_the_first_lattice_voxel_by_the_stores_convention():
+    """Lattice voxel 0 spans native voxels [low, low + v/e); its centre is low*v + (e - v)/2,
+    plus the store's own level translation."""
+    from types import SimpleNamespace
+
+    from prediction.artifact import ome_geometry
+
+    scales = {0: SimpleNamespace(translation_or_zeros=lambda: [0.0, 3.0, 0.0, 0.0])}  # c,z,y,x
+    info = SimpleNamespace(image_meta=SimpleNamespace(scales=scales), img_spatial_idx=[1, 2, 3])
+    grid = SimpleNamespace(
+        info=info, image_level=0, axes="zyx",
+        image_voxel=[29.0, 6.0, 6.0],            # kasthuri's native voxel
+        effective_voxel=[8.0, 8.0, 8.0],         # the 8 nm lattice
+        native_box=lambda: [[14, 86], [84, 939], [84, 939]],
+    )
+    g = ome_geometry(grid)
+    assert g["axes"] == "zyx" and g["voxel_nm"] == [8.0, 8.0, 8.0]
+    # z: 14 * 29 + (8 - 29) / 2 + 3;  y, x: 84 * 6 + (8 - 6) / 2
+    assert g["translation_nm"] == pytest.approx([14 * 29 - 10.5 + 3.0, 84 * 6 + 1.0, 84 * 6 + 1.0])
+
+
+@pytest.mark.unit
+def test_labellings_are_written_as_the_narrowest_unsigned_type():
+    """Neuroglancer has no int64; uint32 holds nearly every labelling and uint64 the rest."""
+    from predict import unsigned_labels
+
+    small = np.array([[0, 3], [7, 2**32 - 1]], dtype=np.int64)
+    assert unsigned_labels(small).dtype == np.uint32
+    assert np.array_equal(unsigned_labels(small), small)
+    huge = np.array([0, 2**40], dtype=np.int64)          # a 64-bit hemibrain body id
+    assert unsigned_labels(huge).dtype == np.uint64
+    assert int(unsigned_labels(huge)[1]) == 2**40
+    already = np.array([1, 2], dtype=np.uint32)
+    assert unsigned_labels(already) is already
+    with pytest.raises(ValueError, match="negative"):
+        unsigned_labels(np.array([-1, 4], dtype=np.int64))
+    with pytest.raises(TypeError, match="integer"):
+        unsigned_labels(np.array([0.5]))
+
+
+@pytest.mark.unit
 def test_a_volume_without_labels_still_gets_a_lattice():
     """Pseudo-labelling tiles unlabeled volumes: no `label_key`, so no label level to resolve.
 

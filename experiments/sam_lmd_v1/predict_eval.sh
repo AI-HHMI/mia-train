@@ -13,14 +13,17 @@
 # **Both halves are needed.** The size filter is fitted on the finetune half and applied to the
 # reported half, exactly as for the MWS entries; mia-evals refuses to fit and report on one set.
 #
-# **Mask-generator settings are fixed here, not fitted.** They are the values
-# promptable_seg_v1/RESULTS.md found best on a held-out block (14^3 clicks per tile, IoU and
-# stability gates at 0.5), with the windows reconciled by agreement (`consensus`, measured best on
-# the GT blocks 2026-09-12 and at the metric's ceiling for perfect masks), applied identically to
-# every arm and round, and recorded in each artifact's attrs. The only parameter fitted per arm is
-# the size filter, which is also the only one fitted for the MWS rows. `points_per_batch` is a
-# throughput knob with no effect on the result and is lowered for the finer-stride arms, whose
-# per-prompt logits are 8x and 64x larger.
+# **Mask-generator settings are the labeller's, fixed, not fitted.** Every generator knob is read
+# from `pseudolabel.LABEL_AMG` (14^3 clicks per window, IoU gate 0.7, stability gate 0.8, NMS 0.7,
+# windows reconciled by agreement), so the pass the leaderboard scores is exactly the pass that
+# writes the pseudo-labels and that every diagnostic (probe, block tables, pictures) describes.
+# Until 2026-09-15 the gates here were 0.5 / 0.5, the values promptable_seg_v1/RESULTS.md found best
+# on one block of liconn_expid82 with an early model (pq 0.142 against 0.139 for 0.5 / 0.8 -- within
+# noise); no artifact was ever scored with them. Applied identically to every arm and round, and
+# recorded in each artifact's attrs. The only parameter fitted per arm is the size filter, which is
+# also the only one fitted for the MWS rows. `points_per_batch` is a throughput knob with no effect
+# on the result and is lowered for the finer-stride arms, whose per-prompt logits are 8x and 64x
+# larger.
 #
 # **B300, one architecture for every SAM arm.** The same code on a different GPU generation gives
 # a different instance count (530 vs 520 on one block, pq 0.0486 vs 0.0503 -- measured), so all
@@ -34,9 +37,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 VENV=/groups/scicompsoft/home/orhane/myvenv
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-STAGE=/nrs/scicompsoft/orhane/mia-train-scratch/sam_lmd_v1
-LOGS="$RUNS/jobs"
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/sam_lmd_v1   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+STAGE=$EXP
+LOGS="$EXP/jobs"
 PROJECT=miaai
 QUEUE=${QUEUE:-gpu_b300}
 
@@ -66,15 +70,25 @@ run=${run%/}
 upscale=$("$VENV/bin/python" -c "import json,sys; print(json.load(open(sys.argv[1]))['algorithm']['kwargs'].get('mask_upscale', 4))" "$run/resolved_config.json")
 case "$upscale" in 16) batch=8; mem_scale=3 ;; 8) batch=32; mem_scale=2 ;; *) batch=64; mem_scale=1 ;; esac
 # One string, because it is spliced into a command LSF hands to a shell: the TOML quotes around
-# a string value must survive that second parse, so they are escaped here (`\"propagate\"`).
-# A run was once lost to the shell stripping them and predict.py refusing the bare word.
-OVERRIDES='--override algorithm.points_per_side=14 --override algorithm.pred_iou_thresh=0.5 \
---override algorithm.stability_thresh=0.5 --override algorithm.nms_iou=0.7 \
---override algorithm.tile_merge=\"consensus\" --override algorithm.agree_thresh=0.5'
+# a string value must survive that second parse, so they are escaped (`\"consensus\"`). A run was
+# once lost to the shell stripping them and predict.py refusing the bare word. The knobs come from
+# the labeller's LABEL_AMG so the two passes cannot drift apart; points_per_batch is overridden last.
+OVERRIDES=$("$VENV/bin/python" - "$REPO/experiments/sam_lmd_v1" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from pseudolabel import LABEL_AMG
+def toml(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return '\\"%s\\"' % v if isinstance(v, str) else str(v)
+print(" ".join(f"--override algorithm.{k}={toml(v)}" for k, v in LABEL_AMG.items() if k != "points_per_batch"))
+PY
+)
 OVERRIDES+=" --override algorithm.points_per_batch=$batch"
 echo "run   $run"
 echo "step  $STEP"
 echo "mask_upscale $upscale -> points_per_batch $batch"
+echo "generator $OVERRIDES"
 
 slots_for () {                          # host slots at 40 GB; two int64 volumes plus write buffers
   local base

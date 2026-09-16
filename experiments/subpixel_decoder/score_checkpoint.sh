@@ -16,7 +16,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHARED="$HERE/../banis_parity/score_checkpoint.sh"
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/subpixel_decoder   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
 
 [[ $# -gt 0 ]] || exec bash "$SHARED"      # no step given: let the shared script print its usage
 

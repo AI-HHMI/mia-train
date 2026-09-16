@@ -846,6 +846,18 @@ def test_consensus_handles_no_tiles_and_rejects_bad_thresholds():
         consensus_labelling([], (1, 1, 1), agree_thresh=0.5, min_support=0)
 
 
+def test_upsample_cells_repeats_every_cell_over_its_stride_block():
+    from algorithms.promptable.amg import upsample_cells
+
+    cells = np.arange(1, 1 + 2 * 3 * 4, dtype=np.int64).reshape(2, 3, 4)
+    out = upsample_cells(cells, (4, 2, 1))
+    assert out.shape == (8, 6, 4) and out.dtype == np.int64
+    # Every voxel carries the id of the cell it lies in, and only those ids occur.
+    z, y, x = np.indices(out.shape)
+    assert np.array_equal(out, cells[z // 4, y // 2, x // 1])
+    assert np.array_equal(np.unique(out), cells.ravel())
+
+
 def test_tile_labelling_gives_the_better_score_the_overlap():
     from algorithms.promptable.amg import tile_labelling
 

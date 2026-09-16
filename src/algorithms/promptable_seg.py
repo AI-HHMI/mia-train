@@ -132,6 +132,8 @@ class PromptableSegmentation(BaseAlgorithm):
         box_prob: float = 0.5,
         box_noise: float = 0.1,
         box_noise_max: int = 20,
+        correction_pairs: bool = False,
+        mask_prompt_prob: float = 1.0,
         num_classes: int = 0,
         focal_weight: float = 20.0,
         dice_weight: float = 1.0,
@@ -165,6 +167,8 @@ class PromptableSegmentation(BaseAlgorithm):
             raise ValueError(f"rounds must be at least 1, got {rounds}")
         if not 0.0 <= box_prob <= 1.0:
             raise ValueError(f"box_prob must be a probability, got {box_prob}")
+        if not 0.0 <= mask_prompt_prob <= 1.0:
+            raise ValueError(f"mask_prompt_prob must be a probability, got {mask_prompt_prob}")
         if prefer not in PREFER:
             raise ValueError(f"prefer must be one of {PREFER}, got {prefer!r}")
         if tile_merge not in TILE_MERGE:
@@ -179,6 +183,8 @@ class PromptableSegmentation(BaseAlgorithm):
         self.box_prob = box_prob
         self.box_noise = box_noise
         self.box_noise_max = box_noise_max
+        self.correction_pairs = correction_pairs
+        self.mask_prompt_prob = mask_prompt_prob
         self.focal_weight = focal_weight
         self.dice_weight = dice_weight
         self.iou_weight = iou_weight
@@ -407,6 +413,11 @@ class PromptableSegmentation(BaseAlgorithm):
 
         A prompt whose prediction already agrees everywhere contributes a padding token: there is
         no correction to make, and inventing one would teach the model to distrust a correct mask.
+
+        With `correction_pairs` the round adds TWO points per prompt, the reference's recipe
+        (Kirillov et al.; Archit et al. 2025): a foreground click drawn from the missed cells and
+        a background click drawn from the spilled cells, each a padding token when its kind of
+        error is absent.
         """
         predicted = logits.squeeze(1) > 0
         actual = target.squeeze(1) > 0.5
@@ -414,26 +425,46 @@ class PromptableSegmentation(BaseAlgorithm):
         if known is not None:
             labelled = known.squeeze(1) > 0.5
             missed, spilled = missed & labelled, spilled & labelled
-        wrong = (missed | spilled).flatten(1)
 
-        key = torch.rand(wrong.shape, device=wrong.device).masked_fill(~wrong, float("inf"))
+        if self.correction_pairs:
+            positive, has_missed, _ = self._pick(missed, extent)
+            negative, has_spilled, _ = self._pick(spilled, extent)
+            coords = torch.stack([positive, negative], dim=1)
+            labels = torch.stack(
+                [
+                    torch.where(has_missed, FOREGROUND, PAD),
+                    torch.where(has_spilled, BACKGROUND, PAD),
+                ],
+                dim=1,
+            )
+            return coords, labels
+
+        # Foreground where the prediction missed the object, background where it spilled out of it.
+        point, has_error, chosen = self._pick(missed | spilled, extent)
+        is_missed = missed.flatten(1).gather(1, chosen.unsqueeze(1)).squeeze(1)
+        labels = torch.where(is_missed, FOREGROUND, BACKGROUND)
+        labels = torch.where(has_error, labels, torch.full_like(labels, PAD))
+        return point.unsqueeze(1), labels.unsqueeze(1)
+
+    def _pick(
+        self, region: torch.Tensor, extent: tuple[int, ...]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One cell drawn uniformly from a `(P, *grid)` bool region, per prompt.
+
+        Returns the cell centre in the [-1, 1] frame `(P, rank)`, whether the region had any cell
+        `(P,)` (the coordinate is meaningless where it did not), and the flat index chosen `(P,)`.
+        """
+        flat = region.flatten(1)
+        key = torch.rand(flat.shape, device=flat.device).masked_fill(~flat, float("inf"))
         chosen = key.argmin(dim=1)
-        has_error = wrong.any(dim=1)
-
-        blocks = tuple(predicted.shape[1:])
         indices, remaining = [], chosen
-        for size in reversed(blocks):
+        for size in reversed(region.shape[1:]):
             indices.append(remaining % size)
             remaining = remaining // size
         block = torch.stack(list(reversed(indices)), dim=-1)
         stride = torch.tensor(self.mask_stride, device=block.device)
         centre = block * stride + (stride - 1).float() / 2
-
-        # Foreground where the prediction missed the object, background where it spilled out of it.
-        is_missed = missed.flatten(1).gather(1, chosen.unsqueeze(1)).squeeze(1)
-        labels = torch.where(is_missed, FOREGROUND, BACKGROUND)
-        labels = torch.where(has_error, labels, torch.full_like(labels, PAD))
-        return voxel_coords(centre, extent).unsqueeze(1), labels.unsqueeze(1)
+        return voxel_coords(centre, extent), flat.any(dim=1), chosen
 
     def encode(
         self, volumes: torch.Tensor
@@ -595,7 +626,11 @@ class PromptableSegmentation(BaseAlgorithm):
                 new_coords, new_labels = self._correction(best.detach(), target, extent, known)
                 coords = torch.cat([coords, new_coords], dim=1)
                 point_labels = torch.cat([point_labels, new_labels], dim=1)
-                mask_input = best.detach()
+                # Fed every round, the mask becomes a crutch: Archit et al. 2025 found a model
+                # trained that way degrades when later given points alone, and feed it with
+                # probability 0.5 instead. One draw per round for the whole batch, as they do.
+                feed = self.mask_prompt_prob >= 1.0 or bool(torch.rand(()) < self.mask_prompt_prob)
+                mask_input = best.detach() if feed else None
 
         totals["loss"] = totals["loss"] / self.rounds
         totals["valid_fraction"] = valid.float().mean()

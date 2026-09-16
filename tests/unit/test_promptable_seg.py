@@ -201,6 +201,51 @@ def test_a_correction_asks_for_foreground_where_the_mask_missed_and_background_w
 
 
 @pytest.mark.unit
+def test_correction_pairs_give_one_foreground_and_one_background_click():
+    algorithm = _algorithm(correction_pairs=True)
+    extent = (32, 32, 32)
+    blocks = tuple(e // s for e, s in zip(extent, algorithm.mask_stride, strict=True))
+    target = torch.zeros(3, 1, *blocks)
+    target[:, :, 2:6, 2:6, 2:6] = 1.0
+    # The prediction covers half the object and spills past it along the first axis.
+    shifted = torch.full((3, 1, *blocks), -10.0)
+    shifted[:, :, 4:8, 2:6, 2:6] = 10.0
+
+    coords, labels = algorithm._correction(shifted, target, extent)
+    assert coords.shape == (3, 2, 3) and labels.shape == (3, 2)
+    assert labels.tolist() == [[FOREGROUND, BACKGROUND]] * 3
+    stride = torch.tensor(algorithm.mask_stride)
+    cells = ((coords + 1) * torch.tensor(extent) / 2 - 0.5).round().long() // stride
+    missed, spilled = (target > 0.5) & ~(shifted > 0), (shifted > 0) & ~(target > 0.5)
+    for p in range(3):
+        assert missed[p, 0][tuple(cells[p, 0])], "foreground click must land in a missed cell"
+        assert spilled[p, 0][tuple(cells[p, 1])], "background click must land in a spilled cell"
+
+    # Only one kind of error: the other slot is padding, never an invented click.
+    _, labels = algorithm._correction(torch.full((3, 1, *blocks), -10.0), target, extent)
+    assert labels.tolist() == [[FOREGROUND, PAD]] * 3
+    _, labels = algorithm._correction(torch.where(target > 0.5, 10.0, -10.0), target, extent)
+    assert labels.tolist() == [[PAD, PAD]] * 3
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("prob, expect_mask", [(0.0, False), (1.0, True)])
+def test_the_previous_mask_is_fed_back_with_the_configured_probability(prob, expect_mask):
+    algorithm = _algorithm(mask_prompt_prob=prob)   # rounds=2 in the fixture: one correction round
+    seen: list[bool] = []
+    real = algorithm.decode_points
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("mask_input") is not None)
+        return real(*args, **kwargs)
+
+    algorithm.decode_points = spy
+    algorithm.training_step(_batch())
+    assert seen[0] is False, "round 0 never has a mask prompt"
+    assert seen[1] is expect_mask
+
+
+@pytest.mark.unit
 def test_a_correction_point_lands_inside_the_region_it_names():
     algorithm = _algorithm()
     extent = (32, 32, 32)

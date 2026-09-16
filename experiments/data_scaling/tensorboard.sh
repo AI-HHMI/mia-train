@@ -52,9 +52,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT=${1:-6006}
 MODE=${2:-}
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-SCRATCH=/nrs/scicompsoft/orhane/mia-train-scratch/data_scaling
-VIEW=$RUNS/tb_data_scaling
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/data_scaling   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+SCRATCH=$EXP
+VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
 
 # TensorBoard refuses a taken port rather than falling back, and watching this alongside another

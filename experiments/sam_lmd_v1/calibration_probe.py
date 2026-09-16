@@ -468,6 +468,8 @@ def main() -> None:
     probe.add_argument("--max-tiles", type=int, default=0, help="0 = every tile of the block")
     probe.add_argument("--points-per-side", type=int)
     probe.add_argument("--points-per-batch", type=int)
+    probe.add_argument("--min-mask-voxels", type=int,
+                       help="the gate's size floor in lattice voxels (512 at 8 nm = 4096 at 4 nm)")
     probe.set_defaults(func=cmd_probe)
 
     summarize = sub.add_parser("summarize", help="pool a directory of probe records")
@@ -479,7 +481,8 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.command == "probe":
-        args.amg = {key: getattr(args, key) for key in ("points_per_side", "points_per_batch")
+        args.amg = {key: getattr(args, key)
+                    for key in ("points_per_side", "points_per_batch", "min_mask_voxels")
                     if getattr(args, key) is not None}
     args.func(args)
 

@@ -17,7 +17,7 @@
 #
 #   bsub -P miaai -q gpu_h200 -gpu "num=8" -n 96 -W 20:00 -r -J sslrec_1a \
 #     -cwd /groups/scicompsoft/home/orhane/projects/mia-train \
-#     -o /nrs/scicompsoft/orhane/mia-train-runs/jobs/sslrec_1a_%J.log \
+#     -o /nrs/scicompsoft/orhane/mia-train-experiments/new_ssl_recipe/jobs/sslrec_1a_%J.log \
 #     "export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; \
 #      export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
 #      /groups/scicompsoft/home/orhane/myvenv/bin/torchrun --standalone --nproc_per_node=8 \

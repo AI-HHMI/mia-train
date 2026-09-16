@@ -30,9 +30,10 @@ set -euo pipefail
 
 PORT=${1:-6006}
 MODE=${2:-}
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-SCRATCH=/nrs/scicompsoft/orhane/mia-train-scratch/new_ssl_recipe
-VIEW=$RUNS/tb_new_ssl_recipe
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/new_ssl_recipe   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+SCRATCH=$EXP
+VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
 
 # TensorBoard refuses a taken port rather than falling back, and watching this alongside

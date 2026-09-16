@@ -9,8 +9,9 @@
 set -euo pipefail
 
 PORT=${1:-6006}
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-VIEW=$RUNS/tb_banis_parity
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
 
 # TensorBoard fails outright on a taken port, which is the normal case here: the arms of a

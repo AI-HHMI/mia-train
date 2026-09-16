@@ -8,6 +8,13 @@ artifacts per volume, on one shared grid:
     <dir>/<volume>.zarr        the prediction, kind from the algorithm
     <dir>/<volume>.gt.zarr     the co-registered ground truth, kind="instances"
 
+Each is a single-level OME-Zarr 0.5 group -- the array at `s0`, the lattice voxel size and the
+physical position of the first voxel in the group's `multiscales` (`prediction.artifact`) -- so a
+viewer opened on the raw volume places the prediction on it unasked. Labellings are written as the
+narrowest unsigned type that holds their ids (`unsigned_labels`): neuroglancer has no int64.
+Artifacts written before 2026-09-15 were bare int64 arrays; every one the leaderboard references was
+rewritten in place as a group (the one-off converter was retired on 2026-09-16).
+
 **Nothing about the run is assumed.** Patch size, channel count, what the channels *mean*, how they
 are squashed for storage, and the spatial rank all come from the run's own resolved config and from
 the algorithm object rebuilt from it. A model trained at patch 128, an algorithm emitting 64 class
@@ -41,8 +48,8 @@ from typing import Any
 
 import numpy as np
 import torch
-import zarr
 
+from prediction.artifact import ome_geometry, write_ome_artifact
 from prediction.dense import select_predictor
 from prediction.grid import VolumeGrid, storage_axes_of
 from prediction.types import VolumePredictor
@@ -289,14 +296,24 @@ def shared_attrs(
     }
 
 
-def write_array(path: Path, array: np.ndarray, **attrs: Any) -> Path:
-    store = zarr.open(
-        str(path), mode="w", shape=array.shape, dtype=array.dtype,
-        chunks=tuple(min(256, s) for s in array.shape),
-    )
-    store[:] = array
-    store.attrs.update(**attrs)
-    return path
+def unsigned_labels(array: np.ndarray) -> np.ndarray:
+    """A labelling as the narrowest unsigned integer type that holds its ids.
+
+    Neuroglancer -- the viewer fileglancer opens artifacts in -- reads unsigned integers up to 64
+    bits and signed ones only up to 32, so an int64 labelling cannot be looked at, and it is also
+    twice the size of the uint32 that holds nearly every labelling here. Ids are never negative
+    (0 is background everywhere in this corpus, and the -1 the pseudo-label sidecars use for
+    "unlabelled" never reaches a scored artifact), so the cast loses nothing; a negative value is
+    refused rather than wrapped into a large id.
+    """
+    if not np.issubdtype(array.dtype, np.integer):
+        raise TypeError(f"a labelling must be integer, got {array.dtype}")
+    if array.size and int(array.min()) < 0:
+        raise ValueError("a labelling with negative ids cannot be written as unsigned")
+    if np.issubdtype(array.dtype, np.unsignedinteger) and array.dtype.itemsize <= 4:
+        return array
+    largest = int(array.max()) if array.size else 0
+    return array.astype(np.uint32 if largest < 2**32 else np.uint64, copy=False)
 
 
 def volumes_to_predict(config: Any, requested: str | None) -> list[str]:
@@ -329,6 +346,7 @@ def run_volume(
 ) -> None:
     """Predict one volume (unless `predictor` is None) and write its ground truth beside it."""
     grid = VolumeGrid(config, name, resolve_patch(config, resolved, name, patch_override))
+    geometry = ome_geometry(grid)
 
     if predictor is not None:
         if device.type == "cuda":
@@ -339,28 +357,33 @@ def run_volume(
             print(f"peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB of "
                   f"{properties.total_memory / 2**30:.0f} GiB ({properties.name})", flush=True)
 
-        path = write_array(
-            out / f"{name}.zarr", prediction.array,
-            kind=prediction.kind,
-            **prediction.attrs,
-            **shared_attrs(grid, run_dir, step, data_config),
+        array = prediction.array
+        if prediction.kind == "instances":
+            array = unsigned_labels(array)
+        path = write_ome_artifact(
+            out / f"{name}.zarr", array, **geometry,
+            attrs={"kind": prediction.kind, **prediction.attrs,
+                   **shared_attrs(grid, run_dir, step, data_config)},
         )
-        print(f"wrote {path}  {prediction.array.shape} {prediction.array.dtype}", flush=True)
-        del prediction
+        print(f"wrote {path}  {array.shape} {array.dtype}", flush=True)
+        del prediction, array
 
     truth = grid.read_ground_truth()
     instances = int((np.unique(truth) != 0).sum())
-    path = write_array(
-        out / f"{name}.gt.zarr", truth,
-        kind="instances",
-        # 0 is background in every label store in this corpus, and -1 never occurs in one, so
-        # nothing here is unannotated. Stated rather than assumed: for a thresholded-components
-        # prediction 0 means "no edge survived", which is a different claim entirely.
-        background_id=0,
-        instances=instances,
-        **shared_attrs(grid, run_dir, step, data_config),
+    truth = unsigned_labels(truth)
+    path = write_ome_artifact(
+        out / f"{name}.gt.zarr", truth, **geometry,
+        attrs={
+            "kind": "instances",
+            # 0 is background in every label store in this corpus, and -1 never occurs in one,
+            # so nothing here is unannotated. Stated rather than assumed: for a
+            # thresholded-components prediction 0 means "no edge survived", a different claim.
+            "background_id": 0,
+            "instances": instances,
+            **shared_attrs(grid, run_dir, step, data_config),
+        },
     )
-    print(f"wrote {path}  {truth.shape} int64, {instances} instances, "
+    print(f"wrote {path}  {truth.shape} {truth.dtype}, {instances} instances, "
           f"{100.0 * float((truth != 0).mean()):.1f}% annotated", flush=True)
 
 

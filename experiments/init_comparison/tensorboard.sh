@@ -9,8 +9,9 @@
 set -euo pipefail
 
 PORT=${1:-6006}
-RUNS=/nrs/scicompsoft/orhane/mia-train-runs
-VIEW=$RUNS/tb_init_comparison
+EXP=/nrs/scicompsoft/orhane/mia-train-experiments/init_comparison   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
+RUNS=$EXP/runs
+VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
 
 # TensorBoard refuses a taken port rather than falling back, and watching two experiments at once

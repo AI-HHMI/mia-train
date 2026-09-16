@@ -488,7 +488,10 @@ def compare_labellings(pred: np.ndarray, truth: np.ndarray, *, iou_thresh: float
     best-matching true object reaches `iou_thresh`. A *merge* is a pseudo-mask of which two or more
     true objects each make up at least `part`; a *fragment* is the mirror image, a true object of
     which two or more pseudo-masks each hold at least `part` -- the two ways tile assembly can go
-    wrong, joining what should stay apart and leaving apart what should be joined.
+    wrong, joining what should stay apart and leaving apart what should be joined. `swallowed`
+    counts the true objects most of which sit inside a pseudo-mask that also holds most of another
+    true object: the merge the `part` rule cannot see once a mask has swallowed so many objects
+    that none of them is a tenth of it (arm 1 on hemibrain: one piece held 62% of the block).
     `truth_best_share` is how much of a true object sits under its single largest pseudo id (1 =
     whole object under one id), `pseudo_purity` how much of a pseudo-mask is one label (background
     counts as one).
@@ -521,7 +524,8 @@ def compare_labellings(pred: np.ndarray, truth: np.ndarray, *, iou_thresh: float
     if pseudo_ids.size == 0:
         result.update(precision=0.0, recall=0.0, merges=0, merge_rate=0.0,
                       claimed_on_background=0.0, mean_best_iou=0.0, fragments=0,
-                      fragment_rate=0.0, truth_best_share=0.0, pseudo_purity=0.0)
+                      fragment_rate=0.0, swallowed=0, swallowed_rate=0.0, truth_best_share=0.0,
+                      pseudo_purity=0.0)
         return result
 
     pairs, counts = np.unique(p[claimed] * n_truth + t[claimed], return_counts=True)
@@ -543,6 +547,11 @@ def compare_labellings(pred: np.ndarray, truth: np.ndarray, *, iou_thresh: float
     share_of_truth = inter / truth_sizes[tid[on_object]]
     pieces = np.bincount(tid[on_object][share_of_truth >= part], minlength=n_truth)
     fragments = int((pieces[truth_ids] >= 2).sum()) if truth_ids.size else 0
+    # A piece holding most of two or more counted objects is a merge however small each object is
+    # beside it; `partners` above misses that when no single object is a tenth of the piece.
+    held = (share_of_truth >= 0.5) & np.isin(tid[on_object], truth_ids)
+    holds = np.bincount(pid[on_object][held], minlength=pseudo_sizes.size)
+    swallowed = int((held & (holds[pid[on_object]] >= 2)).sum())
     best_share = np.zeros(n_truth)
     np.maximum.at(best_share, tid[on_object], share_of_truth)
     purity = np.zeros(pseudo_sizes.size)
@@ -557,6 +566,8 @@ def compare_labellings(pred: np.ndarray, truth: np.ndarray, *, iou_thresh: float
         mean_best_iou=float(best_pseudo[pseudo_ids].mean()),
         fragments=fragments,
         fragment_rate=fragments / max(int(truth_ids.size), 1),
+        swallowed=swallowed,
+        swallowed_rate=swallowed / truth_ids.size if truth_ids.size else 0.0,
         truth_best_share=float(best_share[truth_ids].mean()) if truth_ids.size else 0.0,
         pseudo_purity=float(purity[pseudo_ids].mean()),
     )
@@ -593,6 +604,7 @@ def cmd_diagnose(args: argparse.Namespace) -> None:
               f"{scores['truth_instances']} true  precision@0.5 {scores['precision']:.3f}  "
               f"recall {scores['recall']:.3f}  "
               f"merges {scores['merges']}  fragments {scores['fragments']}  "
+              f"swallowed {scores['swallowed']}  "
               f"claimed {100 * scores['claimed_fraction']:.1f}% "
               f"(truth fg {100 * scores['truth_foreground_fraction']:.1f}%)", flush=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -608,7 +620,7 @@ def cmd_summarize(args: argparse.Namespace) -> None:
         raise SystemExit(f"no diagnose reports under {args.directory}")
     rows = []
     totals = {"pseudo": 0, "truth": 0, "hits": 0.0, "found": 0.0, "merges": 0, "fragments": 0,
-              "purity": 0.0, "share": 0.0}
+              "swallowed": 0, "purity": 0.0, "share": 0.0}
     for path in reports:
         report = json.loads(path.read_text())
         blocks = report["blocks"]
@@ -619,6 +631,7 @@ def cmd_summarize(args: argparse.Namespace) -> None:
         merges = sum(b["merges"] for b in blocks)
         # Reports written before these fields existed read as 0; the table then says so.
         fragments = sum(b.get("fragments", 0) for b in blocks)
+        swallowed = sum(b.get("swallowed", 0) for b in blocks)
         purity = sum(b.get("pseudo_purity", 0.0) * b["pseudo_instances"] for b in blocks)
         share = sum(b.get("truth_best_share", 0.0) * b["truth_instances"] for b in blocks)
         rows.append({
@@ -627,12 +640,13 @@ def cmd_summarize(args: argparse.Namespace) -> None:
             "recall": found / max(truth, 1), "merges": merges,
             "merge_rate": merges / max(pseudo, 1),
             "fragments": fragments, "fragment_rate": fragments / max(truth, 1),
+            "swallowed": swallowed, "swallowed_rate": swallowed / max(truth, 1),
             "pseudo_purity": purity / max(pseudo, 1), "truth_best_share": share / max(truth, 1),
             "claimed_fraction": float(np.mean([b["claimed_fraction"] for b in blocks])),
         })
         for key, value in (("pseudo", pseudo), ("truth", truth), ("hits", hits),
                            ("found", found), ("merges", merges), ("fragments", fragments),
-                           ("purity", purity), ("share", share)):
+                           ("swallowed", swallowed), ("purity", purity), ("share", share)):
             totals[key] += value
     summary = {
         "run": json.loads(reports[0].read_text())["run"],
@@ -646,22 +660,25 @@ def cmd_summarize(args: argparse.Namespace) -> None:
             "merges": totals["merges"], "merge_rate": totals["merges"] / max(totals["pseudo"], 1),
             "fragments": totals["fragments"],
             "fragment_rate": totals["fragments"] / max(totals["truth"], 1),
+            "swallowed": totals["swallowed"],
+            "swallowed_rate": totals["swallowed"] / max(totals["truth"], 1),
             "pseudo_purity": totals["purity"] / max(totals["pseudo"], 1),
             "truth_best_share": totals["share"] / max(totals["truth"], 1),
         },
     }
     print(f"{'volume':30s} {'blocks':>6s} {'pseudo':>7s} {'truth':>6s} {'prec@.5':>8s} "
-          f"{'recall':>7s} {'merges':>7s} {'frags':>6s} {'purity':>7s} {'share':>6s} "
-          f"{'claimed':>8s}")
+          f"{'recall':>7s} {'merges':>7s} {'frags':>6s} {'swallow':>8s} {'purity':>7s} "
+          f"{'share':>6s} {'claimed':>8s}")
     for row in rows:
         print(f"{row['volume'][:30]:30s} {row['blocks']:6d} {row['pseudo_instances']:7d} "
               f"{row['truth_instances']:6d} {row['precision']:8.3f} {row['recall']:7.3f} "
-              f"{row['merges']:7d} {row['fragments']:6d} {row['pseudo_purity']:7.3f} "
-              f"{row['truth_best_share']:6.3f} {100 * row['claimed_fraction']:7.1f}%")
+              f"{row['merges']:7d} {row['fragments']:6d} {row['swallowed']:8d} "
+              f"{row['pseudo_purity']:7.3f} {row['truth_best_share']:6.3f} "
+              f"{100 * row['claimed_fraction']:7.1f}%")
     pooled = summary["pooled"]
     print(f"{'POOLED':30s} {'':6s} {pooled['pseudo_instances']:7d} {pooled['truth_instances']:6d} "
           f"{pooled['precision']:8.3f} {pooled['recall']:7.3f} {pooled['merges']:7d} "
-          f"{pooled['fragments']:6d} {pooled['pseudo_purity']:7.3f} "
+          f"{pooled['fragments']:6d} {pooled['swallowed']:8d} {pooled['pseudo_purity']:7.3f} "
           f"{pooled['truth_best_share']:6.3f}")
     out = args.out or (args.directory / "summary.json")
     out.write_text(json.dumps(summary, indent=2))
@@ -686,6 +703,8 @@ def _amg_arguments(parser: argparse.ArgumentParser) -> None:
                        help="consensus: windows that must claim a cell (capped at how many saw it)")
     group.add_argument("--edge-discard", type=int, choices=(0, 1),
                        help="drop masks touching an interior tile face (the reference's rule)")
+    group.add_argument("--min-mask-voxels", type=int,
+                       help="smallest mask kept, in lattice voxels (512 at 8 nm = 4096 at 4 nm)")
     # The merge-aware filters (amg.py `tiled_wholes`, `PromptGridPredictor._consistency`).
     group.add_argument("--consistency-clicks", type=int)
     group.add_argument("--consistency-thresh", type=float)
@@ -698,7 +717,7 @@ def _collect_amg(args: argparse.Namespace) -> dict[str, Any]:
     keys = ("pred_iou_thresh", "stability_thresh", "points_per_side", "points_per_batch",
             "nms_iou", "tile_merge", "propagate_min_coverage", "consistency_clicks",
             "consistency_thresh", "consistency_pick", "split_tiled_wholes", "tiled_cover_thresh",
-            "edge_discard", "agree_thresh", "min_support")
+            "edge_discard", "agree_thresh", "min_support", "min_mask_voxels")
     amg = {key: getattr(args, key) for key in keys if getattr(args, key, None) is not None}
     for flag in ("split_tiled_wholes", "edge_discard"):
         if flag in amg:
