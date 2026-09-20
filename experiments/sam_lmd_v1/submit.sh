@@ -7,6 +7,14 @@
 #   bash experiments/sam_lmd_v1/submit.sh --smoke base       # 20-step rounds, one tiny block, one GPU
 #   bash experiments/sam_lmd_v1/submit.sh --rounds 1 base    # round 0 and one data-engine round only
 #   bash experiments/sam_lmd_v1/submit.sh --skip-r0 base     # round 0 already ran; start at L1
+#   bash experiments/sam_lmd_v1/submit.sh --rounds 0 --after <smoke job id> arm8_8nm_gb16_musam128
+#                                                            # round 0 only, released by done(<smoke>)
+#
+# Where things land (layout of 2026-09-16): job scripts, the placeholder-resolved TOMLs and the LSF
+# logs in jobs/, run directories in runs/ (via --output-root), and everything a --smoke run produces
+# one level down in jobs/smoke/ and runs/smoke/. Arms 1-7 predate this and left their scripts in the
+# legacy cmd/, resolved/ and smoke/ trees. The data engine's rounds/, pseudo/ and diag/ stay where
+# they are (nothing of round 0 touches them).
 #
 # The chain, per arm:
 #
@@ -41,7 +49,7 @@ STAGE=$EXP     # NOT /tmp: that is node-local
 LOGS="$EXP/jobs"
 
 ALL_ARMS=(base stride2 stride1 stride2_small feat64 refine4 deep4 wide512)
-V4_ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32 arm6_8nm_gb16_musam arm7_8nm_gb16_musam64)   # version 4: round 0 only (`--rounds 0`)
+V4_ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32 arm6_8nm_gb16_musam arm7_8nm_gb16_musam64 arm8_8nm_gb16_musam128)   # version 4: round 0 only (`--rounds 0`)
 PREFIX=sam1__                                                    # matches make_configs.PREFIX
 
 QUEUE=${QUEUE:-gpu_b300}
@@ -72,7 +80,7 @@ WALL_R0=${WALL_R0:-72:00}
 WALL_ROUND=${WALL_ROUND:-48:00}
 WALL_LABEL=${WALL_LABEL:-8:00}
 wall_scale () {                        # arm -> multiplier applied to the walls above
-  case "$1" in stride1|arm7_8nm_gb16_musam64) echo 2 ;; stride2|stride2_small|arm6_8nm_gb16_musam) echo 1.5 ;; arm3_p8) echo 4 ;; *) echo 1 ;; esac
+  case "$1" in arm8_8nm_gb16_musam128) echo 3 ;; stride1|arm7_8nm_gb16_musam64) echo 2 ;; stride2|stride2_small|arm6_8nm_gb16_musam) echo 1.5 ;; arm3_p8) echo 4 ;; *) echo 1 ;; esac
 }
 scaled () {                            # H:MM x factor -> H:MM
   local h=${1%%:*} f=$2; printf '%d:00' "$(awk -v h="$h" -v f="$f" 'BEGIN{printf "%d", h*f+0.5}')"
@@ -98,13 +106,14 @@ SMOKE_TEACHER=${SMOKE_TEACHER:-/nrs/scicompsoft/orhane/mia-train-experiments/pro
 SMOKE_VOLUME=${SMOKE_VOLUME:-em-zebrafish-fish2/crop-005_quadcube3_x9638_y10314_z0}
 SMOKE_GT=${SMOKE_GT:-kasthuri15_ac3}
 
-SMOKE=0 DRY=0 ROUNDS=2 SKIP_R0=0
+SMOKE=0 DRY=0 ROUNDS=2 SKIP_R0=0 AFTER=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --smoke)   SMOKE=1 ;;
     --dry-run) DRY=1 ;;
     --rounds)  ROUNDS=$2; shift ;;
     --skip-r0) SKIP_R0=1 ;;
+    --after)   AFTER=$2; shift ;;
     *) echo "unknown flag $1" >&2; exit 2 ;;
   esac
   shift
@@ -114,8 +123,11 @@ for arm in "${ARMS[@]}"; do
   [[ -f "$HERE/${arm}_r0.toml" ]] || { echo "unknown arm $arm (no ${arm}_r0.toml)" >&2; exit 2; }
 done
 
-ROOT=$STAGE; [[ $SMOKE -eq 1 ]] && ROOT=$STAGE/smoke
-mkdir -p "$LOGS" "$ROOT/cmd" "$ROOT/rounds" "$ROOT/pseudo" "$ROOT/diag" "$ROOT/resolved"
+ROOT=$STAGE; [[ $SMOKE -eq 1 ]] && ROOT=$STAGE/smoke      # the data engine's staging tree (rounds/ pseudo/ diag/)
+# Layout of 2026-09-16: scripts, resolved configs and logs in jobs/, run dirs in runs/, smoke one level down.
+CMDDIR=$LOGS; RUNS_ROOT=$RUNS
+[[ $SMOKE -eq 1 ]] && { LOGS=$LOGS/smoke; CMDDIR=$LOGS; RUNS_ROOT=$RUNS/smoke; }
+mkdir -p "$LOGS" "$RUNS_ROOT" "$ROOT/rounds" "$ROOT/pseudo" "$ROOT/diag"
 
 # The scratch tree records how to regenerate itself (the /nrs retention rule).
 [[ -f "$STAGE/README.md" ]] || cat > "$STAGE/README.md" <<EOF
@@ -154,8 +166,8 @@ stage () {
 
   if [[ $SMOKE -eq 1 ]]; then
     exp="smoke_${PREFIX}${name}"; tag="smoke_$name"; wall=1:00; procs=1; slots=12
-    runs_root=$ROOT; tail_args="--output-root $ROOT"
-    cfg="$ROOT/cmd/$tag.toml"
+    runs_root=$RUNS_ROOT; tail_args="--output-root $RUNS_ROOT"
+    cfg="$CMDDIR/$tag.toml"
     sed -e "s/^experiment_name = .*/experiment_name = \"$exp\"/" \
         -e 's/^max_steps = .*/max_steps = 20/'   -e 's/^warmup_steps = .*/warmup_steps = 2/' \
         -e 's/^val_every = .*/val_every = 10/'   -e 's/^checkpoint_every = .*/checkpoint_every = 20/' \
@@ -164,7 +176,7 @@ stage () {
         "$config" > "$cfg"
   fi
 
-  local resolved="$ROOT/resolved/$tag.toml" prologue=""
+  local resolved="$CMDDIR/${tag}_resolved.toml" prologue=""
   local roundcfg="$ROOT/rounds/${arm}_r${round}.yaml"
   if [[ $round -gt 0 ]]; then
     local prev_exp="$prev"; [[ $SMOKE -eq 1 ]] && prev_exp="smoke_$prev"
@@ -176,7 +188,7 @@ sed -e \"s|ROUND_CONFIG|$roundcfg|\" -e \"s|PREV_CHECKPOINT|\$RUN/checkpoints/st
     prologue="cp '$cfg' '$resolved'"
   fi
 
-  local cmd="$ROOT/cmd/$tag.sh"
+  local cmd="$CMDDIR/$tag.sh"
   { echo "#!/usr/bin/env bash"
     echo "set -euo pipefail"
     echo "$THREADS"
@@ -232,7 +244,7 @@ $(latest_step)"
   local n=${#volumes[@]} total=$(( ${#volumes[@]} + ${#gts[@]} ))
   mkdir -p "$sidecars" "$diag"
 
-  local worker="$ROOT/cmd/$tag.sh" final="$ROOT/cmd/${tag}_final.sh"
+  local worker="$CMDDIR/$tag.sh" final="$CMDDIR/${tag}_final.sh"
   { echo "#!/usr/bin/env bash"
     echo "set -euo pipefail"
     echo "$THREADS"
@@ -292,7 +304,7 @@ for arm in "${ARMS[@]}"; do
     # Round 0's run directory must already exist; the labelling job resolves it by name.
     r=""; line=$(printf '%-14s r0=(existing)' "$arm")
   else
-    r=$(stage "$HERE/${arm}_r0.toml" 0 "$arm")
+    r=$(stage "$HERE/${arm}_r0.toml" 0 "$arm" "" "$AFTER")
     line=$(printf '%-14s r0=%s' "$arm" "$r")
   fi
   prev_exp="${PREFIX}${arm}_r0"

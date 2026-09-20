@@ -39,10 +39,13 @@ SCRATCH="$STAGE/score/${ARM}_r${ROUND}"
 mkdir -p "$SCRATCH" "$LOGS"
 
 cmd="export OMP_NUM_THREADS=16 NUMBA_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHONPATH=$EVALS/src; cd $EVALS && \
-$PY -m evaluate score configs/tasks/lmd_ssl_v1_neuron_instance_mws_test.toml \
+$PY -m evaluate score configs/lmd_ssl_v1_neuron_instance/mws.toml \
   --test '$ART/test' --val '$ART/finetune' \
-  --val-config configs/tasks/lmd_ssl_v1_neuron_instance_mws_fit.toml \
-  --run-dir '$run' --label $LABEL --scratch '$SCRATCH'"
+  --run-dir '$run' --scratch '$SCRATCH'"
+# (2026-09-18) one scoring config carries both splits and the record is named <run>.step<N>.<route>
+# by mia-evals itself; the old --val-config and --label flags no longer exist. NOTE: that config's
+# route is `mws`, which names these SAM labellings wrongly -- score SAM arms through a config whose
+# route is `size_filter` before the next one is recorded.
 id=$(bsub -P miaai -q local -n 20 -W 12:00 -J "sc_$LABEL" -o "$LOGS/sc_${LABEL}_%J.log" -e "$LOGS/sc_${LABEL}_%J.err" "$cmd" \
      | sed -n 's/^Job <\([0-9]*\)>.*/\1/p')
 echo "  $LABEL  job=$id  -> $EVALS/leaderboard/lmd_ssl_v1_neuron_instance/records/$LABEL.json"

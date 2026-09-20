@@ -1,0 +1,105 @@
+# gary_comparison arm 1b: arm 1a FROM SCRATCH -- the same ViT-L/16, head, data, schedule and augmentation,
+# but random initialisation instead of the released DINOv3 LVD-1689M checkpoint. 1a vs 1b is the value of
+# the pretrained encoder on this volume, and nothing else: every non-comment line below is identical to
+# 1a_dinov3_axial_subpixel.toml except `experiment_name` and the absent `[init]` section (diff them).
+#
+# The risk this arm carries that 1a did not: 1a's cold sub-pixel head sat on the trivial "everything is
+# connected" predictor until ~step 1-3k and then escaped, helped by an encoder that already had features.
+# Here the encoder starts random too, so the plateau may last longer or never end; judge no earlier than
+# ~5k steps (warmup ends there), and read `boundary_accuracy` (0 on the plateau) before anything else.
+#
+# Launch as arm 1a: TORCHINDUCTOR_LAYOUT_OPTIMIZATION=0 exported, --output-root
+# /nrs/scicompsoft/orhane/mia-train-experiments/gary_comparison/runs (submit.sh does both).
+experiment_name = "gary__1b_scratch_axial_subpixel"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256            # 16^3 = 4096 tokens at patch 16
+patch_size = 16
+in_chans = 1
+embed_dim = 1024          # ViT-L/16, 303M parameters
+depth = 24
+num_heads = 16            # head_dim 64; 64 % 6 = 4, so axial 3D RoPE leaves 4 channels unrotated
+n_storage_tokens = 4
+layerscale_init = 1.0e-05 # kept identical to 1a (there its value is dictated by the checkpoint)
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+# Axial 3D RoPE, as in 1a. From scratch it is simply the natural 3D form -- depth owns its own third
+# of the rotated channels -- with none of 1a's tension against a 2D checkpoint's channel layout.
+pos_embed_rope_type = "vanilla"
+# 0.0 as in 1a: DINOv3's drop path is sample-level stochastic depth, and at one sample per rank the
+# dropped subset is always empty, so any other value would do nothing here either.
+drop_path_rate = 0.0
+# torch SDPA (cuDNN on Hopper/Blackwell). FA4 is off because `[trainer].compile` below cannot be
+# combined with it, and it buys nothing at 4096 tokens anyway.
+use_fa4 = false
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10           # nearest-neighbour offsets plus 10-voxel ones, as in every arm before
+decoder = "subpixel"
+decoder_hidden_dim = 256  # 2c's sub-pixel head, unchanged
+decoder_readout_dim = 16
+decoder_refine_depth = 2
+# FALSE as in 1a, and more necessary here: with the output convolution zeroed the head emits a
+# constant and NO gradient reaches the encoder at step 0, which from a random encoder would leave
+# the whole network untrained. 1a's plateau on the trivial predictor (affinity accuracy equal to
+# the batch positive rate, boundary accuracy 0) lasted until step 1-3k; expect longer here.
+decoder_zero_init_output = false
+# Id 0 is BACKGROUND here (every pair touching it is a cut, in the loss), exactly as in 1a.
+split_disconnected = true
+
+[data]
+# z < 3000 of the crop, 75 G voxels, 8 nm, patch 256. The box, axes and resolution are pinned in
+# the YAML; verified 2026-09-16 (README.md, "Verification").
+name = "miao_volumes"
+config_path = "experiments/gary_comparison/data/hemibrain_eb_train.yaml"
+samples_per_epoch = 100000  # 12.5k steps per epoch at 8 ranks x batch 1: 40 worker respawns in 500k steps
+defer_image_ops = true
+
+[val_data]
+# 3000 <= z < 4000. The only place model selection or post-processing thresholds may be fitted;
+# the test corner is scored once.
+name = "miao_volumes"
+config_path = "experiments/gary_comparison/data/hemibrain_eb_val.yaml"
+samples_per_epoch = 32
+defer_image_ops = true
+
+[trainer]
+max_steps = 500000
+batch_size = 1            # per rank; x 8 ranks -> global batch 8
+lr = 0.0003
+warmup_steps = 5000
+min_lr_ratio = 0.001
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 1.0  # the stem must move: 0.9 x 0.2 once put patch_embed 696x below BANIS' LR
+patch_embed_lr_mult = 1.0
+lr_schedule = "linear"
+precision = "bf16"
+# Measured 2.30x on affinity_seg on B300 (eager B300 is launch-bound and slower than eager H200);
+# needs the SDPA kernel selected in [model].
+compile = true
+activation_checkpointing = false
+log_every = 1000
+val_every = 10000
+checkpoint_every = 50000
+num_workers = 8
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8              # one full node
+tp = 1
+
+[augment]
+# BANIS' defaults, byte-identical to every lmd_ssl_v1 arm and to sam_lmd_v1, so augmentation is
+# not a confound against those lineages.
+rotate = "inplane"
+drop_slice_prob = 0.05
+shift_slice_prob = 0.05
+shift_magnitude = 10
+intensity = true
+mul_intensity = 0.1
+add_intensity = 0.1
+noise_scale = 0.5

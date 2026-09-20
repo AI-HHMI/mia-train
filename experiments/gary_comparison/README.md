@@ -138,6 +138,10 @@ label transform, which nothing in the data path does today.
 | arm | config | what it is |
 | --- | --- | --- |
 | 1a | `1a_dinov3_axial_subpixel.toml` | released DINOv3 ViT-L/16 inflated to 3D, axial RoPE, SDPA + compile, `affinity_seg` sub-pixel head from step 0 in one 500k-step stage (lr 3e-4, 5k warmup, linear decay) |
+| 1b | `1b_scratch_axial_subpixel.toml` | arm 1a from random initialisation: no `[init]` section, every other non-comment line identical. 1a vs 1b is the value of the pretrained encoder on this volume |
+| 1c | `1c_dinov3_axial_subpixel_1m.toml` | arm 1a trained twice as long: `max_steps` 1M and `checkpoint_every` 100k, nothing else changed (so the linear decay stretches to 1M). 1a vs 1c is the value of a longer schedule; submit with `WALL=168:00` |
+| 2a | `2a_simmim_lmd_mask60.toml` | **SSL only.** SimMIM pretraining of a 3D DINOv3 ViT-L/16 from random init on the census-20260920 lmd corpus (226 volumes), 500k steps at global batch 128 (16/rank, one B300 node), mask ratio 0.6, axial RoPE, SDPA + compile, in-plane rotation as the only augmentation; validates reconstruction on the hemibrain val slab. Created 2026-09-20 (written as 1M steps, cut to 500k before launch); submit with `WALL=336:00` |
+| 2b | `2b_simmim_lmd_mask85.toml` | arm 2a with `mask_ratio = 0.85`, nothing else (`diff` the two). 2a vs 2b, read through their eventual fine-tunes, is the value of a harder pretext task in 3D |
 
     bash experiments/gary_comparison/submit.sh 1a_dinov3_axial_subpixel            # 20-step smoke on 1 GPU, then the real run chained on done(smoke)
     bash experiments/gary_comparison/submit.sh --dry-run 1a_dinov3_axial_subpixel  # print the bsub lines, write the job scripts
@@ -148,7 +152,8 @@ own places and nowhere else: run directories in `runs/` (via `--output-root`; ba
 newest), and LSF logs and the generated job scripts in `jobs/`. Everything belonging to a smoke run -- its
 derived config, job script, LSF logs, run directory and TensorBoard link -- sits one level down, in
 `jobs/smoke/`, `runs/smoke/` and `tensorboard/smoke/`, so the production runs are never cluttered by it.
-Probe scripts with their results go to `probes/<question>/`. Live stdout of a running job: `bpeek <jobid>`.
+Probe scripts with their results go to `probes/<question>/`. A running job's LSF log in `jobs/` is written
+live (this cluster's LSF streams `-o`), so `tail` it; `bpeek <jobid>` shows the same.
 
 Arm 1a departs from lmd_ssl_v1's arm 2 in two ways that are choices, not just settings: the sub-pixel head
 starts cold with `decoder_zero_init_output = false` (the zeroed default sends no gradient to the encoder at
@@ -160,6 +165,214 @@ three decimals with `boundary_accuracy` near zero.
 **Launch log.** 2026-09-16 15:22: smoke job 154312366 passed (20 steps, 169 s; boundary accuracy rose
 0 -> 0.29, loss 0.685 -> 0.586, so the head left the trivial predictor within 15 steps at a 2-step warmup).
 Real run job 154312367 on gpu_b300, 8 GPUs, `-W 96:00 -r`; expected 21-31 h at 0.15-0.22 s/step.
+Dispatched 21:55 on i02u02 (run `runs/gary__1a_dinov3_axial_subpixel_20260916_215544`). Measured 30.2 crops/s =
+0.26 s/step, so ~37 h of stepping: finish about Fri 2026-09-18 midday. **The cold head DID start on the trivial
+predictor and escaped**: at step 1k affinity accuracy 0.88748 vs positive rate 0.887476 with boundary accuracy
+0.0002; step 2k 0.904 vs 0.902, boundary 0.07; step 3k 0.912 vs 0.893, boundary 0.56; step 7k 0.955 vs 0.897,
+boundary 0.67, loss 0.26 -> 0.11. The earlier NISB failures dipped near step 400 and never recovered; this one
+recovered between 1k and 3k with `decoder_zero_init_output = false` and the 5k warmup. `data_wait_frac` 0.003.
+
+Arm 1b (from scratch) submitted 2026-09-16 23:51: smoke job 154330430, real run 154330431 chained on it, same
+queue, node size and 96 h wall as 1a (its step should cost the same: the init changes no shapes).
+
+Arm 1c (1M steps) submitted 2026-09-19 12:45 after 1a and 1b both scored better at every later checkpoint
+and were still improving at 500k: smoke job 154373730, real run 154373731 chained on it, 168 h wall (1a's
+0.26 s/step puts 1M steps at ~72 h). Read its checkpoints against 1a's both by step and by remaining-schedule
+fraction: at step 500k it sits at half the peak LR where 1a had finished decaying.
+
+## SSL arms (2a, 2b): SimMIM pretraining on the lmd corpus
+
+Created 2026-09-20 on request. Two configs that differ in one non-comment line
+(`mask_ratio` 0.6 vs 0.85; `diff 2a_simmim_lmd_mask60.toml 2b_simmim_lmd_mask85.toml`). Each pretrains a 3D
+DINOv3 ViT-L/16 from random initialisation with SimMIM for 500k steps at global batch 128 (16 per rank on one
+B300 node) on lmd-configs' census-20260920 single-scale pretraining corpus,
+`/groups/miaai/miaai/lmd-v0.0.1/configs/configs/pretraining/singlescale/baseline/8nm_p256_swe0.4_min1e8_up8_census20260920.yaml`.
+Only the SSL stage exists; the supervised stage (arm 1a's recipe initialised from an SSL checkpoint) is
+deliberately not chained yet. The template is lmd_ssl_v1's arm-1 stage A; every departure from it is listed
+and justified in the config header (SDPA + `compile`, 1M steps, the new corpus, 1M samples per epoch, the
+hemibrain val slab as validation, the gary logging cadence, and in-plane rotation as the only augmentation).
+
+**The corpus.** Described by lmd-configs' own `describe.py` in
+`/nrs/scicompsoft/orhane/mia-train-experiments/gary_comparison/probes/ssl_corpus_and_mask/describe.txt`
+(regenerate with `run.sh` there): 226 volumes, 89.8 T level-0 voxels, 8 nm ladder, 256^3 patches,
+size-weighting exponent 0.4, so an epoch has an effective sample size of 49 volumes and its top 10 volumes
+take 35% of it; Drosophila 35% and mouse 31% of an epoch; EM 77%, ExM 23%; 21.3 MB of stored voxels read per
+sample. 64M samples is ~12 passes over the corpus by voxel count, but with replacement and weighted, so
+"epochs" mean little here.
+
+**The test corner is in the pretraining data.** The corpus keeps the eval volumes by its own decision
+(`hold_out_eval_volumes: false`: pretraining reads no labels, and its header lists every overlap), and it
+holds the hemibrain Ellipsoid Body crop whole, at 0.79% of an epoch. A 256^3 crop touches the
+`[4000, 5000)^3` test corner when its origin exceeds 3744 on all three axes, which is 0.9% of that volume's
+crops, so about 0.007% of all samples (~9k of 128M) show test-corner voxels, unlabelled. For the comparison
+with the colleague this means our SSL encoder will have seen a small amount of test-corner *images*. The
+strict alternative is a derived copy of the corpus YAML with `bounding_box: [[0, 5000], [0, 5000], [0, 4000]]`
+(the train + val boxes) on that one volume; not done, because the corpus's decision of 2026-09-20 was to
+document overlaps rather than hold out, and the exposure is tiny.
+
+**Why the mask ratio, and why 0.85.** SimMIM explains its own mask-ratio results through the average
+distance from a masked pixel to the nearest visible one: too near and the target is recoverable by
+interpolation, too far and it is unpredictable. In 3D every block has 26 neighbours instead of 8, so the same
+ratio leaves visible context much nearer. Measured on this grid (256^3 crop, 16-voxel patches, 32-voxel masked
+blocks; `mask_avgdist.py` in the probe directory above):
+
+| mask ratio | 3D: mean distance to nearest visible patch | 3D: masked patches with no visible face neighbour | 2D, same grid |
+| ---: | ---: | ---: | ---: |
+| 0.6 | 19 vox | 27% | 23 px, 40% |
+| 0.75 | 22 vox | 48% | 30 px, 61% |
+| 0.85 | 27 vox | 65% | 38 px, 74% |
+| 0.9 | 32 vox | 76% | 51 px, 84% |
+
+At 0.6 the 3D task is easier than the paper's 2D one at the same ratio; 0.85 is about where the paper's
+0.7 sat, inside the range it found flat for 32-px blocks. The other defensible knob was the block size
+(`mask_granularity` 2 -> 3, 48-voxel blocks); the ratio was chosen because it is the paper's headline
+parameter and leaves the block geometry, and with it the per-patch loss normalisation, unchanged.
+
+**What previous SimMIM runs say about a long run.** Asked 2026-09-20: was SimMIM saturating? Answered with
+smoothed curves, not per-step losses: `/nrs/scicompsoft/orhane/probes/simmim_saturation/` (`results.md`,
+`curves.png`, script). Rolling mean over 5k-step windows of the logged train loss, val as logged (the
+trainer's own pass, no augmentation):
+
+| run | init, data, global batch, length | smoothed train loss 10k -> 50k -> end | second half's share of the total drop | val loss best -> end |
+| --- | --- | --- | ---: | --- |
+| lmd_ssl_v1 1a | scratch, lmd 91 vol, 128, 100k | 0.149 -> 0.149 -> 0.150 | -6% | 0.087 (15k) -> 0.094 |
+| init_comparison 3a | scratch, NISB 5 cubes, 8, 100k | 0.100 -> 0.093 -> 0.093 | 2% | 0.091 (95k) -> 0.093 |
+| new_ssl_recipe 2a | LVD init, NISB, 8, 71.5k (20k frozen) | 0.107 -> 0.102 -> 0.103 | -28% | 0.101 (35k) -> 0.104 |
+| new_ssl_recipe 3a | LVD init, NISB, 8, 58.4k | 0.101 -> 0.105 -> 0.105 | rose | 0.101 (25k) -> 0.104 |
+| new_ssl_recipe 4a | LVD init, NISB, 32, 100k | 0.101 -> 0.105 -> 0.100 | annealing only | 0.097 (100k), 0.098 at 15k |
+
+**Yes, on the pretext loss: every run plateaued within 10-25k steps.** The late-phase slope of the raw
+per-step loss is within two standard errors of zero for every run but init 3a (-0.0007 +- 0.0002 per 10k
+steps, i.e. 0.7% per 100k), and the one late decrease that exists (4a, 0.105 -> 0.100 over 50k-100k) tracks
+the linear LR decay reaching zero -- the loss recovering from a mid-run rise, not new learning. Two things
+keep this from meaning "stop at 25k": `visible_l1`, the copy-through error on unmasked patches, kept falling
+throughout lmd 1a (0.41 at 10k -> 0.28 at 100k), so the network was still changing; and masked-image
+modelling generally shows fine-tuned accuracy improving with pretraining length while the pretext loss is
+nearly flat. The pretext loss is not the readout; the fine-tuned score is. Practical consequence: judge these
+arms by the supervised stage at several SSL checkpoints (100k, 300k and 500k are the natural ones), not by
+their curves. Note also that lmd 1a's train loss carried an irreducible term from BANIS' photometric and
+slice augmentations (SimMIM's target is its input, so per-voxel noise and displaced sections enter the
+target), which is why it trained at 0.15 and validated at 0.09 while the rotation-only NISB runs showed no
+gap. Arms 2a/2b therefore keep in-plane rotation only, the papers' geometric-only recipe (decided
+2026-09-20), so their train and val losses sit on one scale. Smooth `val/loss` over five or more points.
+
+**Before a long SSL run: probe the kept lmd_ssl_v1 checkpoints.** lmd_ssl_v1 arm 1 kept all ten SSL
+checkpoints (`runs/lmd1__1a_dinov3_simmim_pretrain_20260825_122541/checkpoints/step_{10000..100000}`, 4.8 GB
+each). Fine-tuning arm 1a's recipe from, say, steps 10k, 30k and 100k on the hemibrain train box and scoring
+the test corner asks directly whether SSL steps past the loss plateau help downstream, at the measured
+0.26 s/step of arms 1a-1c on a B300 node:
+
+| supervised steps per probe | wall per probe | three probes on one node | three probes on three nodes |
+| ---: | ---: | ---: | ---: |
+| 100k | 7.2 h | 22 h | 7.2 h |
+| 300k | 22 h | 2.7 d | 22 h |
+| 500k (arm 1a's length) | 36 h | 4.5 d | 1.5 d |
+
+Plus a few hours of prediction and scoring per probe, off the training node. 100k-step probes are the
+cheap ranking proxy: at 100k the scored 1a/1b ordering already matched the 500k one (mws 0.149 vs 0.140,
+then 0.164 vs 0.153), and 1a and 1b at 100k are already scored, so they serve as the LVD-init and scratch
+references at no cost. Not launched (2026-09-20); the decision is open.
+
+**Runtime and wall.** 500k steps x 128 = 64M samples (the configs were written for 1M and cut to 500k before launch). B300 compiled 8-rank SimMIM measured 188.7 ms/step at
+4 per rank (170 samples/s); at 16 per rank the launch-bound part amortises, so expect 170-230 samples/s, i.e.
+3.2-4.4 days -- if the loader keeps up, which means 3.6-4.9 GB/s of stored voxels from `/groups` (the August
+H200 run sustained 75-100 samples/s at `data_wait_frac` ~0 without `defer_image_ops`). Submit with
+`WALL=336:00`, the queue's maximum (20160 min = 14 days); a run capped at 100 samples/s needs 7.4 days, inside the wall; below ~53 samples/s it
+finishes through one `--no-smoke` resubmission, which continues via `--resume`. Read `samples_per_s` and
+`data_wait_frac` at the first `[train]` line (step 1k). Checkpoints every 100k steps, 5 x 4.8 GB per arm.
+
+    WALL=336:00 bash experiments/gary_comparison/submit.sh 2a_simmim_lmd_mask60
+    WALL=336:00 bash experiments/gary_comparison/submit.sh 2b_simmim_lmd_mask85
+
+Both take a full gpu_b300 node after a 20-step smoke on one GPU; the smoke also exercises stochastic depth's
+`randperm(b)[:k]` path under `compile` (16 samples per rank, so `drop_path_rate = 0.1` is functional here,
+unlike in arms 1a-1c), which no earlier compiled run took.
+
+**Launch log.** 2026-09-20 15:25, both arms at 500k steps with rotation-only augmentation, `WALL=336:00`,
+full gpu_b300 nodes: 2a smoke job 154377884 -> real job 154377885 (chained on `done(smoke)`); 2b smoke job
+154377886 -> real job 154377887. The plan is to watch both for saturation (smoothed `val/loss`) and to start
+the supervised stage from a 100k-multiple checkpoint before the SSL runs finish if the curves justify it.
+The first `[train]` line (step 1k) gives `samples_per_s` and `data_wait_frac`; the smoke logs live in
+`jobs/smoke/`, the real logs in `jobs/`, both streamed live.
+Both smokes passed at 15:43 (237 s each, 20 steps on one GPU at batch 16, val at step 20, checkpoint written;
+masked_fraction 0.5996 / 0.8496; 12 GB host memory). The real runs dispatched at once: 2a on i07u02 (run
+`runs/gary__2a_simmim_lmd_mask60_*`), 2b on i04u22.
+**Measured at step 2k: 399 (2a) and 401 (2b) samples/s, MFU 26%, `data_wait_frac` 0.002**, i.e. 0.32 s/step,
+about twice the rate estimated above (compiled B300 at batch 16 is compute-bound, not launch-bound). 500k steps
+therefore take ~44 h: finish about Tue 2026-09-22 midday, with checkpoints landing every ~9 h (100k at
+~Mon 00:40, 200k ~09:35, 300k ~18:30, 400k ~Tue 03:25). Losses at 2k: 0.117 (2a) and 0.129 (2b), lr still
+warming; grad_norm spikes of 27-40 in warmup are clipped to 1.0 and match lmd 1a's early behaviour. `visible_l1`
+rises early (1.1 -> 1.9 / 2.3 by 2k): no loss constrains the visible patches, and the rotation-only NISB runs
+showed the same early rise before it fell.
+
+**The supervised stage, when it comes:** arm 1a's config with
+`[init] path = "<run>/checkpoints/step_<N>"`, `prefix = "model."`, `strict = true` (no `inflate_2d_to_3d`,
+no `skip`), RoPE already `vanilla`. Compare with 1a (LVD init) and 1b (scratch) at equal supervised steps,
+scored on the test corner as before.
+
+**What to read in TensorBoard** (`tensorboard.sh` serves both arms): `train/loss` (masked L1) against
+`train/visible_l1`; `val/loss` on the hemibrain slab; `train/masked_fraction` (0.5996 and 0.8496: the ratio
+is rounded to whole 32-voxel blocks); `samples_per_s` >= 170 and `data_wait_frac` ~0; `grad_norm` spikes in
+the first few thousand steps (lmd 1a had 48 at step 300 and recovered).
+
+## Scoring
+
+    bash experiments/gary_comparison/score.sh 1a_dinov3_axial_subpixel 500000          # predict fit + test, then MWS and CC routes
+    bash experiments/gary_comparison/score.sh 1a_dinov3_axial_subpixel 500000 --dry-run
+
+The task in mia-evals is `gary_comparison_neuron_instance`: the test corner from
+`configs/gary_comparison_neuron_instance/data/test.yaml` (a copy of `data/hemibrain_eb_test.yaml`), scored on its
+lattice-aligned 896^3 centre, ranked by panoptic quality with VOI, SQ, RQ and adapted Rand error
+reported. Post-processing is fitted on `configs/gary_comparison_neuron_instance/data/fit.yaml`, a 1000^3 block of the
+validation slab directly beneath the test corner (`[4000, 5000) x [4000, 5000) x [3000, 4000)`): the
+same lateral tissue, inside the split the protocol reserves for selection, disjoint from the test box.
+Two routes, in two scoring configs sharing the task: `mws` (mutex watershed at repulsive stride 1,
+then a size filter swept over 0/500/5k/20k/50k voxels) and `cc_threshold` (thresholded components at
+logits 0/3/6 crossed with the same filter), the second being the cheap baseline that says what the
+long-range channels buy. Predictions run on gpu_b300, like the training, because instance counts
+differ across GPU generations.
+
+Records are named `<run>.step<N>.<route>`, e.g.
+`gary__1a_dinov3_axial_subpixel_20260916_215544.step500000.mws`, so a row names its checkpoint
+directory outright. Predictions live in `eval/<arm>/step<N>/{fit,test}/` under the experiment's /nrs
+directory; scored labellings and scratch under `/nrs/scicompsoft/orhane/mia-evals/gary_comparison_neuron_instance/`.
+
+Checkpoints scored for arms 1a and 1b: steps 100k, 300k and 500k each. Arm 1b (from scratch) finished on
+2026-09-18 (run `runs/gary__1b_scratch_axial_subpixel_20260917_093923`); it too left the trivial predictor by
+step 3k and its validation loss followed 1a's shape (0.148 at 100k, 0.100 at 300k, 0.118 at 500k), so the
+pretrained encoder did not change the learning curve's shape. Its scoring jobs were submitted 2026-09-18 evening
+(LSF jobs 154372480-154372491). Validation loss (32 crops, noisy) had its
+best 100k-window at 300-400k (mean 0.087) and rose again to 0.112 over 400-500k while training loss
+stayed near 0.09, so the final checkpoint is not obviously the best one; the three points show the
+trend.
+
+## Results (2026-09-19): pretrained vs scratch, test corner, 896^3 centre
+
+Test panoptic quality, post-processing fitted on the fit block (every mws record chose min_size 20000; every
+cc record logit +6 with min_size 5000, except 1b at 100k which chose 20000):
+
+| step | 1a DINOv3 init, mws | 1b scratch, mws | 1a cc_threshold | 1b cc_threshold |
+| ---: | ---: | ---: | ---: | ---: |
+| 100k | 0.149 | 0.140 | 0.110 | 0.081 |
+| 300k | 0.157 | 0.151 | 0.112 | 0.101 |
+| 500k | **0.164** | 0.153 | 0.118 | 0.114 |
+
+- **The pretrained encoder wins at every checkpoint on both routes**, by 0.011 pq at 500k under the watershed
+  and 0.005 under components. The difference is in merges: at 500k/mws, VOI-merge is 0.42 (1a) vs 0.48 (1b)
+  while VOI-split is equal (0.95 vs 0.96). Under cc_threshold the gap shrinks with training (0.029 -> 0.011
+  -> 0.005), so at this data scale (75 G training voxels) the random init catches up slowly rather than
+  failing.
+- **Mutex watershed beats thresholded components by ~0.04 pq for both arms**, as on lmd_ssl_v1; the
+  long-range channels pay.
+- **Both arms were still improving at 500k**, under both routes, despite the validation-loss dip at 300-400k:
+  val loss on 32 crops is not the selection signal to trust here; scoring is.
+- The size filter dominates absolute pq (unfiltered watershed: 0.003 on the fit block): pq counts every
+  surviving fragment, and 20000 voxels (10 um^3) was the fitted floor at every step. Numbers are comparable
+  within this table and with anything scored on the same 896^3 region and metric; the colleague's protocol
+  is still to be confirmed (see below).
+
+Records: `leaderboard/gary_comparison_neuron_instance/` in mia-evals; scored labellings under
+`/nrs/scicompsoft/orhane/mia-evals/gary_comparison_neuron_instance/scored/<record>/`.
 
 ## Still to get from the colleague
 

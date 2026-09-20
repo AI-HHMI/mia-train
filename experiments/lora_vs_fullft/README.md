@@ -22,7 +22,7 @@ mechanical rather than careful. The only keys that differ between `1a` and `2a`,
 
 Both start from the released DINOv3 **ViT-L/16** (`dinov3_vitl16_pretrain_lvd1689m`), inflated to a
 16³ single-channel stem. `experiment_name` is `lvf__` + the file stem, so run directories are
-`/nrs/scicompsoft/orhane/mia-train-runs/lvf__1a_lora_interp_<timestamp>/`.
+`/nrs/scicompsoft/orhane/mia-train-experiments/lora_vs_fullft/runs/lvf__1a_lora_interp_<timestamp>/`.
 
 Arm 1's trainable budget: adapters 6.29M (96 of them), stem 4.20M, LayerNorm + LayerScale 0.15M,
 cls/storage/mask tokens 6.1K, the RoPE depth gate 1 scalar.
@@ -152,7 +152,7 @@ bash experiments/lora_vs_fullft/tensorboard.sh 6008 --smoke
 
 ```bash
 bash experiments/banis_parity/score_checkpoint.sh 50000 \
-  --run /nrs/scicompsoft/orhane/mia-train-runs/lvf__1b_lora_subpixel_<timestamp> \
+  --run /nrs/scicompsoft/orhane/mia-train-experiments/lora_vs_fullft/runs/lvf__1b_lora_subpixel_<timestamp> \
   --tag lvf1b
 ```
 

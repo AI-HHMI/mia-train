@@ -94,7 +94,7 @@ if [[ $SMOKE -eq 1 ]]; then
       -e 's/^num_workers = .*/num_workers = 2/'  -e 's/^log_every = .*/log_every = 5/' \
       "$CONFIG" > "$smoke_cfg"
   cmd=$(write_cmd "$SMOKE_LOGS" "smoke_$NAME" "$smoke_cfg" 1 --output-root "$SMOKE_RUNS")
-  SMOKE_ID=$(submit "$SMOKE_LOGS" "smoke_$NAME" "$cmd" 1 12 1:00)
+  SMOKE_ID=$(submit "$SMOKE_LOGS" "smoke_$NAME" "$cmd" 1 12 2:00)   # 2 h: opening a 226-volume corpus takes minutes
   echo "smoke  $NAME: job $SMOKE_ID  ($cmd)"
 fi
 if [[ $REAL -eq 1 ]]; then

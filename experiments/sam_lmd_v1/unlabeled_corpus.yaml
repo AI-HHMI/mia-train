@@ -3,7 +3,7 @@
 #
 # A PINNED COPY, not a reference. It is byte-for-byte the data config that run
 # `lmd1__1a_dinov3_simmim_pretrain_20260825_122541` saved beside its checkpoints
-# (`/nrs/scicompsoft/orhane/mia-train-runs/lmd1__1a_.../lmd_pretraining_singlescale_min1Gvox_noeval_
+# (`/nrs/scicompsoft/orhane/mia-train-experiments/lmd_ssl_v1/runs/lmd1__1a_.../lmd_pretraining_singlescale_min1Gvox_noeval_
 # patch256_sizeexp0.4.yaml`), with this header prepended. The generator that produced it no longer
 # exists in that form -- the corpus tooling under /groups/miaai/miaai/lmd-v0.0.1/configs was rebuilt
 # on 2026-09-01 and its current single-scale pretraining config lists 189 volumes -- so the only

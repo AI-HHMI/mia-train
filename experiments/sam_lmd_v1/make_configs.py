@@ -238,6 +238,16 @@ ARMS: list[dict] = [
          blurb="version 4 arm 7: arm 6 with 64 objects per crop instead of 32; otherwise "
                "identical (click pairs, mask fed back with probability 0.5, 8 nm, patch 16, "
                "global batch 16, 3D axial RoPE)."),
+    # Arm 7 doubled again (2026-09-16 evening): does the per-crop object count keep paying past 64?
+    # Identical to arm 7 except masks_per_sample 128, so arm 8 vs 7 vs 6 vs 4 is 128 vs 64 vs 32 vs
+    # 16 objects. Arm 7 cost 1.4x arm 6 per step (18.2 vs 25.5 crops/s); expect ~1.3 s/step here.
+    dict(name="arm8_8nm_gb16_musam128",
+         knobs={"mask_feature_dim": 64, "masks_per_sample": 128, "correction_pairs": True,
+                "mask_prompt_prob": 0.5},
+         rope="vanilla", batch=2, rounds=0,
+         blurb="version 4 arm 8: arm 7 with 128 objects per crop instead of 64; otherwise "
+               "identical (click pairs, mask fed back with probability 0.5, 8 nm, patch 16, "
+               "global batch 16, 3D axial RoPE)."),
     dict(name="arm5_8nm_gb32", knobs={"mask_feature_dim": 64}, rope="vanilla", batch=4, rounds=0,
          workers=16,
          blurb="version 4 arm 5: as arm 4 at four crops per rank, global batch 32. 16 dataloader "

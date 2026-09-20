@@ -14,7 +14,7 @@
 # reports on the other four. The post-processing threshold is fitted on the finetune half and
 # applied to the held-out half, so scoring the reported half alone leaves nothing to fit on -- and
 # fitting on the half being reported would select on the number being published. mia-evals refuses
-# that; see configs/tasks/lmd_ssl_v1_neuron_instance_test.toml over there.
+# that; see configs/lmd_ssl_v1_neuron_instance/ over there.
 #
 # **L4, not H100.** Nothing here needs a Hopper GPU: peak GPU memory is 5.1 GiB against the L4's
 # 24 GB, and arm 2's checkpoint runs attention through SDPA -- its saved config carries no `use_fa4`,
@@ -141,7 +141,6 @@ done
 echo
 echo "artifacts land in $OUT_ROOT/{test,finetune}/<volume>{,.gt}.zarr"
 echo "then, in mia-evals:"
-echo "  python src/evaluate.py score configs/tasks/lmd_ssl_v1_neuron_instance_test.toml \\"
-echo "      --test $OUT_ROOT/test --val $OUT_ROOT/finetune \\"
-echo "      --val-config configs/tasks/lmd_ssl_v1_neuron_instance_fit.toml \\"
-echo "      --run-dir $run --label ${ARM}_step${STEP}"
+echo "  mia-evals score configs/lmd_ssl_v1_neuron_instance/cc_threshold.toml \\"
+echo "      --test $OUT_ROOT/test --val $OUT_ROOT/finetune --run-dir $run"
+echo "  (the record is named <run>.step<N>.<route> by mia-evals; there is no --label)"

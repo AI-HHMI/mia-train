@@ -29,6 +29,9 @@
 #   arm7_8nm_gb16_musam64
 #                   arm 6 with 64 objects per crop instead of 32, otherwise identical: arm 7 vs
 #                   arm 6 vs arm 4 is 64 vs 32 vs 16 objects (arm 4 also lacks the click pairs).
+#   arm8_8nm_gb16_musam128
+#                   arm 7 with 128 objects per crop, otherwise identical (2026-09-16 evening):
+#                   8 vs 7 vs 6 vs 4 is 128 vs 64 vs 32 vs 16 objects.
 #
 # WHAT TO READ
 #
@@ -72,7 +75,7 @@ RUNS=$EXP/runs
 SMOKE=$EXP/smoke
 VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
-ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32 arm6_8nm_gb16_musam arm7_8nm_gb16_musam64)
+ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32 arm6_8nm_gb16_musam arm7_8nm_gb16_musam64 arm8_8nm_gb16_musam128)
 
 port_busy () { ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1$"; }
 if [[ "$MODE" != "--list" ]]; then
@@ -83,9 +86,9 @@ fi
 # it holds files open, and on NFS that leaves the directory undeletable.
 mkdir -p "$VIEW"; find "$VIEW" -maxdepth 1 -type l -delete
 missing=()
-link () {
-  local name=$1 dir
-  dir=$(ls -dt $2 2>/dev/null | head -1 || true)
+link () {                              # link <name> <glob>...: the newest run matching the first glob that has one
+  local name=$1 dir=""; shift
+  for pattern in "$@"; do dir=$(ls -dt $pattern 2>/dev/null | head -1 || true); [[ -n "$dir" ]] && break; done
   if [[ -n "$dir" && -d "${dir%/}/tensorboard" ]]; then
     ln -sfn "${dir%/}/tensorboard" "$VIEW/$name"; printf '  %-16s -> %s\n' "$name" "$(basename "${dir%/}")"
   else
@@ -96,7 +99,7 @@ link () {
 echo "arms found:"
 for arm in "${ARMS[@]}"; do
   if [[ "$MODE" == "--smoke" ]]; then
-    link "$arm" "$SMOKE/smoke_sam1__${arm}_r0_*/"
+    link "$arm" "$RUNS/smoke/smoke_sam1__${arm}_r0_*/" "$SMOKE/smoke_sam1__${arm}_r0_*/"   # layout of 2026-09-16, then the legacy tree
   else
     link "$arm" "$RUNS/sam1__${arm}_r0_*/"
   fi
@@ -108,7 +111,7 @@ echo "arm1_4nm = 4 nm read, 64 nm token, 1 um window, gb 8 | arm2_4nm_gb16 = arm
 echo "arm3_p8 = patch 8 at 8 nm, 64 nm token, 2 um window, 32k tokens, gb 8 |"
 echo "arm4_8nm_gb16 / arm5_8nm_gb32 = version 3's geometry (8 nm, patch 16, 32 nm cells) at gb 16 / 32."
 echo "arm6_8nm_gb16_musam = arm 4 + 32 objects/crop, click pairs, mask fed back at p=0.5 (Archit et al. 2025)."
-echo "arm7_8nm_gb16_musam64 = arm 6 with 64 objects/crop."
+echo "arm7_8nm_gb16_musam64 = arm 6 with 64 objects/crop. arm8_8nm_gb16_musam128 = arm 7 with 128 objects/crop."
 echo "All: feat64 head, 3D axial RoPE, v1 recipe, 200k steps, LR 3e-4."
 [[ "$MODE" == "--list" ]] && exit 0
 echo; echo "http://localhost:$PORT"

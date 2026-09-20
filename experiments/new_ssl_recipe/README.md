@@ -31,7 +31,7 @@ Configs, in submission order:
 ```
 
 `experiment_name` is `sslrec__` + the file stem, so run directories are
-`/nrs/scicompsoft/orhane/mia-train-runs/sslrec__2a_ssl_twophase_<timestamp>/`.
+`/nrs/scicompsoft/orhane/mia-train-experiments/new_ssl_recipe/runs/sslrec__2a_ssl_twophase_<timestamp>/`.
 
 The two finetune stages are the sequence `init_comparison` established: the **interpolating** head
 first, then the **sub-pixel** head warm-started from that encoder. It is used here as machinery, not
@@ -255,7 +255,7 @@ There is no wrapper here either. Call the shared script directly, naming the run
 cannot overwrite each other's affinities:
 
 ```bash
-RUN=$(ls -dt /nrs/scicompsoft/orhane/mia-train-runs/sslrec__2c_ssl_twophase_subpixel_*/ | head -1)
+RUN=$(ls -dt /nrs/scicompsoft/orhane/mia-train-experiments/new_ssl_recipe/runs/sslrec__2c_ssl_twophase_subpixel_*/ | head -1)
 bash experiments/banis_parity/score_checkpoint.sh 100000 --run "${RUN%/}" --tag sslrec_2c
 ```
 

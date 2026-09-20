@@ -1,0 +1,142 @@
+# gary_comparison arm 2a: SimMIM pretraining of a 3D DINOv3 ViT-L/16 from RANDOM init on the census-20260920
+# single-scale lmd pretraining corpus -- 500k steps at global batch 128, mask ratio 0.6 (the control; arm 2b is
+# this file with mask_ratio 0.85, and `diff` proves nothing else differs).
+#
+# The SSL stage ONLY. The supervised stage that turns this encoder into a hemibrain affinity model -- arm 1a's
+# recipe with `[init] path = "<this run>/checkpoints/step_<N>"`, `prefix = "model."`, `strict = true` -- is not
+# chained yet (2026-09-20: configs first, SSL only).
+#
+# lmd_ssl_v1's arm-1 stage A (1a_dinov3_simmim_pretrain) is the template. What differs, and why:
+#   - data: the census-20260920 corpus (226 volumes, 89.8 T voxels) instead of the 91-volume no-eval config;
+#     the eval volumes are IN it by that config's own decision (hold_out_eval_volumes false) -- README, "SSL arms"
+#   - 500k steps instead of 100k (1M was written first, cut 2026-09-20 to a 500k first look at the geometric-only
+#     augmentation; the run can be stopped for fine-tuning at any 100k checkpoint); warmup 5k, log 1k, val 10k,
+#     checkpoint 100k (the 1c conventions; 5 checkpoints)
+#   - torch SDPA + `[trainer].compile` instead of FlashAttention-4: measured 1.57x on 8-rank FSDP2 SimMIM on B300
+#   - samples_per_epoch 1M: every epoch boundary respawns the loader, and at 128 samples/step 100k would do that
+#     every 781 steps
+#   - validation on the hemibrain val slab (data/hemibrain_eb_val.yaml), 128 crops every 10k steps
+#   - num_workers 8 (gary convention; the loader has 3x the headroom it had in August thanks to defer_image_ops)
+#   - augmentation: in-plane rotation ONLY. The template carried BANIS' photometric and slice ops, which corrupt
+#     a reconstruction target (see [augment]); the papers use geometric augmentation only
+#
+# WHAT TO EXPECT. Smoothed over 5k-step windows, the masked-reconstruction loss of EVERY previous SimMIM run
+# in this account had plateaued by step 10-25k, and the second half of each run moved it by less than the
+# noise (probes/simmim_saturation on /nrs; README). Only visible_l1 kept falling. So the masked loss here will
+# look flat from ~20k steps on; that is not the readout. The bet a long schedule makes is on the
+# representation, which only the fine-tuned score can judge. Read val/loss smoothed over >= 5 points, and never
+# compare 2a with 2b on it: a harder mask has a higher L1 by construction.
+#
+# Launch (not yet):  WALL=336:00 bash experiments/gary_comparison/submit.sh 2a_simmim_lmd_mask60
+# submit.sh exports TORCHINDUCTOR_LAYOUT_OPTIMIZATION=0 (compile + cuDNN SDPA) and runs a 20-step smoke first.
+# Estimate: 64M samples at 170-230 samples/s (B300 compiled 8-rank SimMIM measured 188.7 ms/step at 4/rank
+# = 170 samples/s; batch 16 amortises the launch-bound part) is 3.2-4.4 days, IF the loader keeps up -- 21.3 MB
+# of stored voxels per sample is 3.6-4.9 GB/s from /groups. Read data_wait_frac in the first hour: at 100
+# samples/s the run needs 7.4 days, still inside the 14-day wall; below ~53 samples/s it is not, and finishes
+# through one `--no-smoke` resubmission (which continues via --resume).
+experiment_name = "gary__2a_simmim_lmd_mask60"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256            # 16^3 = 4096 tokens at patch 16
+patch_size = 16
+in_chans = 1
+embed_dim = 1024          # ViT-L/16, 303M parameters (306.6M with the 16^3 single-channel stem)
+depth = 24
+num_heads = 16            # head_dim 64; 64 % 6 = 4, so axial 3D RoPE leaves 4 channels unrotated
+n_storage_tokens = 4
+layerscale_init = 1.0e-05 # DINOv3's own training setting; keeps the encoder block-for-block identical to arms 1a-1c
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+# Axial: with a random init there is no 2D channel layout to preserve, so depth owns its third of the rotated
+# channels from step 0 -- lmd_ssl_v1 arm 1's choice, and arm 1a's.
+pos_embed_rope_type = "vanilla"
+# Sample-level stochastic depth. FUNCTIONAL here, unlike in arms 1a-1c: 16 samples per rank, so each block drops
+# ~1 of them. lmd_ssl_v1 arm 1's setting. Under compile this takes the randperm(b)[:k] path with k < b, which the
+# smoke exercises before the real job starts.
+drop_path_rate = 0.1
+use_fa4 = false           # `[trainer].compile` needs SDPA, and FA4 buys nothing on B300 at 4096 tokens
+
+# No [init]: random initialisation. These arms ask whether in-domain masked-image modelling on the lmd corpus can
+# replace the released LVD-1689M checkpoint arm 1a starts from (1a beat the scratch arm 1b by 0.011 pq at 500k).
+# A variant that starts the SSL FROM that checkpoint would take arm 1a's [init] block verbatim (and superposition RoPE).
+
+[algorithm]
+name = "simmim"
+# 0.6: the paper's default and lmd_ssl_v1 arm 1's setting -- the control. In 3D a masked block has 26 neighbours
+# instead of 8, so the same ratio leaves visible context much nearer: measured on this grid (probes/
+# ssl_corpus_and_mask), the mean distance from a masked patch to the nearest visible one is 19 voxels at 0.6
+# against 23 px for the same grid in 2D, and 27% of masked patches have no visible face neighbour against 40%.
+# The 3D grid needs ~0.8 to be as hard as the paper's 2D setting at 0.6; arm 2b tests 0.85.
+mask_ratio = 0.6
+mask_granularity = 2      # hide 2x2x2 patch blocks, i.e. 32 voxels across (the paper's unit for 16-px patches)
+norm_pix_loss = false     # raw intensities as the target, as the paper; the corpus windows every volume into [0, 1]
+
+[data]
+name = "miao_volumes"
+# GENERATED file in lmd-configs (recipe recipes/pretraining/singlescale/baseline/8nm_p256_swe0.4_min1e8_up8.yaml,
+# census 20260920): 226 volumes, 89.8 T level-0 voxels, 8 nm ladder, patch 256, size-weighting exponent 0.4
+# (effective sample size 49 volumes; the top 10 take 35% of an epoch; EM 77%, ExM 23%). It contains the hemibrain
+# Ellipsoid Body crop -- this experiment's volume -- WHOLE, test corner included, at 0.79% of an epoch. About
+# 0.9% of that volume's 256^3 crops touch the [4000, 5000)^3 corner, so ~0.007% of all samples (~4.5k of 64M) show
+# test-corner voxels, unlabelled. README, "SSL arms", for the strict alternative.
+config_path = "/groups/miaai/miaai/lmd-v0.0.1/configs/configs/pretraining/singlescale/baseline/8nm_p256_swe0.4_min1e8_up8_census20260920.yaml"
+# An epoch boundary respawns every loader worker (~4 s). 1M samples = 7,812 steps per epoch at global batch 128,
+# 64 boundaries in the run, <0.1% of wall. Sampling is with replacement, so the value changes nothing else.
+samples_per_epoch = 1000000
+defer_image_ops = true
+
+[val_data]
+name = "miao_volumes"
+# The hemibrain val slab (3000 <= z < 4000) -- the volume this experiment is about -- rather than fresh crops from
+# the corpus: a fixed distribution every 10k steps, readable across a run. A progress readout, not a selection
+# signal (there is nothing to select; the fine-tune decides), and NOT the place to read 2a against 2b, whose
+# masked L1 differ by construction. The slab also lies inside the pretraining volume above, so it is not held out.
+config_path = "experiments/gary_comparison/data/hemibrain_eb_val.yaml"
+# At least the global batch: the val loader uses the per-rank training batch with drop_last, so fewer than 16
+# samples per rank would drop everything and log a bare `[val]` line with no metrics (lmd_ssl_v1/make_configs.py).
+samples_per_epoch = 128
+defer_image_ops = true
+
+[trainer]
+max_steps = 500000
+# Per rank; x 8 ranks -> global batch 128, what lmd_ssl_v1 arm 1 ran. Masked reconstruction stalls at small global
+# batch (dead at 8-16, alive at 84: lmd_ssl_v1/make_configs.py), so this is the floor, not a tuning knob. Memory:
+# 80 GiB/rank on H200 eager FA4 at this batch; B300 has 268 GiB, so 32/rank would fit -- kept at 16 so the run has
+# lmd_ssl_v1 arm 1's global batch and its curves read against that run.
+batch_size = 16
+lr = 0.0003
+warmup_steps = 5000       # the gary convention (1a-1c); lmd_ssl_v1 arm 1 used 3k of 100k
+min_lr_ratio = 0.001
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 1.0  # random init: nothing to protect
+patch_embed_lr_mult = 1.0
+lr_schedule = "linear"
+precision = "bf16"
+# Measured 1.57x on 8-rank FSDP2 SimMIM on B300 (296.6 -> 188.7 ms/step at 4/rank); needs the SDPA kernel selected
+# in [model] and TORCHINDUCTOR_LAYOUT_OPTIMIZATION=0 in the job. Compiled RNG uses its own stream, so a compiled
+# run does not reproduce an eager one step for step; 2a and 2b are both compiled and comparable.
+compile = true
+activation_checkpointing = false
+log_every = 1000
+val_every = 10000         # 50 validations of 128 crops
+checkpoint_every = 100000 # 5 checkpoints x 4.8 GB (ViT-L + AdamW state); a node failure costs at most ~1 day of steps
+num_workers = 8
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8              # one full B300 node
+tp = 1
+
+[augment]
+# Geometric only, as in MAE and SimMIM (random crop + flip there; MAE measured colour jitter as a loss). SimMIM's
+# target IS its input, so anything else enters the reconstruction target: BANIS' intensity_jitter is one affine
+# map per crop and predictable from the visible patches, but additive_noise (std up to 0.5 x U(0,1) per crop) is
+# not, and drop_slice / shift_slice remove or displace random sections that nothing visible reveals -- irreducible
+# terms in the masked L1. That is why lmd_ssl_v1 arm 1, which carried the full BANIS set, trained at 0.15 and
+# validated (un-augmented) at 0.09, while the rotation-only NISB SimMIM runs showed no gap. Decided 2026-09-20:
+# in-plane rotation (the 16 transforms that keep z), random masking, nothing else. The SUPERVISED stage that will
+# follow keeps BANIS' full set, as arms 1a-1c do.
+rotate = "inplane"

@@ -768,6 +768,7 @@ layout, so the arms compare with each other and not with version 3.
 | 5 | `arm5_8nm_gb32_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | 32 (4 per rank), 16 workers |
 | 6 | `arm6_8nm_gb16_musam_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | 16 (2 per rank); 32 objects/crop, click pairs, mask fed back at p = 0.5 |
 | 7 | `arm7_8nm_gb16_musam64_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | as arm 6 with 64 objects/crop |
+| 8 | `arm8_8nm_gb16_musam128_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | as arm 7 with 128 objects/crop |
 
 Arms 1 and 3 put the same token and the same mask cell on the tissue; they differ in field of
 view (1 vs 2 um), tokens per window (8x) and native vs interpolated voxels. Arm 2 is arm 1 at
@@ -790,6 +791,13 @@ alone). Both knobs are new algorithm arguments whose defaults reproduce the old 
 in `tests/unit/test_promptable_seg.py`. Arm 6 against arm 4 is the three changes together;
 `final_iou` in its curves is measured half the time without the mask prompt and is comparable
 only with itself.
+Arm 8 (added 2026-09-16 evening, while arm 7 was at step 47k) doubles the objects per crop once more, to
+128, and changes nothing else: 8 vs 7 vs 6 vs 4 is 128 vs 64 vs 32 vs 16 objects. It exists because the
+training metrics moved with this knob (arm 7's `first_iou` ran ahead of arm 6's at equal steps) while
+the downstream effect is still unknown; arm 7 also cost 1.4x arm 6 per step (18.2 vs 25.5 crops/s), so
+arm 8 is given a 3x wall (216 h) for its expected ~1.3 s/step. It is the first arm submitted under the
+2026-09-16 layout: its job scripts, resolved config and LSF logs are in `jobs/`, its run directory in
+`runs/`, its smoke artifacts in `jobs/smoke/` and `runs/smoke/`.
 
 **How the patch-8 encoder is initialised.** The released kernel is `(1024, 3, 16, 16)`. The
 loader averages RGB to one channel, spreads the kernel over 16 depth slices divided by 16 (a
