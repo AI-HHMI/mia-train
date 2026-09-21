@@ -73,7 +73,7 @@ for single-node, multi-node and resume recipes.
 | `muvit_mae` | Masked autoencoding across scale levels, one decoder per level. |
 | `simmim` | Masked image modelling by mask-token substitution. Works with DINOv3 encoders, which MAE cannot use because they cannot consume a scattered token subset. |
 | `dinov3` | The DINOv3 self-supervised objective: teacher/student EMA, DINO + iBOT losses, Sinkhorn centring, KoLeo. Rank-agnostic. |
-| `affinity_seg` | Supervised instance segmentation by binary affinity prediction. |
+| `affinity_seg` | Supervised instance segmentation by binary affinity prediction. With `lsd_sigma` set, the head also predicts local shape descriptors (MTLSD). |
 | `semantic_seg` | Supervised per-voxel classification (serves both 2D and 3D). |
 | `promptable_seg` | Supervised promptable instance segmentation, Segment Anything-style, supporting point, box, mask, or class token prompts. |
 

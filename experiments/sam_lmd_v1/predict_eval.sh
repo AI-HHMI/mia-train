@@ -66,9 +66,11 @@ run=${run%/}
 [[ -n "$STEP" ]] || STEP=$(ls -d "$run"/checkpoints/step_* | sed 's|.*step_||' | sort -n | tail -1)
 [[ -d "$run/checkpoints/step_$STEP" ]] || { echo "no step_$STEP in $run/checkpoints" >&2; exit 1; }
 
-# The arm's mask stride decides the throughput knob and the memory below.
-upscale=$("$VENV/bin/python" -c "import json,sys; print(json.load(open(sys.argv[1]))['algorithm']['kwargs'].get('mask_upscale', 4))" "$run/resolved_config.json")
-case "$upscale" in 16) batch=8; mem_scale=3 ;; 8) batch=32; mem_scale=2 ;; *) batch=64; mem_scale=1 ;; esac
+# The arm's mask stride (patch / mask_upscale, in voxels) decides the throughput knob and the
+# memory below: a stride-2 arm has 8x the logits per prompt of a stride-4 one, whether it got there
+# through mask_upscale 8 at patch 16 or through mask_upscale 4 at patch 8 (arm3_p8).
+stride=$("$VENV/bin/python" -c "import json,sys; r=json.load(open(sys.argv[1])); print(int(r['model']['kwargs'].get('patch_size', 16)) // int(r['algorithm']['kwargs'].get('mask_upscale', 4)))" "$run/resolved_config.json")
+case "$stride" in 1) batch=8; mem_scale=3 ;; 2) batch=32; mem_scale=2 ;; *) batch=64; mem_scale=1 ;; esac
 # One string, because it is spliced into a command LSF hands to a shell: the TOML quotes around
 # a string value must survive that second parse, so they are escaped (`\"consensus\"`). A run was
 # once lost to the shell stripping them and predict.py refusing the bare word. The knobs come from
@@ -87,20 +89,10 @@ PY
 OVERRIDES+=" --override algorithm.points_per_batch=$batch"
 echo "run   $run"
 echo "step  $STEP"
-echo "mask_upscale $upscale -> points_per_batch $batch"
+echo "mask stride $stride voxels -> points_per_batch $batch, memory x$mem_scale"
 echo "generator $OVERRIDES"
 
-slots_for () {                          # host slots at 40 GB; two int64 volumes plus write buffers
-  local base
-  case "$1" in
-    zebrafish_fish2_doublecube1) base=5 ;;   # 7.1 G voxels
-    zebrafish_fish2_quadcube1)   base=4 ;;   # 4.7 G
-    hemibrain_ellipsoid_body)    base=2 ;;
-    liconn_expid82)              base=2 ;;
-    *)                           base=1 ;;
-  esac
-  echo $(( base + mem_scale - 1 ))
-}
+SLOTS=12                                # one GPU's share of an H100/H200/B300 node (12 slots/GPU, 40 GB each); never size by RAM
 wall_for () {                           # tiles x ~6 s per tile at the base head, with headroom
   local h
   case "$1" in
@@ -124,7 +116,7 @@ for half in "${HALVES[@]}"; do
   volumes=$(grep '^- name: ' "$config" | sed 's/^- name: //')
   for volume in $volumes; do
     [[ -n "$ONLY_VOLUME" && "$volume" != "$ONLY_VOLUME" ]] && continue
-    n=$(slots_for "$volume"); w=$(wall_for "$volume")
+    n=$SLOTS; w=$(wall_for "$volume")
     tag="${ARM}_r${ROUND}_${half}_${volume}"
     cmd="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$REPO/src; \

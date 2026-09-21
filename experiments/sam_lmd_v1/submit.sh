@@ -49,7 +49,7 @@ STAGE=$EXP     # NOT /tmp: that is node-local
 LOGS="$EXP/jobs"
 
 ALL_ARMS=(base stride2 stride1 stride2_small feat64 refine4 deep4 wide512)
-V4_ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32 arm6_8nm_gb16_musam arm7_8nm_gb16_musam64 arm8_8nm_gb16_musam128)   # version 4: round 0 only (`--rounds 0`)
+V4_ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32 arm6_8nm_gb16_musam arm7_8nm_gb16_musam64 arm8_8nm_gb16_musam128 arm9_8nm_gb64_musam32_c128 arm10_8nm_gb8_musam128_c352)   # version 4: round 0 only (`--rounds 0`)
 PREFIX=sam1__                                                    # matches make_configs.PREFIX
 
 QUEUE=${QUEUE:-gpu_b300}
@@ -80,7 +80,7 @@ WALL_R0=${WALL_R0:-72:00}
 WALL_ROUND=${WALL_ROUND:-48:00}
 WALL_LABEL=${WALL_LABEL:-8:00}
 wall_scale () {                        # arm -> multiplier applied to the walls above
-  case "$1" in arm8_8nm_gb16_musam128) echo 3 ;; stride1|arm7_8nm_gb16_musam64) echo 2 ;; stride2|stride2_small|arm6_8nm_gb16_musam) echo 1.5 ;; arm3_p8) echo 4 ;; *) echo 1 ;; esac
+  case "$1" in arm8_8nm_gb16_musam128|arm10_8nm_gb8_musam128_c352) echo 3 ;; stride1|arm7_8nm_gb16_musam64|arm9_8nm_gb64_musam32_c128) echo 2 ;; stride2|stride2_small|arm6_8nm_gb16_musam) echo 1.5 ;; arm3_p8) echo 4 ;; *) echo 1 ;; esac
 }
 scaled () {                            # H:MM x factor -> H:MM
   local h=${1%%:*} f=$2; printf '%d:00' "$(awk -v h="$h" -v f="$f" 'BEGIN{printf "%d", h*f+0.5}')"

@@ -3,11 +3,12 @@
 #
 #   bash experiments/sam_lmd_v1/score.sh base 2 [--step N]
 #
-# The artifacts are `instances`, so they go through the task files the mutex-watershed entries use
-# (`lmd_ssl_v1_neuron_instance_mws_{fit,test}.toml`): a `size_filter` swept over
-# [0, 500, 5000, 50000] on the finetune half and applied once to the reported half, panoptic
-# quality ranking, same region. That is the whole of the comparison: the SAM row and the MWS row
-# differ only in what wrote the labelling.
+# The artifacts are `instances`, so they go through mia-evals' `size_filter` route
+# (`configs/lmd_ssl_v1_neuron_instance/size_filter.toml`): the same size filter the mutex-watershed
+# rows get (`mws.toml`), swept over [0, 500, 5000, 50000] on the finetune half and applied once to
+# the reported half, panoptic quality ranking, same region. That is the whole of the comparison:
+# the SAM row and the MWS row differ only in what wrote the labelling. mia-evals names the record
+# `<run dir>.step<N>.size_filter` and keeps the post-processed labellings under the scratch dir.
 #
 # CPU queue: scoring needs no GPU, and mia-evals lives in the banis environment.
 set -euo pipefail
@@ -39,13 +40,9 @@ SCRATCH="$STAGE/score/${ARM}_r${ROUND}"
 mkdir -p "$SCRATCH" "$LOGS"
 
 cmd="export OMP_NUM_THREADS=16 NUMBA_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHONPATH=$EVALS/src; cd $EVALS && \
-$PY -m evaluate score configs/lmd_ssl_v1_neuron_instance/mws.toml \
+$PY -m evaluate score configs/lmd_ssl_v1_neuron_instance/size_filter.toml \
   --test '$ART/test' --val '$ART/finetune' \
   --run-dir '$run' --scratch '$SCRATCH'"
-# (2026-09-18) one scoring config carries both splits and the record is named <run>.step<N>.<route>
-# by mia-evals itself; the old --val-config and --label flags no longer exist. NOTE: that config's
-# route is `mws`, which names these SAM labellings wrongly -- score SAM arms through a config whose
-# route is `size_filter` before the next one is recorded.
 id=$(bsub -P miaai -q local -n 20 -W 12:00 -J "sc_$LABEL" -o "$LOGS/sc_${LABEL}_%J.log" -e "$LOGS/sc_${LABEL}_%J.err" "$cmd" \
      | sed -n 's/^Job <\([0-9]*\)>.*/\1/p')
-echo "  $LABEL  job=$id  -> $EVALS/leaderboard/lmd_ssl_v1_neuron_instance/records/$LABEL.json"
+echo "  $LABEL  job=$id  -> $EVALS/leaderboard/lmd_ssl_v1_neuron_instance/records/$(basename "$run").step${STEP}.size_filter.json"

@@ -1,0 +1,123 @@
+# lsd_aux_v1, arm `mtlsd_s80`: the sub-pixel control plus local shape descriptors as an auxiliary
+# target -- the MTLSD network of Sheridan et al. (2023).
+#
+# Derived from experiments/subpixel_decoder/subpixel_256.toml by experiments/lsd_aux_v1's README
+# recipe; the only differences are `lsd_sigma` in [algorithm] and `defer_image_ops` in the two
+# data sections (a placement of the resampling and augmentation, not a change of what they
+# compute). Verify with
+#
+#   diff experiments/subpixel_decoder/subpixel_256.toml experiments/lsd_aux_v1/mtlsd_s80.toml
+#
+experiment_name = "lsd_aux_v1__mtlsd_s80"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256
+patch_size = 16
+in_chans = 1
+embed_dim = 1024
+depth = 24
+num_heads = 16
+n_storage_tokens = 4
+layerscale_init = 1.0e-05
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+pos_embed_rope_type = "superposition"
+
+[init]
+# The control's own encoder at 200k steps, not the released DINOv3 weights. The question here is
+# whether the *head* limits sharpness, so the encoder starts where the control left it and only
+# the decoder is new -- which also makes this run tens of thousands of steps rather than 300k.
+#
+# `prefix` is "model." and not "encoder.": `BaseAlgorithm` registers the backbone as `model`, and
+# `self.encoder` is the same object, so torch stores it once under the name it saw first. The
+# checkpoint's own `decoder.*`/`decoder_out.*` keys do not start with the prefix and are dropped
+# before the unused-key check, which is what leaves the new head at its initialisation.
+path = "/nrs/scicompsoft/orhane/mia-train-experiments/banis_parity/runs/banis_parity__finetune_256_long_20260810_123308/checkpoints/step_200000"
+prefix = "model."
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder = "subpixel"
+# Width on the patch grid, where positions are 4096x cheaper than voxels -- so this can be wide.
+decoder_hidden_dim = 256
+# Width at voxel resolution. This is the number that costs: every tensor after the expansion is
+# this many channels over the whole crop, so it sets both the refinement convolutions' arithmetic
+# and what activation checkpointing would have to recompute.
+decoder_readout_dim = 16
+# Two 3x3x3 convolutions -> a 5-voxel receptive field across the seam between two tokens' blocks,
+# which are otherwise decoded independently.
+decoder_refine_depth = 2
+split_disconnected = true
+
+# --- the one change against the control ------------------------------------------------------
+# The descriptor window's standard deviation in the data's physical units (nanometres): the
+# paper's FIB-25 value, which on 9x9x20 nm voxels is a window of (8.9, 8.9, 4.0) voxels. The
+# other descriptor settings stay at their defaults: `lsd_weight = 1.0` (the reference sums the two
+# losses unweighted), `lsd_downsample = 2` (the reference's setting; 40-75 ms per 256^3 sample on
+# a B300, see mia-train-experiments/lsd_aux_v1/probes/lsd_target_cost), `lsd_background =
+# "ignore"` (background voxels are not in the descriptor loss, as in the reference).
+lsd_sigma = 80.0
+
+[data]
+name = "miao_volumes"
+config_path = "experiments/subpixel_decoder/nisb_base_256_aug.yaml"
+samples_per_epoch = 1000
+defer_image_ops = true
+
+[val_data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [256, 256, 256]
+samples_per_epoch = 32
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+defer_image_ops = true
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/val/seed100.zarr"
+image_key = "raw"
+label_key = "labels/public_gt-cell-nisb"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+# 100k rather than the control's 300k: the encoder is already trained, and `max_steps` sets the
+# shape of the cosine, so quoting a horizon the run will not reach would leave the LR near its
+# peak for the whole run -- the mistake that made the control's early checkpoints hard to read.
+max_steps = 100000
+batch_size = 1            # per rank; 8 ranks -> global batch 8, matching the control exactly
+lr = 3.0e-4
+warmup_steps = 2000
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 1.0
+patch_embed_lr_mult = 1.0
+lr_schedule = "cosine"
+# Off, as in the control. The sub-pixel head holds roughly a quarter of the interpolating head's
+# activations, so this has more headroom than the control did, not less.
+activation_checkpointing = false
+precision = "bf16"
+log_every = 100
+val_every = 5000
+checkpoint_every = 5000   # denser than the control's 10k: the early steps are the informative ones
+num_workers = 6
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1
+
+[augment]
+# Rotation moved here from the data YAML's per-volume `aug_rot`, which miao removed. "inplane"
+# draws from the 16 transforms that never exchange z with x or y; the full 48-transform group is
+# refused against this data's 9x9x20 nm voxels, since exchanging axes of unequal size produces
+# object shapes that do not occur in the specimen. Same augmentation as before, stated in the run
+# rather than per volume.
+rotate = "inplane"

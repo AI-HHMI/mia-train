@@ -21,6 +21,7 @@ See README.md for the design and its caveats.
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
 import tomllib
 
@@ -56,10 +57,10 @@ SAMPLES_PER_EPOCH = 100_000
 VAL_SAMPLES = 32                # what arms 1/2 validated on; see lmd_ssl_v1/make_configs.py
 
 # The encoder block of lmd_ssl_v1 arm 2, verbatim except for the attention kernel (see comment).
-# Version 4 arms parametrise the patch size and the RoPE type (see `render`).
+# Version 4 arms parametrise the patch size, the crop and the RoPE type (see `render`).
 MODEL = '''[model]
 name = "dinov3_vit3d"
-img_size = 256            # %(grid)d^3 = %(tokens)d tokens at patch %(patch)d
+img_size = %(crop)d            # %(grid)d^3 = %(tokens)d tokens at patch %(patch)d
 patch_size = %(patch)d
 in_chans = 1
 embed_dim = 1024          # ViT-L/16, 303M parameters
@@ -248,6 +249,36 @@ ARMS: list[dict] = [
          blurb="version 4 arm 8: arm 7 with 128 objects per crop instead of 64; otherwise "
                "identical (click pairs, mask fed back with probability 0.5, 8 nm, patch 16, "
                "global batch 16, 3D axial RoPE)."),
+    # Arm 8's recipe at half the crop edge (2026-09-21): 128^3 voxels = 1 um at 8 nm, 8^3 = 512
+    # tokens per crop instead of 4096. A 1 um crop holds a few dozen objects of >= 512 voxels at
+    # most (the 2 um windows held 7-119), so the 128 slots of arm 8 would mostly be padding: 32
+    # slots here, arm 6's number. Eight crops per rank instead of two, so a step sees half of
+    # arm 8's tissue (64 x 128^3 against 16 x 256^3 voxels) at the same 256 object decodes per
+    # rank (8 x 32 against 2 x 128) and half the encoder tokens; 16 loader workers, as the other
+    # arm above two crops per rank needed. RoPE normalises coordinates by the runtime grid, so
+    # this model must be labelled and evaluated with 128-voxel windows (the `crop128` data
+    # configs), never 256.
+    dict(name="arm9_8nm_gb64_musam32_c128",
+         knobs={"mask_feature_dim": 64, "masks_per_sample": 32, "correction_pairs": True,
+                "mask_prompt_prob": 0.5},
+         rope="vanilla", batch=8, rounds=0, crop=128, workers=16,
+         blurb="version 4 arm 9: the click-pair recipe of arms 6-8 on 128^3 crops (1 um, 512 "
+               "tokens) with 32 object slots and eight crops per rank (global batch 64); 8 nm, "
+               "patch 16, 3D axial RoPE, mask fed back with probability 0.5."),
+    # Arm 8's recipe at the largest cubic crop every GT volume can supply (2026-09-21): 352^3 voxels
+    # = 2.8 um at 8 nm, 22^3 = 10648 tokens per crop (2.6x arm 8's 4096). kasthuri15 is 768 x 768 x
+    # 362 voxels at 8 nm (100 sections of 29 nm), so 352 is the last multiple of the patch that fits;
+    # 512 would drop it (TOO_SMALL_FOR_CROP). One crop per rank (global batch 8): the mask grid is
+    # 88^3, so 128 object slots cost 1.3x arm 8's decoder cells per rank (87M vs 67M), two crops
+    # would cost 2.6x. RoPE normalises by the runtime grid: label and evaluate with 352-voxel windows.
+    dict(name="arm10_8nm_gb8_musam128_c352",
+         knobs={"mask_feature_dim": 64, "masks_per_sample": 128, "correction_pairs": True,
+                "mask_prompt_prob": 0.5},
+         rope="vanilla", batch=1, rounds=0, crop=352, workers=16,
+         blurb="version 4 arm 10: arm 8's recipe (128 objects per crop, click pairs, mask fed back "
+               "with probability 0.5) on 352^3 crops (2.8 um, 10648 tokens), the largest cube "
+               "kasthuri15 can supply, at one crop per rank (global batch 8); 8 nm, patch 16, "
+               "3D axial RoPE."),
     dict(name="arm5_8nm_gb32", knobs={"mask_feature_dim": 64}, rope="vanilla", batch=4, rounds=0,
          workers=16,
          blurb="version 4 arm 5: as arm 4 at four crops per rank, global batch 32. 16 dataloader "
@@ -317,16 +348,37 @@ def head_block(knobs: dict[str, object], patch: int = 16, nm: int = 8) -> str:
     return "\n".join(lines) + "\n"
 
 
-def split_path(which: str, nm: int) -> str:
-    """The data config of one split at one lattice: lmd_ssl_v1's own at 8 nm, a generated copy
-    with `resolutions` replaced at 4 nm (`data/` beside this file)."""
-    if nm == 8:
+def split_path(which: str, nm: int, crop: int = 256) -> str:
+    """The data config of one split at one lattice and crop: lmd_ssl_v1's own at 8 nm / 256, a
+    generated copy with `resolutions` replaced at 4 nm, or with `patch_size` replaced for another
+    crop (`data/` beside this file)."""
+    if nm == 8 and crop == 256:
         return f"{SPLITS}/lmd_{which}_singlescale.yaml"
+    if crop != 256:
+        assert nm == 8, "a non-256 crop is only generated at 8 nm"
+        return f"experiments/sam_lmd_v1/data/lmd_{which}_singlescale_crop{crop}.yaml"
     return f"experiments/sam_lmd_v1/data/lmd_{which}_singlescale_{nm}nm.yaml"
 
 
+# Volumes that cannot supply a crop of the given edge at 8 nm (measured 2026-09-21 from the stores'
+# boxes and voxel sizes): kasthuri15 is 768 x 768 x 362 voxels (100 sections of 29 nm); every other
+# GT volume exceeds 1000 voxels on each axis. An arm at that crop trains and validates without them.
+TOO_SMALL_FOR_CROP: dict[int, tuple[str, ...]] = {
+    512: ("kasthuri15_ac3", "kasthuri15_ac4"),
+}
+
+
+def drop_volume(text: str, name: str) -> str:
+    """Remove one `- name: <name>` entry, with its indented keys, from a split YAML's volume list."""
+    pattern = re.compile(rf"^- name: {re.escape(name)}\n(?:  .*\n)*", re.MULTILINE)
+    new, n = pattern.subn("", text)
+    assert n == 1, f"volume {name} not found exactly once"
+    return new
+
+
 def split_copies() -> dict[str, str]:
-    """The 4 nm split configs: the 8 nm YAMLs with `resolutions` rewritten, nothing else."""
+    """The generated split configs: the 8 nm / 256 YAMLs with `resolutions` rewritten (4 nm) or
+    `patch_size` rewritten (the crops the arms use), nothing else."""
     files = {}
     for which in ("finetune", "val"):
         text = (HERE.parents[1] / SPLITS / f"lmd_{which}_singlescale.yaml").read_text()
@@ -339,15 +391,38 @@ def split_copies() -> dict[str, str]:
                "encoder token 64 nm. Edit the generator, not this.\n"
                "resolutions:\n- - 4.0\n  - 4.0\n  - 4.0\n")
         files[f"data/lmd_{which}_singlescale_4nm.yaml"] = text.replace(old, new, 1)
+        old_patch = "patch_size:\n- 256\n- 256\n- 256\n"
+        assert old_patch in text, f"{which}: patch_size block not found"
+        for crop in sorted({int(arm.get("crop", 256)) for arm in ARMS} - {256}):
+            dropped = [v for v in TOO_SMALL_FOR_CROP.get(crop, ()) if f"- name: {v}\n" in text]
+            remaining = text.count("\n- name: ") - len(dropped)
+            note = ("" if not dropped else
+                    "# " + ", ".join(dropped) + f" dropped: too small for a {crop}-voxel crop at "
+                    f"8 nm (TOO_SMALL_FOR_CROP); the {remaining} remaining volumes are re-weighted "
+                    "equally.\n")
+            new_patch = ("# GENERATED by experiments/sam_lmd_v1/make_configs.py from " + SPLITS +
+                         f"/lmd_{which}_singlescale.yaml:\n# the same volumes, boxes, weights and "
+                         f"8 nm lattice, read in {crop}-voxel crops ({crop * 8 / 1000:g} um) "
+                         "instead of 256. A model\n# trained on these crops must also be labelled "
+                         "and evaluated with them: RoPE normalises coordinates by\n# the runtime "
+                         "grid. Edit the generator, not this.\n" + note +
+                         f"patch_size:\n- {crop}\n- {crop}\n- {crop}\n")
+            copy = text.replace(old_patch, new_patch, 1)
+            for v in dropped:
+                copy = drop_volume(copy, v)
+            if dropped:
+                assert copy.count("  weight: 0.25\n") == remaining
+                copy = copy.replace("  weight: 0.25\n", f"  weight: {1 / remaining:.6f}\n")
+            files[f"data/lmd_{which}_singlescale_crop{crop}.yaml"] = copy
     return files
 
 
-def data_blocks(round_index: int, nm: int = 8) -> str:
+def data_blocks(round_index: int, nm: int = 8, crop: int = 256) -> str:
     if round_index == 0:
-        source = f'config_path = "{split_path("finetune", nm)}"'
+        source = f'config_path = "{split_path("finetune", nm, crop)}"'
         note = ("# The four ground-truth finetune volumes of lmd_ssl_v1 (kasthuri15_ac3, zebrafish "
                 f"quadcube1,\n# liconn_mouse_dg, hemibrain_ellipsoid_body), equally weighted, "
-                f"{nm} nm, patch 256.")
+                f"{nm} nm, patch {crop}.")
     else:
         source = 'config_path = "ROUND_CONFIG"'
         note = ("# The round's mixture -- the same four ground-truth volumes plus one entry per "
@@ -371,7 +446,7 @@ defer_image_ops = false
 # round is scored at its final step, as arms 1/2 were, so nothing here leaks into the reported
 # number.
 name = "miao_volumes"
-config_path = "{split_path("val", nm)}"
+config_path = "{split_path("val", nm, crop)}"
 samples_per_epoch = {VAL_SAMPLES}
 defer_image_ops = false
 '''
@@ -384,8 +459,9 @@ def render(arm: dict, round_index: int) -> str:
     nm = arm.get("nm", 8)
     batch = arm.get("batch", BATCH_PER_RANK)
     workers = arm.get("workers", WORKERS)
-    model = MODEL % dict(patch=patch, grid=256 // patch, tokens=(256 // patch) ** 3, rope=rope,
-                         rope_note=ROPE_NOTES[rope])
+    crop = arm.get("crop", 256)
+    model = MODEL % dict(patch=patch, crop=crop, grid=crop // patch, tokens=(crop // patch) ** 3,
+                         rope=rope, rope_note=ROPE_NOTES[rope])
     if round_index == 0:
         steps, lr, init = R0_STEPS, LR_R0, INIT_LVD
         what = (f"round 0 -- ground truth only. From the released DINOv3 LVD-1689M checkpoint, "
@@ -406,7 +482,7 @@ experiment_name = "{PREFIX}{name}_r{round_index}"
 {model}
 {init}
 {head_block(arm['knobs'], patch, nm)}
-{data_blocks(round_index, nm)}
+{data_blocks(round_index, nm, crop)}
 {TRAINER % dict(max_steps=steps, lr=lr, warmup=WARMUP, min_lr_ratio=MIN_LR_RATIO,
                 batch=batch, dp_shard=DP_SHARD, global_batch=batch * DP_SHARD,
                 workers=workers)}

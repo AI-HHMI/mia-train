@@ -1,0 +1,90 @@
+# Short supervised run on NISB "base": affinities plus local shape descriptors (the paper's MTLSD).
+#
+#   bsub -P <project> -q gpu_h100 -gpu "num=2" -n 24 -W 0:30 ... \
+#     torchrun --standalone --nproc_per_node=2 src/train.py --config configs/nisb_mtlsd_smoke.toml
+#
+# `configs/nisb_affinity_smoke.toml` with one change: `lsd_sigma` below. The head then also predicts
+# the ten local shape descriptors of Sheridan et al. (2023) as an auxiliary target, built on the
+# device from the same labels the affinities are (see `src/algorithms/affinity/lsd.py`). Prediction
+# and scoring are unchanged -- the artifact carries the six affinity channels only -- so the
+# descriptors show up in this run's `loss_lsd` and `lsd_mse_*` curves and nowhere else.
+#
+# [parallelism] must multiply to the torchrun world size.
+
+experiment_name = "nisb_mtlsd_smoke"
+
+[model]
+name = "vit3d"
+img_size = [64, 64, 64]
+patch_size = [8, 8, 8]
+in_channels = 1
+embed_dim = 384
+depth = 6
+num_heads = 6
+attention_backend = "auto"
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder_hidden_dim = 64
+split_disconnected = true
+
+# The descriptor window's standard deviation, in the data's physical units (nanometres here): the
+# paper's FIB-25 setting, which on NISB's 9x9x20 nm voxels is a window of (8.9, 8.9, 4.0) voxels.
+# Converted per sample from the batch's voxel size, so the same number means the same window on
+# any volume in the corpus.
+lsd_sigma = 80.0
+# Added to the affinity loss with this weight; the reference sums the two unweighted.
+lsd_weight = 1.0
+# Statistics computed on a 2x strided grid and nearest-upsampled, as the reference does. The cost
+# is proportional to objects x voxels, and this cuts it eightfold; measured in
+# mia-train-experiments/lsd_aux_v1/probes/lsd_target_cost.
+lsd_downsample = 2
+# Background voxels are left out of the descriptor loss, the reference's default. "zero" would
+# supervise them towards the all-zero descriptor instead.
+lsd_background = "ignore"
+
+[data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [64, 64, 64]
+samples_per_epoch = 1000
+defer_image_ops = true
+
+[val_data]
+name = "miao_volumes"
+config_path = "configs/data/nisb_base.yaml"
+patch_size = [64, 64, 64]
+samples_per_epoch = 64
+resolutions = [[9, 9, 20]]
+output_axes = "lcxyz"
+defer_image_ops = true
+
+[[val_data.volumes]]
+name = "NISB base val seed100"
+path = "/groups/miaai/miaai/lmd-v0.0.1/dev/nisb/base/val/seed100.zarr"
+image_key = "raw"
+label_key = "labels/public_gt-cell-nisb"
+zarr_version = "zarr3"
+weight = 1.0
+normalize = true
+
+[trainer]
+max_steps = 50
+batch_size = 2
+lr = 1.0e-4
+warmup_steps = 5
+min_lr_ratio = 0.1
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+log_every = 5
+val_every = 25
+checkpoint_every = 25
+num_workers = 4
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 2
+tp = 1

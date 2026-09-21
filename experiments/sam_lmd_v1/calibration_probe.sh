@@ -30,6 +30,7 @@ BLOCK=${BLOCK:-512}
 MAX_TILES=${MAX_TILES:-0}
 GT_CONFIG=${GT_CONFIG:-experiments/lmd_ssl_v1/lmd_finetune_singlescale.yaml}
 MIN_MASK=${MIN_MASK:-512}     # the gate's size floor in lattice voxels; 4096 for a 4 nm model
+POINTS_PER_BATCH=${POINTS_PER_BATCH:-}   # prompts decoded per batch; a mask-stride-2 arm (arm3_p8) needs 16: the default 64 peaks near 260 GB
 # A 4 nm model: GT_CONFIG=experiments/sam_lmd_v1/data/lmd_finetune_singlescale_4nm.yaml BLOCK=1024 MIN_MASK=4096
 GT_VOLUMES=(kasthuri15_ac3 zebrafish_fish2_quadcube1 liconn_mouse_dg hemibrain_ellipsoid_body)
 
@@ -63,7 +64,7 @@ for ARM in "${ARMS[@]}"; do
     echo "echo \"element \${LSB_JOBINDEX:-1}: volume \$V on \$(hostname)\""
     echo "nvidia-smi --query-gpu=name --format=csv,noheader | head -1"
     echo "$VENV/bin/python experiments/sam_lmd_v1/calibration_probe.py probe '$run' --step $STEP --volume \"\$V\" \\"
-    echo "  --out '$OUT'/\"\$V\".npz --block $BLOCK --max-tiles $MAX_TILES --gt-config '$GT_CONFIG' --min-mask-voxels $MIN_MASK"
+    echo "  --out '$OUT'/\"\$V\".npz --block $BLOCK --max-tiles $MAX_TILES --gt-config '$GT_CONFIG' --min-mask-voxels $MIN_MASK${POINTS_PER_BATCH:+ --points-per-batch $POINTS_PER_BATCH}"
   } > "$WORKER"
   FINAL="$STAGE/cmd/probe_${ARM}_r${ROUND}_step${STEP}_final.sh"
   { echo "#!/usr/bin/env bash"
