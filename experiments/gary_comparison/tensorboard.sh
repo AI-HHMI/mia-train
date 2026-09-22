@@ -27,6 +27,11 @@
 #                              mask ratio 0.6. Its curves are reconstruction losses, not affinity metrics.
 #   2b_simmim_lmd_mask85       arm 2a with mask_ratio 0.85, nothing else. A harder mask has a HIGHER
 #                              masked L1 by construction: never rank 2a against 2b on these curves.
+#   3a_simmim60_axial_subpixel arm 1a's recipe (affinity_seg sub-pixel head, 500k steps) with the encoder
+#                              initialised from arm 2a's final SSL checkpoint instead of the LVD weights.
+#                              Read it against 1a (natural-image pretraining) and 1b (none).
+#   3b_simmim85_axial_subpixel the same from arm 2b's checkpoint; 3a vs 3b is the SSL mask ratio.
+#                              Both start a COLD sub-pixel head: the collapse check below applies.
 #
 # WHAT TO READ
 #
@@ -77,7 +82,8 @@ RUNS=$EXP/runs
 VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
 ARMS=(1a_dinov3_axial_subpixel 1b_scratch_axial_subpixel 1c_dinov3_axial_subpixel_1m
-      2a_simmim_lmd_mask60 2b_simmim_lmd_mask85)
+      2a_simmim_lmd_mask60 2b_simmim_lmd_mask85
+      3a_simmim60_axial_subpixel 3b_simmim85_axial_subpixel)
 
 PORT=6006 SMOKE=0 LIST=0
 for arg in "$@"; do

@@ -27,15 +27,15 @@ scale, the batch and the prompting recipe (below).
     bash experiments/sam_lmd_v1/predict_eval.sh feat64 0              # eight volumes -> instances
     bash experiments/sam_lmd_v1/score.sh feat64 0                     # -> the leaderboard table
 
-**Status (2026-09-21; version 4: arms 1-8 done and scored, arms 4-8 on the leaderboard, arm 3's
-row predicting, arm 9 training).** Nine arms on the encoder's scale, the batch size and the training
+**Status (2026-09-22; version 4: arms 1-9 done and scored, arms 3-9 on the leaderboard, arm 10
+training).** Nine arms on the encoder's scale, the batch size and the training
 recipe (below); version 3's single arm is superseded and its round-0 checkpoints remain for
 reference. **Arm 8 (128 objects per crop, click pairs, mask feedback) leads the
 `lmd_ssl_v1_neuron_instance` leaderboard at pq 0.2786, arm 7 (64 objects) is second at 0.2591, both
 above the affinity rows 1c 0.2369 and 2c 0.2287**; arm 6 0.2244, arm 4 0.2094, arm 5 0.2038. Objects
 per training crop is the lever: assembled block recall 0.343 -> 0.407 -> 0.450 -> 0.542 (arms 4, 6,
 7, 8) at a flat precision of 0.57-0.60, and pq followed. Arm 3 (patch 8, mask stride 2) is the worst
-arm on every diagnostic and costs 5-10x the compute. Arms 6-8 were predicted on H200 GPUs, arms 4
+arm on every diagnostic, last of the SAM rows at pq 0.1734, and costs 5-10x the compute. Arms 6-8 were predicted on H200 GPUs, arms 4
 and 5 on B300 (see "GPU architecture" under Caveats).
 Configs are generated: `make_configs.py` emits the TOMLs in this directory (the original head
 sweep's 8 arms x 3 rounds, and the version-4 round-0 arms); an arm's identity is its entry in `ARMS`
@@ -267,6 +267,19 @@ Until 2026-09-15 the eval gates were 0.5 / 0.5 (an early sweep, within noise of 
 artifact was ever scored with them); one protocol means every diagnostic describes the pass that
 is scored. Every round is
 scored at its final step, as arms 1/2 were, so the validation set selects nothing.
+
+**The window follows the run (2026-09-22).** `predict.py` refuses a data config whose `patch_size`
+differs from the model's `img_size`, because RoPE normalises coordinates by the runtime grid, so a
+model must be labelled with the crop it trained at. `predict_eval.sh`, `assembly_sweep.sh`,
+`calibration_probe.sh` and `labelling_gallery.sh` therefore read `img_size` from the run's
+`resolved_config.json` and, when it is not 256, switch to the generated split copies
+`data/lmd_{finetune,val}_singlescale_crop<N>.yaml` and scale the click grid to keep the labeller's
+click spacing of 256/14 = 18.3 voxels: 7 clicks per side at 128 (arm 9), 19 at 352 (arm 10), the
+same rule SAM's generator applies across its crop layers. The single-window blocks of the sweep
+shrink to the window plus 32 (160 for arm 9, as 288 is 256 + 32), so `single_tile` stays one
+window; the assembled 512-voxel blocks and the leaderboard lattice are unchanged, so those numbers
+compare across windows while the single-window row does not. Everything else -- gates, NMS,
+consensus, size floor, the size filter fitted on the finetune half -- is identical.
 
 ## Caveats, in the order they would bite
 
@@ -504,7 +517,7 @@ effect was unknown; arm 7 cost 1.4x arm 6 per step (18.2 vs 25.5 crops/s), so ar
 wall (216 h). Arm 8 is the first arm under the 2026-09-16 layout: job scripts, resolved config and
 LSF logs in `jobs/`, run directory in `runs/`, smoke artifacts in `jobs/smoke/` and `runs/smoke/`.
 
-**Arm 9: the click-pair recipe on 128^3 crops** (config written 2026-09-21, not yet launched).
+**Arm 9: the click-pair recipe on 128^3 crops** (config written 2026-09-21; trained 2026-09-21/22 in 25.5 h, job 154384975, 0.46 s/step; scored 2026-09-22 with 128-voxel windows and 7 clicks per side, see Scoring).
 `img_size = 128` and the generated `data/lmd_{finetune,val}_singlescale_crop128.yaml` -- lmd_ssl_v1's
 split YAMLs with `patch_size` 128 and nothing else changed -- give 8^3 = 512 tokens per crop instead
 of 4096. Two settings move with the crop, by the user's decision: `masks_per_sample` 32 rather
@@ -516,6 +529,69 @@ needed above two crops per rank. Because RoPE normalises coordinates by the runt
 model must be labelled and evaluated with 128-voxel windows: the `crop128` data configs cover the
 model side, but the scoring scripts assume 256 windows throughout and need a small adaptation
 before this arm can be scored. Wall x2 in `submit.sh` as a guess.
+
+**Arm 9 on the leaderboard** (2026-09-22; record `sam1__arm9_..._r0_...step200000.size_filter`, B300
+predictions with 128-voxel windows and 7 clicks per side): **pq 0.2017, eighth**, between arm 5
+(0.2038) and arm 3 (0.1734); size filter 5000, finetune-half fit 0.360. Per volume against arm 8:
+kasthuri15_ac4 0.398 / 0.487, liconn hippocampus 0.306 / 0.391, liconn expid82 0.017 / 0.098,
+zebrafish doublecube1 0.086 / 0.139; components sq 0.694 / 0.687, rq 0.282 / 0.395, voi_merge
+3.33 / 2.02, voi_split 0.98 / 1.19. So half the tissue per step at the same decodes per rank kept the
+mask quality (sq) and lost recognition and merges -- the assembly-time fragmentation and self-
+disagreement the block tables and the oracle galleries showed. **The region episode:** the 128
+lattice fills more of each volume than the 256 lattice (the tail a 256 stride cannot complete:
+kasthuri15_ac4 320x704x704 against 256x640x640), so the first record was scored over a larger
+region, and the leaderboard -- which groups rows by scored region and refuses to rank different
+regions together -- put it in a table of its own at pq 0.2040. `crop_artifacts.py` crops an arm's
+predictions and co-registered truth to another arm's extents (origins are all 0, so only the tail
+goes and the OME placement holds); `score.sh` takes `ART_DIR` / `SCRATCH_DIR` to score such a copy
+(`eval/arm9_..._r0_lattice256/`, `score/arm9_..._r0_lattice256/`). The sub-region record is kept
+at `score/arm9_..._r0/record_lattice128_region.json`. Any arm whose window is not 256 needs this
+step before its row is comparable; arm 10 (352) will.
+
+**Why arm 9's single windows leave objects unpainted** (2026-09-22, `probes/unpainted-window-objects/`
+under the experiment root). In the gallery's central 128-voxel windows, 20% (kasthuri) and 15%
+(hemibrain) of the GT voxels carry no label, against 1.5% and 0.6% in arm 8's 256-voxel windows.
+Measured cause, object by object: a small share had no grid click inside them at all (2 of 10 and
+8 of 18 unpainted objects, median 2.5-8k voxels in the window against one click per 6,114 voxels;
+about 1% of GT voxels), and every other one was clicked -- up to 24 times -- and lost at the gate:
+no candidate of any of its clicks had IoU head >= 0.7 and stability >= 0.8 on the same mask. Nothing
+was removed later by NMS, containment or painting. On kasthuri the dropped masks were good (true IoU
+0.75-0.81) with the head at 0.71-0.73 on one candidate and stability on another, i.e. the fixed gate
+cutting a knife-edge; on hemibrain they were genuine failures (head 0.2-0.66, true IoU 0.17-0.77) on
+thin processes the window cuts short. Assembly recovers most of it because eight half-overlapping
+windows see every voxel, which is why the assembled recall (0.445) is far above the single window's.
+
+**The oracle galleries: gluing error against within-window error** (2026-09-22,
+`viz/oracle_w256/` and `viz/oracle_w128/`, `figures/oracle_gallery.sh`; CPU only). The same four
+blocks, sections and pictures as an arm's gallery, but every window's masks are the ground truth's
+own objects on the 4-voxel mask grid with perfect confidence, glued by the labeller's consensus rule;
+`labelling_gallery.py oracle` refuses a split config whose `patch_size` is not the window, because
+`VolumeGrid` reads each tile at the config's patch and a 128 window on the 256 config silently ran
+at a 2x coarser lattice on the first attempt. Pooled precision@0.5 / recall, single window then
+assembled: perfect masks at 256 windows 0.771 / 0.962 then 0.750 / 0.957 (1328 pieces for 1041
+objects, 35 merges, 133 fragments, 0 swallowed); arm 8 0.762 / 0.686 then 0.596 / 0.542. Perfect
+masks at 128 windows 0.885 / 0.962 then 0.742 / 0.958 (343 windows on hemibrain instead of 27, 34
+merges, 140 fragments); arm 9 0.887 / 0.529 then 0.493 / 0.445. Three things follow. (1) Inside a
+window the arms' per-piece precision IS the oracle's: the imprecision there is the mask grid and the
+512-voxel floor (liconn and zebrafish cap near 0.6 even for perfect masks), not the model; the
+model's within-window deficit is recall, 0.69 and 0.53 against 0.96. (2) The gluing rule itself is
+cheap: perfect masks lose 0.5 points of recall and 2 (256) to 14 (128) points of precision in
+assembly, and 343 windows glue as well as 27. (3) What the arms lose in assembly beyond that --
+arm 8 17 points of precision and 14 of recall, arm 9 39 and 8 -- is the model disagreeing with itself
+between overlapping windows (disputed voxels, fragments, 69 and 86 swallowed objects against 0).
+So the levers are within-window recall (the gate, section above) and cross-window consistency, not
+the reconciliation rule.
+
+Pooled over the four blocks (precision@0.5 / recall; merges, fragments, swallowed are assembled counts):
+
+| labelling | single window | assembled | merges | fragments | swallowed |
+|---|---|---|---|---|---|
+| perfect masks, 256 windows (`viz/oracle_w256`) | 0.771 / 0.962 | 0.750 / 0.957 | 35 | 133 | 0 |
+| arm 8 (`viz/arm8_8nm_gb16_musam128_step200000`) | 0.762 / 0.686 | 0.596 / 0.542 | 56 | 184 | 69 |
+| perfect masks, 128 windows (`viz/oracle_w128`) | 0.885 / 0.962 | 0.742 / 0.958 | 34 | 140 | 0 |
+| arm 9 (`viz/arm9_8nm_gb64_musam32_c128_step200000`) | 0.887 / 0.529 | 0.493 / 0.445 | 41 | 264 | 86 |
+
+Per volume the numbers are in each directory's `<volume>.json` (`window_scores`, `assembled_scores`).
 
 **Arm 10: arm 8's recipe on 352^3 crops** (config written and submitted 2026-09-21; job 154388295
 on i07u22, training since 14:22 at 1.91 s/step, MFU 0.14 as arm 8, so 200k steps land around
@@ -680,7 +756,7 @@ and is not more precise per candidate either. It is also the expensive arm: 4.5x
 time per volume (kasthuri15_ac4 553 s against arm 4's 122 s), 6-10x on the consensus blocks, GPU
 memory above 141 GB in the labeller (the containment step asks for 50 GiB with 100 GiB in use) and
 above 268 GB in the probe at its default 64 prompts per batch (`POINTS_PER_BATCH=16` was needed).
-Leaderboard row: predicting on the B300s at the time of writing.
+**On the leaderboard (scored 2026-09-21 21:45, B300 predictions): pq 0.1734, eighth, below every other SAM arm** (arm 5 0.2038) and above only the cc_threshold rows; size filter 5000, finetune-half fit 0.30 (arm 8 0.42). Per volume: kasthuri15_ac4 0.277, liconn hippocampus 0.292, liconn expid82 0.039, zebrafish doublecube1 0.085. Components: voi_merge 4.16 (the most merges of any row), voi_split 0.94, sq 0.711, rq 0.239. The stride-2 predictions took 12-15 h per large volume on a B300 (hemibrain needed its wall raised from 12 to 30 h).
 
 **Arm 8's labels under a stricter gate and a two-window agreement rule** (2026-09-21,
 `viz/arm8_8nm_gb16_musam128_step200000_{iou0.9,support2,iou0.9_support2}/`; the four GT blocks

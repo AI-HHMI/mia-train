@@ -49,6 +49,19 @@ SUFFIX="${PRED_IOU:+_iou$PRED_IOU}${TAG:+_$TAG}"
 OUT="$STAGE/viz/${ARM}_step${STEP}${SUFFIX}"
 GATE_FLAG=${PRED_IOU:+--pred-iou-thresh $PRED_IOU}
 for kv in $AMG; do GATE_FLAG+=" --amg $kv"; done
+# The window the model trained at decides the GT split copy and the click grid: RoPE normalises
+# coordinates by the runtime grid, so a model MUST be labelled with its training crop. The
+# labeller's defaults are a 256-voxel window and 14 clicks per side; another crop keeps the click
+# spacing (256/14 = 18.3 voxels): 7 per side at 128, 19 at 352.
+CROP=$("$VENV/bin/python" -c "import json,sys; print(int(json.load(open(sys.argv[1]))['model']['kwargs'].get('img_size', 256)))" "$run/resolved_config.json")
+if [[ "$CROP" != 256 ]]; then
+  [[ "$NM" == 8 ]] || { echo "a $CROP-voxel window is only generated at 8 nm" >&2; exit 2; }
+  GT_CONFIG="experiments/sam_lmd_v1/data/lmd_finetune_singlescale_crop${CROP}.yaml"
+  [[ -f "$GT_CONFIG" ]] || { echo "missing $GT_CONFIG: run make_configs.py" >&2; exit 1; }
+  PPS=$(( (14 * CROP + 128) / 256 ))
+  GATE_FLAG+=" --amg points_per_side=$PPS"
+  echo "window $CROP: GT config $GT_CONFIG, $PPS clicks per side"
+fi
 mkdir -p "$OUT" "$LOGS" "$STAGE/cmd"
 echo "teacher $run step $STEP -> $OUT"
 

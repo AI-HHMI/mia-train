@@ -401,6 +401,112 @@ def style() -> None:
                          "axes.titlesize": 9})
 
 
+def cmd_oracle(args: argparse.Namespace) -> None:
+    """The same pictures for a PERFECT model: every window's masks are the ground truth's own
+    connected components, pooled to the mask grid, then glued by the labeller's consensus rule.
+    What survives is the cost of the mask grid and of the gluing alone; whatever the real arms
+    lose beyond it is within-window prediction error."""
+    import torch
+    from miao.config import load_config
+    from pseudolabel import (
+        LABEL_AMG,
+        assemble_oracle,
+        compare_labellings,
+        oracle_tile_masks,
+        plan_blocks,
+        resolve_volume,
+    )
+
+    from algorithms.promptable.amg import tile_labelling, upsample_cells
+    from prediction.grid import VolumeGrid
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    config = load_config(args.gt_config)
+    resolved = resolve_volume(config, args.volume)
+    if resolved["volume"].label_key is None:
+        raise SystemExit(f"{args.volume} has no label_key in {args.gt_config}; nothing to draw")
+    patch = [args.patch] * 3
+    if sorted(int(v) for v in config.patch_size) != patch:
+        raise SystemExit(
+            f"{args.gt_config} has patch_size {list(config.patch_size)} but the window is {args.patch}: "
+            "VolumeGrid reads each tile at the config's patch, so the lattice would silently change "
+            "scale. Use the generated crop copy (data/lmd_finetune_singlescale_crop<N>.yaml)."
+        )
+    stride = (args.mask_stride,) * 3
+    amg = dict(LABEL_AMG)
+    amg.update(oracle=True, pred_iou_thresh=1.0, stability_thresh=1.0,
+               min_mask_voxels=args.min_mask_voxels, min_support=args.min_support,
+               agree_thresh=args.agree_thresh, mask_stride=args.mask_stride)
+    (index, box), = plan_blocks(resolved, args.block, 1)
+    grid = VolumeGrid(resolved["config"], args.volume, patch, box=box)
+    print(f"{args.volume}: block {index} {box}, oracle at window {args.patch}, "
+          f"{len(grid.tiles)} windows, output {grid.output_shape}", flush=True)
+    handle = grid.image_handle()
+    started = time.perf_counter()
+    image = paste_image(grid, handle)
+    truth_np = grid.read_ground_truth()
+    values, inverse = np.unique(truth_np, return_inverse=True)
+    dense = np.arange(values.size, dtype=np.int64)
+    dense[values <= 0] = 0
+    truth = torch.from_numpy(dense[inverse].reshape(truth_np.shape))
+    del truth_np, inverse
+    print(f"  image + truth read in {time.perf_counter() - started:.0f} s", flush=True)
+
+    # The central window alone: perfect masks on the mask grid, painted as one window is.
+    window_box, window_origin = central_window(grid)
+    slices = tuple(slice(o, o + p) for o, p in zip(window_origin, patch, strict=True))
+    started = time.perf_counter()
+    masks, scores = oracle_tile_masks(truth[slices], stride, args.min_mask_voxels)
+    window_pred = upsample_cells(tile_labelling(masks, scores).numpy(), stride)
+    window_seconds = time.perf_counter() - started
+    window_scores = compare_labellings(
+        window_pred, truth[slices].numpy(), min_truth_voxels=args.min_truth_voxels
+    )
+    print(f"  central window: {masks.shape[0]} perfect masks; precision "
+          f"{window_scores['precision']:.3f} recall {window_scores['recall']:.3f}", flush=True)
+
+    meta = {
+        "volume": args.volume, "run": f"oracle__w{args.patch}_r0", "step": 0,
+        "block_index": index, "block_box_storage": box, "native_box_storage": grid.native_box(),
+        "storage_axes": resolved["storage_axes"], "lattice_nm": resolved["lattice_nm"],
+        "saved_nm": [v * SUB for v in resolved["lattice_nm"]],
+        "output_shape": list(grid.output_shape), "windows": len(grid.tiles),
+        "patch": list(patch), "amg": amg, "window_box_storage": window_box,
+        "window_origin_output": list(window_origin), "window_seconds": round(window_seconds, 1),
+        "window_scores": window_scores,
+    }
+    truth_saved = subsample(relabel(truth.numpy()))
+    np.savez_compressed(
+        args.out / f"{args.volume}_base.npz",
+        image=(np.clip(subsample(image), 0, 1) * 255).astype(np.uint8),
+        truth=truth_saved,
+        window=subsample(relabel(window_pred)),
+        window_origin=np.array(window_origin) // SUB,
+        window_shape=np.array(patch) // SUB,
+    )
+    (args.out / f"{args.volume}.json").write_text(json.dumps(meta, indent=2))
+    del window_pred, image
+
+    started = time.perf_counter()
+    stats: dict[str, Any] = {}
+    labels, instances = assemble_oracle(
+        grid.tiles, grid.patch, grid.output_shape, truth, stride=stride,
+        tile_merge="consensus", agree_thresh=args.agree_thresh, min_support=args.min_support,
+        min_mask_voxels=args.min_mask_voxels, report=stats,
+    )
+    seconds = time.perf_counter() - started
+    scores = compare_labellings(labels.numpy(), truth.numpy(), min_truth_voxels=args.min_truth_voxels)
+    print(f"  assembled block ({seconds:.0f} s): {stats.get('tile_masks_drawn', 0)} perfect masks "
+          f"-> {scores['pseudo_instances']} pieces vs {scores['truth_instances']} objects  "
+          f"precision {scores['precision']:.3f}  recall {scores['recall']:.3f}  "
+          f"merges {scores['merges']}  fragments {scores['fragments']}", flush=True)
+    np.savez_compressed(args.out / f"{args.volume}_assembled.npz",
+                        assembled=subsample(relabel(labels.numpy())))
+    meta.update(assembled_seconds=round(seconds, 1), assembled_scores=scores)
+    (args.out / f"{args.volume}.json").write_text(json.dumps(meta, indent=2))
+    render_volume(args.out, args.volume)
+
+
 def render_volume(directory: Path, volume: str) -> None:
     style()
     meta = json.loads((directory / f"{volume}.json").read_text())
@@ -496,11 +602,24 @@ def main() -> None:
     label.add_argument("--amg", action="append", default=None, metavar="KEY=VALUE",
                        help="any other generator setting, e.g. prefer=part, "
                             "split_tiled_wholes=true, consistency_clicks=4")
+    oracle = sub.add_parser("oracle", help="the same pictures for PERFECT per-window masks glued "
+                                            "by the consensus rule (no model)")
+    oracle.add_argument("--volume", required=True)
+    oracle.add_argument("--out", type=Path, required=True)
+    oracle.add_argument("--gt-config", type=Path,
+                        default=REPO / "experiments/lmd_ssl_v1/lmd_finetune_singlescale.yaml")
+    oracle.add_argument("--block", type=int, default=512, help="block edge in lattice voxels")
+    oracle.add_argument("--patch", type=int, default=256, help="window edge in lattice voxels")
+    oracle.add_argument("--mask-stride", type=int, default=4)
+    oracle.add_argument("--min-mask-voxels", type=int, default=512)
+    oracle.add_argument("--min-truth-voxels", type=int, default=512)
+    oracle.add_argument("--agree-thresh", type=float, default=0.5)
+    oracle.add_argument("--min-support", type=int, default=1)
     render = sub.add_parser("render", help="draw the figures from saved arrays")
     render.add_argument("directory", type=Path)
     render.add_argument("--volume", action="append", default=None)
     args = parser.parse_args()
-    {"label": cmd_label, "render": cmd_render}[args.command](args)
+    {"label": cmd_label, "oracle": cmd_oracle, "render": cmd_render}[args.command](args)
 
 
 if __name__ == "__main__":

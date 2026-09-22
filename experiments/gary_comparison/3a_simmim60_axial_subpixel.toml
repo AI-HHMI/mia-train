@@ -1,0 +1,122 @@
+# gary_comparison arm 3a: arm 1a's recipe -- `affinity_seg` with the sub-pixel head, ONE stage of 500k steps
+# on the colleague's split of the hemibrain Ellipsoid Body crop -- with the encoder initialised from THIS
+# experiment's own SimMIM pretraining instead of the released DINOv3 LVD-1689M checkpoint:
+#
+#   arm 2a (SSL, mask ratio 0.6, 500k steps on the census-20260920 lmd corpus, rotation-only augmentation)
+#   -> its final checkpoint, runs/gary__2a_simmim_lmd_mask60_20260920_154404/checkpoints/step_500000
+#
+# Requested 2026-09-22: "replicate the 1a-1b setup but start from the SSL-trained encoders". Every non-comment
+# line other than [init] and experiment_name is identical to 1a_dinov3_axial_subpixel.toml (`diff` proves it),
+# so 1a vs 3a is the value of in-domain SimMIM pretraining against natural-image pretraining, and 1b vs 3a the
+# value of SimMIM pretraining against no pretraining, at equal supervised budget. 3a vs 3b is the mask ratio.
+#
+# Launch with TORCHINDUCTOR_LAYOUT_OPTIMIZATION=0 exported (submit.sh does): compile + the head's 3-wide
+# voxel-resolution convolutions otherwise die at step 1 with a cuDNN SDPA stride error. Runs go to
+# --output-root /nrs/scicompsoft/orhane/mia-train-experiments/gary_comparison/runs (bare --resume scans it).
+experiment_name = "gary__3a_simmim60_axial_subpixel"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 256            # 16^3 = 4096 tokens at patch 16
+patch_size = 16
+in_chans = 1
+embed_dim = 1024          # ViT-L/16, 303M parameters
+depth = 24
+num_heads = 16            # head_dim 64; 64 % 6 = 4, so axial 3D RoPE leaves 4 channels unrotated
+n_storage_tokens = 4
+layerscale_init = 1.0e-05 # NOT optional: the released weights were trained with LayerScale
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+# Axial 3D RoPE, as in the SSL stage that produced this encoder (arms 2a/2b), so the pretrained
+# attention weights meet exactly the rotations they were trained with -- unlike arm 1a, whose
+# LVD weights had been fitted under a 2D layout.
+pos_embed_rope_type = "vanilla"
+# 0.0, as in arms 1a-1c: sample-level stochastic depth drops nothing at one sample per rank. The
+# SSL stage ran 0.1 at 16 samples per rank, where it was functional; that is a property of the
+# pretraining, not of this fine-tune.
+drop_path_rate = 0.0
+# torch SDPA (cuDNN on Hopper/Blackwell). FA4 is off because `[trainer].compile` below cannot be
+# combined with it, and it buys nothing at 4096 tokens anyway.
+use_fa4 = false
+
+[init]
+# The SSL encoder from arm 2a: a sharded (DCP) checkpoint of the whole SimMIM algorithm, whose encoder
+# lives under "model." -- the same handover lmd_ssl_v1's stage B made from its stage A. The prefix selects
+# those tensors and drops the SimMIM head; `strict` insists every encoder tensor is found. No inflation and
+# no `skip`: this is a 3D checkpoint with the same axial RoPE tables this model builds.
+path = "/nrs/scicompsoft/orhane/mia-train-experiments/gary_comparison/runs/gary__2a_simmim_lmd_mask60_20260920_154404/checkpoints/step_500000"
+prefix = "model."
+strict = true
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10           # nearest-neighbour offsets plus 10-voxel ones, as in every arm before
+decoder = "subpixel"
+decoder_hidden_dim = 256  # 2c's sub-pixel head, unchanged
+decoder_readout_dim = 16
+decoder_refine_depth = 2
+# FALSE because this head starts cold. With the output convolution zeroed (the default, right for
+# a warm start) the head emits a constant and NO gradient reaches the encoder at step 0; the repo's
+# three single-phase sub-pixel attempts on NISB collapsed onto the trivial "everything is connected"
+# predictor (init_comparison/README.md, "Why two phases"), and leaving the output open is its
+# documented remedy for a cold head. The collapse signature to watch for in the first ~1k steps:
+# training affinity accuracy tracking the batch's positive rate to three decimals.
+decoder_zero_init_output = false
+# Id 0 (3.7% of this volume; one train crop was 57% id 0) is BACKGROUND here: every pair touching
+# it is a cut and stays in the loss. Only -1 is ignored, and miao never emits -1. See README.md.
+split_disconnected = true
+
+[data]
+# z < 3000 of the crop, 75 G voxels, 8 nm, patch 256. The box, axes and resolution are pinned in
+# the YAML; verified 2026-09-16 (README.md, "Verification").
+name = "miao_volumes"
+config_path = "experiments/gary_comparison/data/hemibrain_eb_train.yaml"
+samples_per_epoch = 100000  # 12.5k steps per epoch at 8 ranks x batch 1: 40 worker respawns in 500k steps
+defer_image_ops = true
+
+[val_data]
+# 3000 <= z < 4000. The only place model selection or post-processing thresholds may be fitted;
+# the test corner is scored once.
+name = "miao_volumes"
+config_path = "experiments/gary_comparison/data/hemibrain_eb_val.yaml"
+samples_per_epoch = 32
+defer_image_ops = true
+
+[trainer]
+max_steps = 500000
+batch_size = 1            # per rank; x 8 ranks -> global batch 8
+lr = 0.0003
+warmup_steps = 5000
+min_lr_ratio = 0.001
+weight_decay = 0.05
+grad_clip_norm = 1.0
+layerwise_lr_decay = 1.0  # the stem must move: 0.9 x 0.2 once put patch_embed 696x below BANIS' LR
+patch_embed_lr_mult = 1.0
+lr_schedule = "linear"
+precision = "bf16"
+# Measured 2.30x on affinity_seg on B300 (eager B300 is launch-bound and slower than eager H200);
+# needs the SDPA kernel selected in [model].
+compile = true
+activation_checkpointing = false
+log_every = 1000
+val_every = 10000
+checkpoint_every = 50000
+num_workers = 8
+seed = 0
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8              # one full node
+tp = 1
+
+[augment]
+# BANIS' defaults, byte-identical to every lmd_ssl_v1 arm and to sam_lmd_v1, so augmentation is
+# not a confound against those lineages.
+rotate = "inplane"
+drop_slice_prob = 0.05
+shift_slice_prob = 0.05
+shift_magnitude = 10
+intensity = true
+mul_intensity = 0.1
+add_intensity = 0.1
+noise_scale = 0.5

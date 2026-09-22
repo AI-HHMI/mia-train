@@ -30,13 +30,14 @@ run=$(ls -dt "$RUNS"/sam1__${ARM}_r${ROUND}_*/ 2>/dev/null | head -1) || true
 [[ -n "${run:-}" ]] || { echo "no run matching sam1__${ARM}_r${ROUND}_*" >&2; exit 1; }
 run=${run%/}
 [[ -n "$STEP" ]] || STEP=$(ls -d "$run"/checkpoints/step_* | sed 's|.*step_||' | sort -n | tail -1)
-ART="$STAGE/eval/${ARM}_r${ROUND}"
+ART="${ART_DIR:-$STAGE/eval/${ARM}_r${ROUND}}"        # ART_DIR: score another artifact directory of this run,
+                                                        # e.g. the 256-lattice crop of a 128-window arm (crop_artifacts.py)
 for half in test finetune; do
   n=$(ls -d "$ART/$half"/*.zarr 2>/dev/null | grep -vc '\.gt\.zarr$' || true)
   [[ "$n" -eq 4 ]] || { echo "$ART/$half holds $n prediction artifacts, expected 4 -- run predict_eval.sh first" >&2; exit 1; }
 done
 LABEL="sam1_${ARM}_r${ROUND}_step${STEP}"
-SCRATCH="$STAGE/score/${ARM}_r${ROUND}"
+SCRATCH="${SCRATCH_DIR:-$STAGE/score/${ARM}_r${ROUND}}"
 mkdir -p "$SCRATCH" "$LOGS"
 
 cmd="export OMP_NUM_THREADS=16 NUMBA_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHONPATH=$EVALS/src; cd $EVALS && \

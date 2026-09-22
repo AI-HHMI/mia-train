@@ -87,6 +87,16 @@ print(" ".join(f"--override algorithm.{k}={toml(v)}" for k, v in LABEL_AMG.items
 PY
 )
 OVERRIDES+=" --override algorithm.points_per_batch=$batch"
+# The window the model trained at decides the GT split copy and the click grid: RoPE normalises
+# coordinates by the runtime grid, so a model MUST be labelled with its training crop. The
+# labeller's defaults are a 256-voxel window and 14 clicks per side; another crop keeps the click
+# spacing (256/14 = 18.3 voxels): 7 per side at 128, 19 at 352.
+CROP=$("$VENV/bin/python" -c "import json,sys; print(int(json.load(open(sys.argv[1]))['model']['kwargs'].get('img_size', 256)))" "$run/resolved_config.json")
+if [[ "$CROP" != 256 ]]; then
+  PPS=$(( (14 * CROP + 128) / 256 ))
+  OVERRIDES=${OVERRIDES//points_per_side=14/points_per_side=$PPS}
+  echo "window $CROP voxels -> $PPS clicks per side, crop$CROP split copies"
+fi
 echo "run   $run"
 echo "step  $STEP"
 echo "mask stride $stride voxels -> points_per_batch $batch, memory x$mem_scale"
@@ -111,6 +121,10 @@ for half in "${HALVES[@]}"; do
     finetune) config="$REPO/experiments/lmd_ssl_v1/lmd_finetune_singlescale.yaml" ;;
     *) echo "--half must be test or finetune, got $half" >&2; exit 2 ;;
   esac
+  if [[ "$CROP" != 256 ]]; then                  # the split copy with this window's patch_size
+    config="$REPO/experiments/sam_lmd_v1/data/lmd_${half/test/val}_singlescale_crop${CROP}.yaml"
+    [[ -f "$config" ]] || { echo "missing $config: run make_configs.py" >&2; exit 1; }
+  fi
   out="$STAGE/eval/${ARM}_r${ROUND}/$half"
   mkdir -p "$out" "$LOGS"
   volumes=$(grep '^- name: ' "$config" | sed 's/^- name: //')

@@ -50,6 +50,18 @@ for ARM in "${ARMS[@]}"; do
   NEWEST=$(ls -d "$run"/checkpoints/step_* | sed 's|.*step_||' | sort -n | tail -1)
   STEP=${STEP:-$NEWEST}                   # STEP=50000 probes an older checkpoint of the same run
   [[ -d "$run/checkpoints/step_$STEP" ]] || { echo "no checkpoints/step_$STEP in $run" >&2; exit 1; }
+  # The window the model trained at decides the GT split copy and the click grid: RoPE normalises
+  # coordinates by the runtime grid, so a model MUST be labelled with its training crop. The
+  # labeller's defaults are a 256-voxel window and 14 clicks per side; another crop keeps the click
+  # spacing (256/14 = 18.3 voxels): 7 per side at 128, 19 at 352.
+  CROP=$("$VENV/bin/python" -c "import json,sys; print(int(json.load(open(sys.argv[1]))['model']['kwargs'].get('img_size', 256)))" "$run/resolved_config.json")
+  ARM_GT=$GT_CONFIG; PPS_FLAG=""
+  if [[ "$CROP" != 256 ]]; then
+    ARM_GT="experiments/sam_lmd_v1/data/lmd_finetune_singlescale_crop${CROP}.yaml"
+    [[ -f "$ARM_GT" ]] || { echo "missing $ARM_GT: run make_configs.py" >&2; exit 1; }
+    PPS_FLAG=" --points-per-side $(( (14 * CROP + 128) / 256 ))"
+    echo "window $CROP: GT config $ARM_GT,${PPS_FLAG#* --points-per-side } clicks per side"
+  fi
   OUT="$STAGE/probe/${ARM}_r${ROUND}_step${STEP}"
   mkdir -p "$OUT"
   echo "teacher $run step $STEP -> $OUT"
@@ -64,7 +76,7 @@ for ARM in "${ARMS[@]}"; do
     echo "echo \"element \${LSB_JOBINDEX:-1}: volume \$V on \$(hostname)\""
     echo "nvidia-smi --query-gpu=name --format=csv,noheader | head -1"
     echo "$VENV/bin/python experiments/sam_lmd_v1/calibration_probe.py probe '$run' --step $STEP --volume \"\$V\" \\"
-    echo "  --out '$OUT'/\"\$V\".npz --block $BLOCK --max-tiles $MAX_TILES --gt-config '$GT_CONFIG' --min-mask-voxels $MIN_MASK${POINTS_PER_BATCH:+ --points-per-batch $POINTS_PER_BATCH}"
+    echo "  --out '$OUT'/\"\$V\".npz --block $BLOCK --max-tiles $MAX_TILES --gt-config '$ARM_GT' --min-mask-voxels $MIN_MASK${POINTS_PER_BATCH:+ --points-per-batch $POINTS_PER_BATCH}${PPS_FLAG}"
   } > "$WORKER"
   FINAL="$STAGE/cmd/probe_${ARM}_r${ROUND}_step${STEP}_final.sh"
   { echo "#!/usr/bin/env bash"

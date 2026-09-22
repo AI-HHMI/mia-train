@@ -142,6 +142,8 @@ label transform, which nothing in the data path does today.
 | 1c | `1c_dinov3_axial_subpixel_1m.toml` | arm 1a trained twice as long: `max_steps` 1M and `checkpoint_every` 100k, nothing else changed (so the linear decay stretches to 1M). 1a vs 1c is the value of a longer schedule; submit with `WALL=168:00` |
 | 2a | `2a_simmim_lmd_mask60.toml` | **SSL only.** SimMIM pretraining of a 3D DINOv3 ViT-L/16 from random init on the census-20260920 lmd corpus (226 volumes), 500k steps at global batch 128 (16/rank, one B300 node), mask ratio 0.6, axial RoPE, SDPA + compile, in-plane rotation as the only augmentation; validates reconstruction on the hemibrain val slab. Created 2026-09-20 (written as 1M steps, cut to 500k before launch); submit with `WALL=336:00` |
 | 2b | `2b_simmim_lmd_mask85.toml` | arm 2a with `mask_ratio = 0.85`, nothing else (`diff` the two). 2a vs 2b, read through their eventual fine-tunes, is the value of a harder pretext task in 3D |
+| 3a | `3a_simmim60_axial_subpixel.toml` | arm 1a's recipe with `[init]` pointing at arm 2a's final SSL checkpoint (`prefix = "model."`, no inflation, no `skip`); every other non-comment line identical to 1a. 3a vs 1a: in-domain SimMIM against natural-image pretraining; 3a vs 1b: against no pretraining |
+| 3b | `3b_simmim85_axial_subpixel.toml` | the same from arm 2b's checkpoint. 3a vs 3b is the SSL mask ratio, read at equal supervised budget |
 
     bash experiments/gary_comparison/submit.sh 1a_dinov3_axial_subpixel            # 20-step smoke on 1 GPU, then the real run chained on done(smoke)
     bash experiments/gary_comparison/submit.sh --dry-run 1a_dinov3_axial_subpixel  # print the bsub lines, write the job scripts
@@ -179,6 +181,10 @@ Arm 1c (1M steps) submitted 2026-09-19 12:45 after 1a and 1b both scored better 
 and were still improving at 500k: smoke job 154373730, real run 154373731 chained on it, 168 h wall (1a's
 0.26 s/step puts 1M steps at ~72 h). Read its checkpoints against 1a's both by step and by remaining-schedule
 fraction: at step 500k it sits at half the peak LR where 1a had finished decaying.
+**Arm 1c finished 2026-09-22 15:15** (1M steps, 74.4 h, run `runs/gary__1c_dinov3_axial_subpixel_1m_20260919_124840`);
+val loss at 100k-multiples 0.132, 0.109, 0.099, 0.108, 0.127, 0.092, 0.125, 0.113, 0.117, 0.113 (32 crops, noisy).
+Scored at the **final checkpoint only**, by decision of 2026-09-22 (jobs 154398281-154398284; the 300k and 500k
+scorings that had been queued were cancelled before producing anything).
 
 ## SSL arms (2a, 2b): SimMIM pretraining on the lmd corpus
 
@@ -304,8 +310,24 @@ therefore take ~44 h: finish about Tue 2026-09-22 midday, with checkpoints landi
 warming; grad_norm spikes of 27-40 in warmup are clipped to 1.0 and match lmd 1a's early behaviour. `visible_l1`
 rises early (1.1 -> 1.9 / 2.3 by 2k): no loss constrains the visible patches, and the rotation-only NISB runs
 showed the same early rise before it fell.
+**Both SSL runs finished 2026-09-22** (2a 16:18, 2b 16:22; 48.6 h each; 365 samples/s at the end with
+`data_wait_frac` 0.04; checkpoints 100k..500k). Un-augmented val loss on the hemibrain slab (128 crops), 2a / 2b:
+10k 0.151 / 0.189, 50k 0.130 / 0.170, 100k 0.129 / 0.168, 200k 0.129 / 0.166, 300k 0.122 / 0.156, 400k 0.121 / 0.150,
+500k 0.123 / 0.155; final train loss 0.070 / 0.089. So with rotation-only augmentation the pretext loss kept
+improving until ~300-400k (7% for 2a, 12% for 2b between 50k and 400k) and was flat over the last 100k -- a later
+plateau than the 10-25k of every earlier run, but a plateau. The two arms' losses are not comparable with each other
+(different mask ratios); their value is decided by the supervised stage, which has not been launched.
 
-**The supervised stage, when it comes:** arm 1a's config with
+**The supervised stage (arms 3a, 3b), launched 2026-09-22:** arm 1a's config with
+`[init] path = "<SSL run>/checkpoints/step_500000"`, `prefix = "model."`, `strict = true` (the DCP checkpoint
+of the whole SimMIM algorithm holds the encoder under `model.`; the prefix selects it and drops the SimMIM head),
+no `inflate_2d_to_3d`, no `skip`, RoPE `vanilla` as in the SSL stage. 500k steps, global batch 8, BANIS' full
+augmentation, cold sub-pixel head with `decoder_zero_init_output = false`, so the step-1k collapse check of arm 1a
+applies. Compare with 1a and 1b at equal supervised steps (100k, 300k, 500k were scored for those).
+Submitted 2026-09-22 16:50: 3a smoke 154398315 -> real 154398316, 3b smoke 154398317 -> real 154398318, full
+gpu_b300 nodes, `WALL=96:00` like 1a/1b (0.26 s/step -> ~37 h).
+
+**The supervised stage, as originally sketched:** arm 1a's config with
 `[init] path = "<run>/checkpoints/step_<N>"`, `prefix = "model."`, `strict = true` (no `inflate_2d_to_3d`,
 no `skip`), RoPE already `vanilla`. Compare with 1a (LVD init) and 1b (scratch) at equal supervised steps,
 scored on the test corner as before.

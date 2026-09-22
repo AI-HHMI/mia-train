@@ -80,6 +80,20 @@ run=${run%/}
 NEWEST=$(ls -d "$run"/checkpoints/step_* | sed 's|.*step_||' | sort -n | tail -1)
 STEP=${STEP:-$NEWEST}                     # STEP=50000 scores an older checkpoint of the same run
 [[ -d "$run/checkpoints/step_$STEP" ]] || { echo "no checkpoints/step_$STEP in $run" >&2; exit 1; }
+# The window the model trained at decides the GT split copy and the click grid: RoPE normalises
+# coordinates by the runtime grid, so a model MUST be labelled with its training crop. The
+# labeller's defaults are a 256-voxel window and 14 clicks per side; another crop keeps the click
+# spacing (256/14 = 18.3 voxels): 7 per side at 128, 19 at 352.
+CROP=$("$VENV/bin/python" -c "import json,sys; print(int(json.load(open(sys.argv[1]))['model']['kwargs'].get('img_size', 256)))" "$run/resolved_config.json")
+if [[ "$CROP" != 256 ]]; then
+  [[ "$NM" == 8 ]] || { echo "a $CROP-voxel window is only generated at 8 nm" >&2; exit 2; }
+  GT_CONFIG="experiments/sam_lmd_v1/data/lmd_finetune_singlescale_crop${CROP}.yaml"
+  [[ -f "$GT_CONFIG" ]] || { echo "missing $GT_CONFIG: run make_configs.py" >&2; exit 1; }
+  PPS=$(( (14 * CROP + 128) / 256 ))
+  COMMON="--gt-config $GT_CONFIG --min-truth-voxels $FLOOR --min-mask-voxels $FLOOR --points-per-side $PPS"
+  FLAGS[single_tile]="${FLAGS[single_tile]//--block 288/--block $((CROP + 32))}"   # one window (+32) per single-window block
+  echo "window $CROP: GT config $GT_CONFIG, $PPS clicks per side, single-window blocks of $((CROP + 32))"
+fi
 OUT="$STAGE/assembly_sweep/${ARM}_step${STEP}"
 mkdir -p "$OUT" "$LOGS" "$STAGE/cmd"
 echo "teacher $run step $STEP -> $OUT"
