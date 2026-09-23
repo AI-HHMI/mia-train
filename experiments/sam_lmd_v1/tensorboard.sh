@@ -75,7 +75,7 @@ RUNS=$EXP/runs
 SMOKE=$EXP/smoke
 VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
-ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32 arm6_8nm_gb16_musam arm7_8nm_gb16_musam64 arm8_8nm_gb16_musam128 arm9_8nm_gb64_musam32_c128 arm10_8nm_gb8_musam128_c352)
+ARMS=(arm1_4nm arm2_4nm_gb16 arm3_p8 arm4_8nm_gb16 arm5_8nm_gb32 arm6_8nm_gb16_musam arm7_8nm_gb16_musam64 arm8_8nm_gb16_musam128 arm9_8nm_gb64_musam32_c128 arm10_8nm_gb8_musam128_c352 arm11_8nm_gb16_musam128_scratch arm12_8nm_gb16_musam128_sat493m)
 
 port_busy () { ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1$"; }
 if [[ "$MODE" != "--list" ]]; then

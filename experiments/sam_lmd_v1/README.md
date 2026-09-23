@@ -27,8 +27,8 @@ scale, the batch and the prompting recipe (below).
     bash experiments/sam_lmd_v1/predict_eval.sh feat64 0              # eight volumes -> instances
     bash experiments/sam_lmd_v1/score.sh feat64 0                     # -> the leaderboard table
 
-**Status (2026-09-22; version 4: arms 1-9 done and scored, arms 3-9 on the leaderboard, arm 10
-training).** Nine arms on the encoder's scale, the batch size and the training
+**Status (2026-09-23; version 4: arms 1-9 done and scored, arms 3-9 on the leaderboard, arms 10,
+11 and 12 training).** Nine arms on the encoder's scale, the batch size and the training
 recipe (below); version 3's single arm is superseded and its round-0 checkpoints remain for
 reference. **Arm 8 (128 objects per crop, click pairs, mask feedback) leads the
 `lmd_ssl_v1_neuron_instance` leaderboard at pq 0.2786, arm 7 (64 objects) is second at 0.2591, both
@@ -492,6 +492,8 @@ layout, so the arms compare with each other and not with version 3.
 | 7 | `arm7_8nm_gb16_musam64_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | as arm 6 with 64 objects/crop |
 | 9 | `arm9_8nm_gb64_musam32_c128_r0.toml` | 8 nm | 16 | 512 | 128 nm | 32 nm | **1 um (128^3 crops)** | 64 (8 per rank), 16 workers; 32 object slots, click pairs, mask fed back at p = 0.5 |
 | 10 | `arm10_8nm_gb8_musam128_c352_r0.toml` | 8 nm | 16 | 10,648 | 128 nm | 32 nm | **2.8 um (352^3 crops)** | 8 (1 per rank), 16 workers; arm 8's 128 object slots, click pairs, mask fed back at p = 0.5 |
+| 11 | `arm11_8nm_gb16_musam128_scratch_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | as arm 8, **random encoder** (no `[init]`) |
+| 12 | `arm12_8nm_gb16_musam128_sat493m_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | as arm 8, **encoder from DINOv3 SAT-493M** (satellite images) |
 | 8 | `arm8_8nm_gb16_musam128_r0.toml` | 8 nm | 16 | 4,096 | 128 nm | 32 nm | 2 um | as arm 7 with 128 objects/crop |
 
 Arms 1 and 3 put the same 64 nm token and 16 nm cell on the tissue and differ in field of view
@@ -609,7 +611,31 @@ error; the GPU peak was not logged. Measured 1.91 s/step at MFU 0.14 (arm 8's MF
 smoke-tested first: its 128^3 mask grid is arm 3's, so it needs 32 object slots to stay within the
 decoder budget; at that setting it fits a B300 and costs 958 TFLOP per step per rank (2.2x arm 8).
 It was retired for the 352 arm because it could not include kasthuri. As with arm 9, this model
-must be labelled and evaluated with 352-voxel windows; the scoring scripts do not support that yet.
+must be labelled and evaluated with 352-voxel windows: the scoring scripts read the window from the run
+(see Scoring), and its artifacts need the common-region crop before its leaderboard row is comparable
+(see arm 9 on the leaderboard).
+
+**Arms 11 and 12: arm 8 from a random encoder and from the satellite checkpoint** (configs written
+and launched 2026-09-23 on gpu_b300; smokes 154399975 / 154399977, full runs 154399976 /
+154399978 held on them). Everything is arm 8's except where the encoder starts. Arm 11 has no
+`[init]` section: `dinov3_vit3d` keeps the random weights its constructor gives it, and the promptable
+head needs no change for that because its mask-feature projection is not zero-initialised; arm 8 vs
+arm 11 is the value of the pretrained weights for this task (gary_comparison's 1a vs 1b measured it
+for the affinity head: mws pq 0.164 vs 0.153 at 500k steps). Arm 12 loads the DINOv3 ViT-L/16 Meta
+released for SAT-493M (satellite imagery) instead of LVD-1689M (natural images); arm 8 vs arm 12 asks
+whether the spatial statistics of the pretraining images carry into EM. The SAT checkpoint is not
+quite the same architecture: Meta's builder sets `untie_global_and_local_cls_norm` for these weights
+only, adding a LayerNorm (`local_cls_norm`, two tensors) that upstream applies only to the local
+crops of self-supervised training and never at evaluation. Arm 12 therefore keeps arm 8's model
+block and adds `local_cls_norm.` to `[init].skip`; without it strict loading fails on exactly those
+two tensors. Verified through the training code path (`probes/init-checkpoint-load/` under the
+experiment root): both checkpoints load as 366 copied tensors plus the inflated patch kernel with
+nothing unused, no shared tensor differs in shape, and the only bit-identical tensors are constants.
+One asymmetry is kept on purpose: Meta normalises SAT input with unequal channel spreads (std
+0.213 / 0.156 / 0.143) where LVD's ImageNet spreads are nearly equal, and every arm here feeds raw
+[0, 1] grayscale to an equally RGB-averaged kernel, so that average is close to LVD's effective
+grayscale kernel but weights red more than SAT's; both arms see identical input and the first layer
+is fine-tuned from step 1. `make_configs.py` arms take `init = "lvd" | "sat" | "scratch"`.
 
 **Ceilings at the 4 nm lattice** (`pseudolabel.py oracle`, perfect masks, 2026-09-14; the
 reference for every arm-1/arm-2 number): single 1 um windows precision 0.885 / recall 0.988 pooled

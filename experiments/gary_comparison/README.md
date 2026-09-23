@@ -326,6 +326,11 @@ augmentation, cold sub-pixel head with `decoder_zero_init_output = false`, so th
 applies. Compare with 1a and 1b at equal supervised steps (100k, 300k, 500k were scored for those).
 Submitted 2026-09-22 16:50: 3a smoke 154398315 -> real 154398316, 3b smoke 154398317 -> real 154398318, full
 gpu_b300 nodes, `WALL=96:00` like 1a/1b (0.26 s/step -> ~37 h).
+Smokes passed (209 s; the loader copied all 368 encoder tensors from each SSL checkpoint, none kept at initial value,
+none unused). Real runs dispatched 17:00 (3a on i04u22, 3b on i01u22), 30 samples/s like 1a. **Collapse check:** both sat
+on the trivial predictor at steps 1k and 2k (boundary accuracy < 0.002, where 1a had 0.07 at 2k) and escaped by 3k
+(boundary accuracy 0.37 / 0.41, affinity accuracy 0.910 vs positive rate 0.893) -- the same escape as 1a/1b, about a
+thousand steps later. Expected finish ~Thu 2026-09-24 morning.
 
 **The supervised stage, as originally sketched:** arm 1a's config with
 `[init] path = "<run>/checkpoints/step_<N>"`, `prefix = "model."`, `strict = true` (no `inflate_2d_to_3d`,
@@ -353,6 +358,14 @@ then a size filter swept over 0/500/5k/20k/50k voxels) and `cc_threshold` (thres
 logits 0/3/6 crossed with the same filter), the second being the cheap baseline that says what the
 long-range channels buy. Predictions run on gpu_b300, like the training, because instance counts
 differ across GPU generations.
+
+**Scoring cost.** Until 2026-09-23 an mws record took 4.5 to 6 hours on one core, because mia-evals' in-memory
+watershed ran its pure-Python reference loop. It now runs the compiled kernel: about 20 minutes per 896^3 block
+when the job has its node to itself, so about an hour per record against about 40 minutes for cc_threshold. A
+second memory-heavy job on the same node made the watershed two to five times slower, so request a whole node.
+All seven mws records were re-scored with the new code (probe `/nrs/scicompsoft/orhane/probes/mws_compiled_rescore/`,
+`results.md`): every pq, fitted size filter and scored partition identical, VOI within 6e-15 because the labels
+are numbered differently and VOI sums in label order. The committed records were left as they are.
 
 Records are named `<run>.step<N>.<route>`, e.g.
 `gary__1a_dinov3_axial_subpixel_20260916_215544.step500000.mws`, so a row names its checkpoint
@@ -392,6 +405,23 @@ cc record logit +6 with min_size 5000, except 1b at 100k which chose 20000):
   surviving fragment, and 20000 voxels (10 um^3) was the fitted floor at every step. Numbers are comparable
   within this table and with anything scored on the same 896^3 region and metric; the colleague's protocol
   is still to be confirmed (see below).
+
+**Arm 1c: 1M steps, final checkpoint only (scored 2026-09-22).** Against arm 1a's last checkpoint, which had the
+same recipe and half the schedule:
+
+| record | route | test pq | VOI merge | VOI split | adapted Rand error | chosen on the fit block |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| 1c at 1M | mws | **0.1665** | 0.433 | 0.924 | 0.216 | min_size 20000 |
+| 1a at 500k | mws | 0.1636 | 0.421 | 0.954 | 0.222 | min_size 20000 |
+| 1c at 1M | cc_threshold | 0.1295 | 3.316 | 0.756 | 0.885 | logit +3, min_size 500 |
+| 1a at 500k | cc_threshold | 0.1184 | 1.525 | 1.204 | 0.728 | logit +6, min_size 5000 |
+
+- **Twice the schedule buys a little under the watershed**: +0.003 pq, from fewer splits (VOI split 0.954 -> 0.924)
+  with merges about equal. 1c is the task's top row. One seed and one test block, so a gap this size is not
+  separable from run-to-run variation without a second seed; 1c at 500k was deliberately not scored.
+- **The cc_threshold gain is a different operating point, not a better model.** The fit block chose a lower
+  threshold (logit +3 against +6) and a smaller size filter, which trades merges for fragments: pq rose, but VOI
+  merge more than doubled and adapted Rand error worsened. Compare that row on pq only with care.
 
 Records: `leaderboard/gary_comparison_neuron_instance/` in mia-evals; scored labellings under
 `/nrs/scicompsoft/orhane/mia-evals/gary_comparison_neuron_instance/scored/<record>/`.

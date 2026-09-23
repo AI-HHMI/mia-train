@@ -91,9 +91,6 @@ weight = 1.0
 normalize = true
 
 [trainer]
-# 100k rather than the control's 300k: the encoder is already trained, and `max_steps` sets the
-# shape of the cosine, so quoting a horizon the run will not reach would leave the LR near its
-# peak for the whole run -- the mistake that made the control's early checkpoints hard to read.
 max_steps = 100000
 batch_size = 1            # per rank; 8 ranks -> global batch 8, matching the control exactly
 lr = 3.0e-4
@@ -104,8 +101,6 @@ grad_clip_norm = 1.0
 layerwise_lr_decay = 1.0
 patch_embed_lr_mult = 1.0
 lr_schedule = "cosine"
-# Off, as in the control. The sub-pixel head holds roughly a quarter of the interpolating head's
-# activations, so this has more headroom than the control did, not less.
 activation_checkpointing = false
 precision = "bf16"
 log_every = 100
@@ -120,9 +115,4 @@ dp_shard = 8
 tp = 1
 
 [augment]
-# Rotation moved here from the data YAML's per-volume `aug_rot`, which miao removed. "inplane"
-# draws from the 16 transforms that never exchange z with x or y; the full 48-transform group is
-# refused against this data's 9x9x20 nm voxels, since exchanging axes of unequal size produces
-# object shapes that do not occur in the specimen. Same augmentation as before, stated in the run
-# rather than per volume.
 rotate = "inplane"

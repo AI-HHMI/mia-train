@@ -31,6 +31,8 @@ PREFIX = "sam1__"                          # experiment_name prefix, used by the
 
 DINOV3_LVD = ("/groups/miaai/miaai/pretrained_models/dinov3/"
               "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth")
+DINOV3_SAT = ("/groups/miaai/miaai/pretrained_models/dinov3/"
+              "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth")  # the same ViT-L/16, SAT-493M satellite imagery
 
 # ---- the protocol, copied from lmd_ssl_v1 -------------------------------------------------------
 #
@@ -67,7 +69,7 @@ embed_dim = 1024          # ViT-L/16, 303M parameters
 depth = 24
 num_heads = 16
 n_storage_tokens = 4
-layerscale_init = 1.0e-05 # NOT optional: the released weights were trained with LayerScale
+layerscale_init = 1.0e-05 # %(layerscale_note)s
 mask_k_bias = true
 pos_embed_rope_dtype = "fp32"
 %(rope_note)s
@@ -91,6 +93,51 @@ inflate_2d_to_3d = true
 skip = ["rope_embed."]    # derived from `base` in init_weights; 2D and 3D split channels apart
 strict = true
 '''
+
+INIT_SAT = f'''[init]
+path = "{DINOV3_SAT}"
+# The 2D (1024,3,16,16) patch kernel, averaged over RGB and spread over z; for a patch smaller than
+# the checkpoint's 16 it is then pseudo-inverse resized (block sums), see utils.pretrained.
+inflate_2d_to_3d = true
+# `rope_embed.` as for LVD: derived from `base` in init_weights; 2D and 3D split channels apart.
+# `local_cls_norm.`: these weights were trained with untie_global_and_local_cls_norm (Meta's
+# dinov3_vitl16 builder sets it for SAT-493M only), so the checkpoint carries one LayerNorm the LVD
+# model lacks. Upstream applies it only to the local crops of self-supervised training ("never used
+# during eval"); a fine-tune never calls it, so the model keeps arm 8's architecture exactly and
+# those two tensors are skipped rather than given a home that nothing would use.
+skip = ["rope_embed.", "local_cls_norm."]
+strict = true
+# Meta normalises this model's RGB input with satellite statistics (mean 0.430/0.411/0.296, std
+# 0.213/0.156/0.143) where LVD uses ImageNet's. Neither is applied here: every arm feeds the
+# RGB-averaged kernel the same single-channel [0, 1] EM intensities, so both checkpoints see
+# identically prepared input.
+'''
+
+# An arm with `init="scratch"` has no [init] table at all: the encoder keeps the random weights its
+# constructor gives it. What the config says in its place:
+INIT_SCRATCH = '''# No [init] section: the encoder starts from RANDOM weights. That is the only difference from arm 8,
+# which loads the released DINOv3 LVD-1689M checkpoint here. dinov3_vit3d initialises itself in its
+# constructor (`init_weights`: truncated-normal linear layers with zero biases, normal-initialised cls
+# and storage tokens, RoPE periods from `base`), exactly as it does in the other arms before their
+# checkpoint overwrites it. The promptable head is random in every arm and needs nothing here: its
+# mask-feature projection is not zero-initialised (`algorithms/promptable/decoder.py`), so gradient
+# reaches the encoder from the first step.
+'''
+
+LAYERSCALE_NOTES = {
+    "lvd": "NOT optional: the released weights were trained with LayerScale",
+    "scratch": "kept identical to arm 8 (there its value is dictated by the checkpoint)",
+}
+LAYERSCALE_NOTES["sat"] = LAYERSCALE_NOTES["lvd"]
+
+ROPE_NOTES_SCRATCH = {
+    "vanilla": (
+        "# 3D AXIAL RoPE (version 4): each axis owns a third of the rotary channels. From a random "
+        "encoder this\n# is simply the natural 3D form, with none of the pretrained arms' tension "
+        "against a 2D checkpoint's\n# channel layout; it is kept identical to arm 8 so that only "
+        "the initialisation differs."
+    ),
+}
 
 ROPE_NOTES = {
     "superposition": (
@@ -279,6 +326,28 @@ ARMS: list[dict] = [
                "with probability 0.5) on 352^3 crops (2.8 um, 10648 tokens), the largest cube "
                "kasthuri15 can supply, at one crop per rank (global batch 8); 8 nm, patch 16, "
                "3D axial RoPE."),
+    # Arm 8 with a RANDOM encoder (2026-09-23): no [init] section and nothing else changed, so arm 8
+    # vs arm 11 is the value of the DINOv3 LVD-1689M weights for this task -- what gary_comparison's
+    # 1a vs 1b measured for the affinity head (mws pq 0.149 vs 0.140 at 100k steps, 0.164 vs 0.153 at
+    # 500k). Same compute as arm 8, so the same 3x wall in submit.sh.
+    dict(name="arm11_8nm_gb16_musam128_scratch",
+         knobs={"mask_feature_dim": 64, "masks_per_sample": 128, "correction_pairs": True,
+                "mask_prompt_prob": 0.5},
+         rope="vanilla", batch=2, rounds=0, init="scratch",
+         blurb="version 4 arm 11: arm 8 from a random encoder instead of the DINOv3 LVD-1689M "
+               "checkpoint; otherwise identical (128 objects per crop, click pairs, mask fed back "
+               "with probability 0.5, 8 nm, patch 16, global batch 16, 3D axial RoPE)."),
+    # Arm 8 from the SATELLITE checkpoint (2026-09-23): the DINOv3 ViT-L/16 Meta released for SAT-493M
+    # instead of LVD-1689M, loaded, inflated and fine-tuned exactly as arm 8's. Arm 8 vs arm 12 asks
+    # whether the spatial statistics of the pretraining images (satellite vs natural) carry into EM;
+    # arm 11 (random encoder) is the floor both stand on. Same compute, same 3x wall in submit.sh.
+    dict(name="arm12_8nm_gb16_musam128_sat493m",
+         knobs={"mask_feature_dim": 64, "masks_per_sample": 128, "correction_pairs": True,
+                "mask_prompt_prob": 0.5},
+         rope="vanilla", batch=2, rounds=0, init="sat",
+         blurb="version 4 arm 12: arm 8 from the DINOv3 SAT-493M (satellite) checkpoint instead of "
+               "LVD-1689M; otherwise identical (128 objects per crop, click pairs, mask fed back "
+               "with probability 0.5, 8 nm, patch 16, global batch 16, 3D axial RoPE)."),
     dict(name="arm5_8nm_gb32", knobs={"mask_feature_dim": 64}, rope="vanilla", batch=4, rounds=0,
          workers=16,
          blurb="version 4 arm 5: as arm 4 at four crops per rank, global batch 32. 16 dataloader "
@@ -460,11 +529,18 @@ def render(arm: dict, round_index: int) -> str:
     batch = arm.get("batch", BATCH_PER_RANK)
     workers = arm.get("workers", WORKERS)
     crop = arm.get("crop", 256)
+    start = arm.get("init", "lvd")   # "lvd" / "sat": a released DINOv3 ViT-L/16; "scratch": random
     model = MODEL % dict(patch=patch, crop=crop, grid=crop // patch, tokens=(crop // patch) ** 3,
-                         rope=rope, rope_note=ROPE_NOTES[rope])
+                         rope=rope,
+                         rope_note=(ROPE_NOTES_SCRATCH if start == "scratch" else ROPE_NOTES)[rope],
+                         layerscale_note=LAYERSCALE_NOTES[start])
     if round_index == 0:
-        steps, lr, init = R0_STEPS, LR_R0, INIT_LVD
-        what = (f"round 0 -- ground truth only. From the released DINOv3 LVD-1689M checkpoint, "
+        steps, lr = R0_STEPS, LR_R0
+        init = {"lvd": INIT_LVD, "sat": INIT_SAT, "scratch": INIT_SCRATCH}[start]
+        origin = {"lvd": "From the released DINOv3 LVD-1689M checkpoint",
+                  "sat": "From the released DINOv3 SAT-493M checkpoint (satellite imagery)",
+                  "scratch": "From a RANDOM encoder (no [init] section)"}[start]
+        what = (f"round 0 -- ground truth only. {origin}, "
                 f"{R0_STEPS // 1000}k steps at lmd_ssl_v1 stage B's schedule. This is the arm-2 "
                 f"analogue, and the teacher of round 1.")
     else:
