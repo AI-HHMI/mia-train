@@ -6,6 +6,8 @@
 #   bash experiments/gary_comparison/submit.sh --smoke 1a_dinov3_axial_subpixel     # smoke only
 #   bash experiments/gary_comparison/submit.sh --no-smoke 1a_dinov3_axial_subpixel  # real run only; resubmitting after a
 #                                                                                   # wall-time kill continues via --resume
+#   GPUS=2 SMOKE_GPUS=2 WALL=240:00 bash experiments/gary_comparison/submit.sh 5a_dinov3_axial_unetr
+#                                   # fewer GPUs than a node: GPUS must equal the config's dp_replicate x dp_shard x tp
 #
 # Everything this writes lands in this experiment's directory on /nrs, in the two places the layout
 # of 2026-09-16 provides: jobs/ (LSF logs and the generated job scripts) and runs/ (run directories
@@ -24,8 +26,9 @@ LOGS=$EXP/jobs                      # LSF logs AND the generated job scripts
 SMOKE_LOGS=$LOGS/smoke              # the smoke's config, script and logs
 SMOKE_RUNS=$RUNS/smoke              # the smoke's run directories
 QUEUE=${QUEUE:-gpu_b300}
-GPUS=8
-SLOTS=96                            # 12 slots/GPU on gpu_b300
+GPUS=${GPUS:-8}                     # the real run's GPUs: must equal the config's dp_replicate x dp_shard x tp
+SLOTS=$((12 * GPUS))                # 12 slots/GPU on gpu_b300
+SMOKE_GPUS=${SMOKE_GPUS:-1}         # the smoke's GPUs; its derived config gets dp_shard = SMOKE_GPUS
 # 500k steps at the expected 0.15-0.22 s/step (2c's 0.27 s on Hopper eager, B300 compiled measured
 # 0.12 s single-GPU, ~1.6x that under 8-rank FSDP) is 21-31 h; 96 h tolerates a 3x slower step.
 # `-r` plus `--resume` turns a node failure into a requeue from the last checkpoint.
@@ -85,16 +88,17 @@ submit () {
 
 SMOKE_ID=""
 if [[ $SMOKE -eq 1 ]]; then
-  # 20 steps on one GPU, straight from the real config, so the smoke exercises what actually runs
+  # 20 steps on SMOKE_GPUS GPUs (default 1), straight from the real config, so the smoke exercises
+  # what actually runs; SMOKE_GPUS=GPUS also exercises the real run's sharding and checkpointing
   smoke_cfg="$SMOKE_LOGS/smoke_$NAME.toml"
   sed -e "s/^experiment_name = .*/experiment_name = \"smoke_gary__$NAME\"/" \
       -e 's/^max_steps = .*/max_steps = 20/'     -e 's/^warmup_steps = .*/warmup_steps = 2/' \
       -e 's/^val_every = .*/val_every = 10/'     -e 's/^checkpoint_every = .*/checkpoint_every = 20/' \
-      -e 's/^samples_per_epoch = .*/samples_per_epoch = 20/' -e 's/^dp_shard = .*/dp_shard = 1/' \
+      -e 's/^samples_per_epoch = .*/samples_per_epoch = 20/' -e "s/^dp_shard = .*/dp_shard = $SMOKE_GPUS/" \
       -e 's/^num_workers = .*/num_workers = 2/'  -e 's/^log_every = .*/log_every = 5/' \
       "$CONFIG" > "$smoke_cfg"
-  cmd=$(write_cmd "$SMOKE_LOGS" "smoke_$NAME" "$smoke_cfg" 1 --output-root "$SMOKE_RUNS")
-  SMOKE_ID=$(submit "$SMOKE_LOGS" "smoke_$NAME" "$cmd" 1 12 2:00)   # 2 h: opening a 226-volume corpus takes minutes
+  cmd=$(write_cmd "$SMOKE_LOGS" "smoke_$NAME" "$smoke_cfg" "$SMOKE_GPUS" --output-root "$SMOKE_RUNS")
+  SMOKE_ID=$(submit "$SMOKE_LOGS" "smoke_$NAME" "$cmd" "$SMOKE_GPUS" $((12 * SMOKE_GPUS)) 2:00)   # 2 h: opening a 226-volume corpus takes minutes
   echo "smoke  $NAME: job $SMOKE_ID  ($cmd)"
 fi
 if [[ $REAL -eq 1 ]]; then

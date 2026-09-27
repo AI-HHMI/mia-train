@@ -1,4 +1,4 @@
-"""Unit tests for the dense prediction heads: interpolating and sub-pixel."""
+"""Unit tests for the dense prediction heads: interpolating, sub-pixel and UNETR."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import torch
 
-from layers.common.dense_heads import SubPixelHead, VoxelHead
+from layers.common.dense_heads import SubPixelHead, UNETRHead, VoxelHead
 
 IN_DIM = 8
 PATCH = (4, 4, 4)
@@ -288,3 +288,103 @@ def test_an_overlapping_expansion_is_refused_rather_than_silently_wrong():
             SubPixelHead(in_dim=4, patch_size=(4, 4, 4), out_channels=2, hidden=4, readout=2)
     finally:
         dense_heads.CONV_TRANSPOSE[3] = nn.ConvTranspose3d
+
+
+# ---------------------------------------------------------------------------------------- UNETR
+
+
+def _unetr(patch: int = 8, rank: int = 3, **overrides) -> UNETRHead:
+    kwargs: dict[str, Any] = dict(
+        in_dim=IN_DIM, patch_size=(patch,) * rank, out_channels=OUT, widths=None,
+        zero_init_output=False,
+    )
+    kwargs.update(overrides)
+    torch.manual_seed(0)
+    return UNETRHead(**kwargs)
+
+
+def _unetr_inputs(head: UNETRHead, grid: tuple[int, ...], batch: int = 2):
+    features = [torch.randn(batch, IN_DIM, *grid, requires_grad=True) for _ in range(head.levels)]
+    size = tuple(g * p for g, p in zip(grid, head.patch_size, strict=True))
+    image = torch.randn(batch, 1, *size, requires_grad=True)
+    return features, image, size
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("patch, levels", [(2, 1), (4, 2), (8, 3), (16, 4)])
+def test_unetr_takes_one_x2_stage_per_power_of_two_of_the_patch(patch, levels) -> None:
+    assert UNETRHead.levels_for((patch,) * 3) == levels
+    head = _unetr(patch)
+    assert head.levels == levels and head.widths == tuple(16 * 2**k for k in range(levels))
+
+
+@pytest.mark.unit
+def test_unetr_maps_token_grids_and_the_image_to_voxels() -> None:
+    head = _unetr(8)
+    features, image, size = _unetr_inputs(head, GRID)
+    out = head(features, image)
+    assert out.shape == (2, OUT, *size)
+
+
+@pytest.mark.unit
+def test_unetr_serves_two_dimensional_data() -> None:
+    head = _unetr(4, rank=2)
+    features, image, size = _unetr_inputs(head, (3, 5))
+    assert head(features, image).shape == (2, OUT, *size)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("patch", [(4, 4, 8), (12, 12, 12), (1, 1, 1)])
+def test_unetr_refuses_a_patch_its_x2_stages_cannot_reach(patch) -> None:
+    with pytest.raises(ValueError, match="power-of-two"):
+        UNETRHead(in_dim=IN_DIM, patch_size=patch, out_channels=OUT)
+
+
+@pytest.mark.unit
+def test_unetr_refuses_widths_that_do_not_match_its_stages() -> None:
+    with pytest.raises(ValueError, match="widths"):
+        UNETRHead(in_dim=IN_DIM, patch_size=(8, 8, 8), out_channels=OUT, widths=(4, 8))
+
+
+@pytest.mark.unit
+def test_unetr_refuses_the_wrong_number_of_encoder_layers() -> None:
+    head = _unetr(8)
+    features, image, _ = _unetr_inputs(head, GRID)
+    with pytest.raises(ValueError, match="fuses 3 encoder layers"):
+        head(features[:2], image)
+
+
+@pytest.mark.unit
+def test_unetr_refuses_an_image_that_is_not_whole_patches() -> None:
+    head = _unetr(8)
+    features, image, _ = _unetr_inputs(head, GRID)
+    with pytest.raises(ValueError, match="divisible by the patch size"):
+        head(features, image[..., :-1])
+
+
+@pytest.mark.unit
+def test_unetr_gradient_reaches_every_encoder_layer_and_the_image() -> None:
+    head = _unetr(8)
+    features, image, _ = _unetr_inputs(head, GRID)
+    head(features, image).square().mean().backward()
+    for index, feature in enumerate(features):
+        assert feature.grad is not None and feature.grad.abs().sum() > 0, f"layer {index}"
+    assert image.grad is not None and image.grad.abs().sum() > 0
+
+
+@pytest.mark.unit
+def test_unetr_without_the_image_skip_never_reads_the_image() -> None:
+    head = _unetr(8, image_skip=False)
+    assert head.image is None
+    features, image, _ = _unetr_inputs(head, GRID)
+    head(features, image).square().mean().backward()
+    assert image.grad is None
+    assert all(f.grad is not None and f.grad.abs().sum() > 0 for f in features)
+
+
+@pytest.mark.unit
+def test_unetr_zero_initialised_output_starts_constant() -> None:
+    head = _unetr(8, zero_init_output=True)
+    features, image, _ = _unetr_inputs(head, GRID)
+    out = head(features, image)
+    assert torch.equal(out, torch.zeros_like(out))

@@ -146,6 +146,8 @@ label transform, which nothing in the data path does today.
 | 3b | `3b_simmim85_axial_subpixel.toml` | the same from arm 2b's checkpoint. 3a vs 3b is the SSL mask ratio, read at equal supervised budget |
 | 4a | `4a_dinov3_axial_subpixel_p8.toml` | arm 1a at **patch 8**: `patch_size` 16 -> 8, every other non-comment line identical (64 nm tokens, 32,768 per 256^3 crop; the LVD patch kernel is resized to 8^3 by block sums). 4a vs 1a is the finer token with our own decoder. Created 2026-09-23 after the colleague's setup came to light (8 nm data, 8^3 patches, UNETR); submit with `WALL=240:00` |
 | 4b | `4b_dinov3sat_axial_subpixel_p8.toml` | arm 4a initialised from **SAT-493M** instead of LVD-1689M: only `[init].path` and `skip` (+ `local_cls_norm.`, as sam_lmd_v1 arm 12) differ. 4b vs 4a is the pretraining corpus at patch 8; submit with `WALL=240:00` |
+| 5a | `5a_dinov3_axial_unetr.toml` | arm 1a with the **UNETR decoder** (`decoder = "unetr"`: blocks 6/12/18/24, widths 16/32/64/128, raw-image skip), every other recipe line identical. Runs on **2 B300s x batch 4** instead of 8 x 1 (same global batch 8; `num_workers` 11): submit with `GPUS=2 SMOKE_GPUS=2 WALL=240:00`. 5a vs 1a is the decoder |
+| 5b | `5b_dinov3_axial_unetr_p8.toml` | arm 4a (patch 8) with the **UNETR decoder** (3 stages: blocks 8/16/24, widths 16/32/64, raw-image skip), every other non-comment line identical to 4a, one full B300 node; submit with `WALL=240:00` from the worktree. 5b vs 4a is the decoder at 64 nm tokens, 5b vs 5a the token size under UNETR |
 
     bash experiments/gary_comparison/submit.sh 1a_dinov3_axial_subpixel            # 20-step smoke on 1 GPU, then the real run chained on done(smoke)
     bash experiments/gary_comparison/submit.sh --dry-run 1a_dinov3_axial_subpixel  # print the bsub lines, write the job scripts
@@ -459,16 +461,29 @@ natural-image (1a) and scratch (1b) encoders at the same supervised step:
 - Arm 3a (mask ratio 0.6) was not scored, by decision of 2026-09-24. The mws scoring took 55 minutes on the compiled
   watershed.
 
+**Arms 4a/4b/5a/5b: patch 8 and the UNETR decoder (scored 2026-09-26, mws only).** 5a at its final step; 4b
+at step 450000, its newest checkpoint when 4a and 4b were stopped at ~481k; 4a and 5b (stopped at ~261k) not
+scored.
+
+| record | test pq | SQ | RQ | matched | false | VOI split | VOI merge | adapted Rand error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1a, LVD-1689M, 500k (control) | 0.1636 | 0.846 | 0.193 | 333 | 305 | 0.954 | 0.421 | 0.222 |
+| 5a, UNETR decoder, 500k | 0.1682 | 0.850 | 0.198 | 348 | 362 | 0.912 | 0.398 | 0.206 |
+| 4b, patch 8 + SAT-493M, 450k | **0.1711** | 0.856 | 0.200 | 345 | 301 | 0.933 | 0.387 | 0.217 |
+| the colleague's (identity route) | 0.2933 | 0.784 | 0.374 | >= 646 | ? | 0.792 | 0.368 | 0.175 |
+
+- The UNETR decoder improves the voxel-weighted metrics most (VOI split -4.5%, merge -5.4%, adapted Rand error
+  -7.1% against 1a), a third of their gap to the colleague; patch 8 lowers VOI merge and the false objects.
+  Neither moves recognition: every arm so far matches 325-348 of the 2,806 test objects against the colleague's
+  >= 646 (from his RQ), so the pq gap sits in something all arms share (targets, offsets, mws + size filter, or
+  the evaluation setup), not in the decoder, the token size or the initialisation.
+- The training-set boundary accuracy that put 5a ahead (0.860 against 0.82-0.83) does not survive validation:
+  over their last five evaluations all five arms average 0.811-0.815.
+- 4a, 4b and 5b were stopped by decision of 2026-09-26. The UNETR decoder (`decoder = "unetr"` in
+  `affinity_seg`) is on master since the same day.
+
 Records: `leaderboard/gary_comparison_neuron_instance/` in mia-evals; scored labellings under
 `/nrs/scicompsoft/orhane/mia-evals/gary_comparison_neuron_instance/scored/<record>/`.
-
-## Still to get from the colleague
-
-- The axis-order reading of his boxes (see the assumption above).
-- Which voxels he scored (the whole 1000^3 corner or a sub-box), and with which metric (voxel
-  panoptic quality / VOI as mia-evals reports, or something skeleton-based).
-- Whether his models saw any data beyond the train box (pretraining corpora, other volumes), so the
-  comparison can be framed as same-data or not.
 
 ## Next
 
@@ -476,3 +491,14 @@ Models. Nothing here presupposes an architecture; the natural first arm is the `
 recipe (released DINOv3 ViT-L/16 inflated to 3D, `affinity_seg`, two-stage interpolate -> sub-pixel
 head) pointed at these YAMLs, since that is the best-scored affinity lineage in this repo and its
 configs need only the two `config_path` lines changed.
+
+Arm 5a (UNETR decoder, branch `unetr-decoder`) submitted 2026-09-24 00:15 with `GPUS=2 SMOKE_GPUS=2
+WALL=240:00`: smoke job 154429723 PASSED on the same 2 GPUs (20 steps, val, 4.7 GB checkpoint; 77.4 TFLOP per
+step per rank = 4 crops x ViT-L + UNETR head), real run 154429724 dispatched 00:17 on i06u22. Step 1k: boundary
+accuracy 0.118 (1a 0.0002); step 2k: 0.682 (1a 0.07); step 3k: 0.472 (1a 0.56) -- the cold UNETR head left
+the trivial predictor sooner, but by 3k the two are comparable (single log windows are noisy). 17.1 crops/s = 0.468 s/step, data_wait 0.003: ~65 h for 500k steps, finish ~2026-09-26 evening.
+
+Arm 5b (UNETR at patch 8, branch `unetr-decoder`) submitted 2026-09-24 23:23 with `WALL=240:00`: smoke job
+154450714 PASSED (1 GPU, 20 steps, val, 4.6 GB checkpoint; 434.5 TFLOP per step per rank vs 4a's 430.9),
+real run 154450715 dispatched on i04u22. Step 1k on the trivial predictor (0.8876 vs positive rate 0.8875),
+step 2k escaped (0.921 vs 0.902); 13.67 crops/s = 0.585 s/step: ~81 h for 500k steps, finish ~2026-09-28 morning.

@@ -1,9 +1,11 @@
 """Getting from a ViT's patch grid back to one prediction per voxel.
 
 Any dense task on a transformer has to undo the patch embedding: tokens sit on a grid `patch_size`
-times coarser than the input on every axis, and the head has to produce a value per voxel. The two
-heads here are alternative answers, and they share a signature -- `forward(x, size)` -- so an
-algorithm can offer the choice as configuration without branching at the call site.
+times coarser than the input on every axis, and the head has to produce a value per voxel. The
+first two heads here are alternative answers from the final layer's tokens alone, and they share a
+signature -- `forward(x, size)` -- so an algorithm can offer the choice as configuration without
+branching at the call site. The third, `UNETRHead`, also reads intermediate layers and the raw
+image, so it takes those instead (see its docstring).
 
 `VoxelHead` interpolates and then convolves at full resolution. Every sub-token detail is therefore
 the responsibility of the convolutions that follow, which act on an already-smooth field and see
@@ -26,11 +28,14 @@ smaller.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .norms import ChannelLayerNorm
 
 # Rank -> the layers and the interpolation mode that operate on it. Trilinear/bilinear rather than
 # nearest because a head's output is a continuous score, not a class index.
@@ -283,4 +288,160 @@ class SubPixelHead(nn.Module):
         x = self.project(x)
         x = self._expand_tokens(x)
         x = self.refine(x)
+        return self.out(x)
+
+
+class _ResidualBlock(nn.Module):
+    """Two 3-wide convolutions, each followed by a channel LayerNorm, around a residual connection.
+
+    MONAI's `UnetResBlock` -- the block UNETR's reference implementation builds its decoder from --
+    with this repository's normalisation and activation. `ChannelLayerNorm` rather than BatchNorm
+    because a dense run trains at one or a few crops per rank, where batch statistics are noise; and
+    rather than InstanceNorm because those statistics are taken over the window, so a voxel's
+    features would depend on which prediction window it happens to sit in, and overlapping windows
+    would disagree about it. A 1x1 projection carries the residual when the width changes.
+    """
+
+    def __init__(self, rank: int, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        conv = CONV[rank]
+        self.conv1 = conv(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.norm1 = ChannelLayerNorm(out_channels)
+        self.conv2 = conv(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.norm2 = ChannelLayerNorm(out_channels)
+        self.project: nn.Module = (
+            conv(in_channels, out_channels, kernel_size=1, bias=False)
+            if in_channels != out_channels else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.gelu(self.norm1(self.conv1(x)))
+        y = self.norm2(self.conv2(y))
+        return F.gelu(y + self.project(x))
+
+
+class UNETRHead(nn.Module):
+    """Tokens from several encoder depths plus the raw image -> `(B, out_channels, *image grid)`.
+
+    UNETR's decoder (Hatamizadeh et al., WACV 2022). The patch grid is brought back to voxel
+    resolution in `levels = log2(patch)` stages of x2 transposed convolution. At each stage the
+    upsampled stream is concatenated with a skip and fused by a residual block: skip `k` (at stride
+    `2^k`) is the encoder's `k`-th requested layer, brought there by its own chain of transposed
+    convolutions, and the last, at full resolution, is a residual block run on the raw image. The
+    deepest requested layer is the bottleneck the stream starts from.
+
+    **Only the raw-image skip adds resolution.** The encoder skips come from intermediate depths but
+    sit on the same patch grid as the final layer: they add less abstract features, not finer ones.
+    Structure below the token scale can come from the image path alone, which is why
+    `image_skip` is a switch -- with it off, the head is the paper's decoder minus its one
+    full-resolution input.
+
+    `widths[k]` is the channel count at stride `2^k`, finest first. The paper's 64/128/256/512 were
+    sized for 96^3 crops; the default 16/32/64/128 is MONAI's and is what a 256^3 crop can afford.
+    Measured on one B300 at a 256^3 crop behind a ViT-L/16 (compiled, one crop, forward + backward):
+    this head costs 1.41-1.46x the sub-pixel head's step at 16.3 GiB, 64/128/256/512 costs 42 s a
+    step, because its last fusion concatenates 2 x 64 channels over the crop -- exactly 2^31
+    elements, cuDNN's 32-bit indexing limit. That limit is the real cap on the finest width:
+    `2 * widths[0] * voxels` must stay under 2^31, so a 512^3 crop would need slabs
+    (probes/unetr-feasibility on /nrs has the measurements). Upsampling by transposed convolution
+    because that measured faster at kernel == stride == 2 than both a matmul-and-fold (the trick
+    `SubPixelHead` needs at kernel 16) and a channels-last layout.
+
+    `zero_init_output` has `SubPixelHead`'s meaning and its caveat: a zeroed output starts every
+    prediction at the bias and sends the encoder no gradient until it grows, so turn it off when the
+    encoder also has to learn.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        patch_size: tuple[int, ...],
+        out_channels: int,
+        in_channels: int = 1,
+        widths: Sequence[int] | None = None,
+        image_skip: bool = True,
+        zero_init_output: bool = True,
+    ) -> None:
+        super().__init__()
+        self.levels = self.levels_for(patch_size)
+        rank = len(patch_size)
+        widths = tuple(widths) if widths is not None else tuple(16 * 2**k for k in range(self.levels))
+        if len(widths) != self.levels or any(w < 1 for w in widths):
+            raise ValueError(
+                f"a patch of {tuple(patch_size)} takes {self.levels} x2 stages, so widths needs "
+                f"{self.levels} positive entries (finest first), got {widths}"
+            )
+        self.patch_size = tuple(patch_size)
+        self.widths = widths
+        conv, up = CONV[rank], CONV_TRANSPOSE[rank]
+
+        # Skip k = 1 .. levels-1: requested layer k-1, at stride 2^k with widths[k] channels.
+        self.skips = nn.ModuleList()
+        for k in range(1, self.levels):
+            chain: list[nn.Module] = [up(in_dim, widths[k], kernel_size=2, stride=2)]
+            for _ in range(self.levels - k - 1):
+                chain += [up(widths[k], widths[k], kernel_size=2, stride=2),
+                          _ResidualBlock(rank, widths[k], widths[k])]
+            self.skips.append(nn.Sequential(*chain))
+
+        # The stream: bottleneck -> stride 2^(levels-1) -> ... -> stride 1, fusing a skip at each.
+        self.ups = nn.ModuleList()
+        self.fuse = nn.ModuleList()
+        channels = in_dim
+        for k in reversed(range(self.levels)):
+            self.ups.append(up(channels, widths[k], kernel_size=2, stride=2))
+            joined = widths[k] if (k == 0 and not image_skip) else 2 * widths[k]
+            self.fuse.append(_ResidualBlock(rank, joined, widths[k]))
+            channels = widths[k]
+        self.image: nn.Module | None = (
+            _ResidualBlock(rank, in_channels, widths[0]) if image_skip else None
+        )
+        self.out = conv(widths[0], out_channels, kernel_size=1)
+
+        if zero_init_output:
+            nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(cast(torch.Tensor, self.out.bias))
+
+    @staticmethod
+    def levels_for(patch_size: tuple[int, ...]) -> int:
+        """x2 stages from the patch grid to voxels: `log2(patch)`, for a cubic power-of-two patch.
+
+        Anisotropic patches would need per-axis stage factors, and a patch that is not a power of two
+        a non-x2 stage somewhere; neither is built, so both are refused rather than approximated.
+        """
+        if len(patch_size) not in CONV:
+            raise ValueError(f"patch_size must have 2 or 3 entries, got {tuple(patch_size)}")
+        side = patch_size[0]
+        if any(p != side for p in patch_size) or side < 2 or side & (side - 1):
+            raise ValueError(
+                f"UNETRHead needs the same power-of-two patch on every axis (x2 stages up to "
+                f"voxels), got {tuple(patch_size)}"
+            )
+        return side.bit_length() - 1
+
+    def forward(self, features: Sequence[torch.Tensor], image: torch.Tensor) -> torch.Tensor:
+        """`levels` token grids `(B, in_dim, *grid)`, shallowest first, and `(B, C, *grid*patch)`."""
+        if len(features) != self.levels:
+            raise ValueError(
+                f"a patch of {self.patch_size} fuses {self.levels} encoder layers (the deepest last), "
+                f"got {len(features)}"
+            )
+        grid = tuple(features[-1].shape[2:])
+        expected = tuple(g * p for g, p in zip(grid, self.patch_size, strict=True))
+        if tuple(image.shape[2:]) != expected:
+            # The same contract as `SubPixelHead`: x2 stages reach exactly grid * patch, so an image
+            # that is not a whole number of patches would leave a rim no stage produces.
+            raise ValueError(
+                f"a patch grid of {grid} at patch size {self.patch_size} covers {expected}, but the "
+                f"image is {tuple(image.shape[2:])}; use a crop divisible by the patch size"
+            )
+        skips = [branch(f) for branch, f in zip(self.skips, features[:-1], strict=True)]
+        x = features[-1]
+        for index, k in enumerate(reversed(range(self.levels))):
+            x = self.ups[index](x)
+            if k >= 1:
+                x = torch.cat([x, skips[k - 1]], dim=1)
+            elif self.image is not None:
+                x = torch.cat([x, self.image(image)], dim=1)
+            x = self.fuse[index](x)
         return self.out(x)

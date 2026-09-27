@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import torch
 
-from algorithms.affinity_seg import AffinitySegmentation
+from algorithms.affinity_seg import AffinitySegmentation, default_skip_layers
 from algorithms.registry import AlgorithmRegistry
 from layers.common.dense_heads import VoxelHead
 from models.dinov3_vit3d import DinoVisionTransformer3D
@@ -379,3 +379,107 @@ def test_delegating_stops_the_algorithm_doing_it_twice(monkeypatch: pytest.Monke
 
     monkeypatch.setattr("algorithms.affinity_seg.relabel_connected", fail)
     algorithm._targets(algorithm._prepare_labels(_reentering_labels()))
+
+
+# ------------------------------------------------------------------------------------ UNETR head
+
+
+def _dinov3(depth: int = 4) -> DinoVisionTransformer3D:
+    torch.manual_seed(0)
+    return DinoVisionTransformer3D(
+        img_size=CROP, patch_size=PATCH, in_chans=1, embed_dim=32, depth=depth, num_heads=4,
+        n_storage_tokens=2, pos_embed_rope_dtype="fp32",
+    )
+
+
+def _unetr(**overrides: Any) -> AffinitySegmentation:
+    kwargs: dict[str, Any] = dict(
+        input_axes="lcxyz", long_range=4, decoder="unetr", decoder_zero_init_output=False,
+    )
+    kwargs.update(overrides)
+    return AffinitySegmentation(_dinov3(), **kwargs)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "depth, levels, expected",
+    [(24, 4, (5, 11, 17, 23)), (24, 3, (7, 15, 23)), (12, 4, (2, 5, 8, 11)), (4, 3, (0, 2, 3))],
+)
+def test_default_skip_layers_end_each_quarter_of_the_stack(depth, levels, expected):
+    """(12, 4) is UNETR's own 3/6/9/12 (1-based); (24, 4) is ViT-L at patch 16."""
+    assert default_skip_layers(depth, levels) == expected
+
+
+@pytest.mark.unit
+def test_dinov3_layer_patch_features_ends_in_patch_features():
+    encoder = _dinov3().eval()
+    volume = torch.randn(2, 1, CROP, CROP, CROP)
+    layers, grid = encoder.layer_patch_features(volume, [0, 2, 3])
+    tokens, patch_grid = encoder.patch_features(volume)
+    assert grid == patch_grid == (2, 2, 2)
+    assert len(layers) == 3 and all(t.shape == (2, 8, 32) for t in layers)
+    torch.testing.assert_close(layers[-1], tokens)
+
+
+@pytest.mark.unit
+def test_unetr_decoder_trains_and_predicts_at_voxel_resolution():
+    algorithm = _unetr()
+    assert algorithm.skip_layers == (0, 2, 3), "patch 8 -> 3 stages over a 4-block encoder"
+    metrics = algorithm.training_step(_batch())
+    assert torch.isfinite(metrics["loss"])
+    metrics["loss"].backward()
+    head = algorithm.decoder_out
+    assert head.skips[0][0].weight.grad.abs().sum() > 0, "the shallowest skip is trained"
+    assert head.image.conv1.weight.grad.abs().sum() > 0, "the raw-image path is trained"
+    assert algorithm.encoder.patch_embed.proj.weight.grad.abs().sum() > 0, "so is the encoder"
+    logits = algorithm.logits(torch.rand(2, 1, CROP, CROP, CROP))
+    assert logits.shape == (2, len(algorithm.offsets), CROP, CROP, CROP)
+
+
+@pytest.mark.unit
+def test_unetr_with_descriptors_emits_them_after_the_affinities():
+    algorithm = _unetr(lsd_sigma=16.0)
+    assert algorithm.decoder_out.out.out_channels == len(algorithm.offsets) + algorithm.lsd_channels
+    batch = _batch()
+    batch["pixel_size"] = torch.full((2, 1, 3), 8.0)
+    metrics = algorithm.training_step(batch)
+    assert torch.isfinite(metrics["loss"]) and "loss_lsd" in metrics
+
+
+@pytest.mark.unit
+def test_unetr_refuses_an_encoder_without_intermediate_layers():
+    with pytest.raises(ValueError, match="layer_patch_features"):
+        AffinitySegmentation(_encoder(), input_axes="lcxyz", decoder="unetr")
+
+
+@pytest.mark.unit
+def test_unetr_refuses_slab_decoding():
+    with pytest.raises(ValueError, match="decode_chunks"):
+        _unetr(decode_chunks=2)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("layers", [(0, 3), (2, 0, 3), (0, 2, 4), (-1, 2, 3)])
+def test_unetr_refuses_skip_layers_that_are_not_one_per_stage_in_order(layers):
+    with pytest.raises(ValueError, match="decoder_skip_layers"):
+        _unetr(decoder_skip_layers=layers)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "decoder, expected",
+    [
+        ("interpolate", {"decoder.0.weight", "decoder.0.bias", "decoder_out.0.weight",
+                         "decoder_out.0.bias", "decoder_out.2.weight", "decoder_out.2.bias"}),
+        ("subpixel", {"decoder_out.project.weight", "decoder_out.project.bias",
+                      "decoder_out.expand.weight", "decoder_out.expand.bias",
+                      "decoder_out.refine.0.weight", "decoder_out.refine.0.bias",
+                      "decoder_out.refine.2.weight", "decoder_out.refine.2.bias",
+                      "decoder_out.out.weight", "decoder_out.out.bias"}),
+    ],
+)
+def test_the_other_heads_keep_their_checkpoint_names(decoder, expected):
+    """Adding the UNETR option must not rename a single existing head tensor."""
+    algorithm = _algorithm(decoder=decoder)
+    head = {name for name, _ in algorithm.named_parameters() if not name.startswith("model.")}
+    assert head == expected

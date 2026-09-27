@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -66,6 +67,22 @@ class BaseModel(nn.Module, abc.ABC):
         raise NotImplementedError(
             f"{type(self).__name__} does not implement patch_features, so it cannot drive a "
             "dense prediction head"
+        )
+
+    def layer_patch_features(
+        self, x: torch.Tensor, layers: Sequence[int]
+    ) -> tuple[list[torch.Tensor], tuple[int, ...]]:
+        """Encode one input -> the patch tokens after each block in `layers`, and their patch grid.
+
+        The multi-depth sibling of `patch_features`, for a head that reads intermediate layers as well
+        as the last (UNETR's skip connections): one `(B, N, C)` tensor per entry of `layers` -- 0-based
+        block indices, strictly increasing -- in that order, on the same grid `patch_features`
+        returns. Declines by default, as `patch_features` does, so a head that needs it fails at
+        construction on an architecture that has not said which tokens those are.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement layer_patch_features, so it cannot drive a "
+            "head that reads intermediate encoder layers"
         )
 
     def extra_forward_methods(self) -> tuple[str, ...]:

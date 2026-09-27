@@ -426,6 +426,22 @@ class DinoVisionTransformer3D(BaseModel):
         grid = tuple(s // self.patch_size for s in x.shape[-SPATIAL_RANK:])
         return out["x_norm_patchtokens"], grid  # type: ignore[return-value]
 
+    def layer_patch_features(
+        self, x: torch.Tensor, layers: Sequence[int]
+    ) -> tuple[list[torch.Tensor], tuple[int, int, int]]:
+        """(B, C, D, H, W) -> normalised patch tokens after each block in `layers`, and their grid.
+
+        Through `get_intermediate_layers(norm=True)`, DINOv3's own dense-evaluation path: every taken
+        block's output passes the final norm, so the last block's tokens are exactly what
+        `patch_features` returns, and CLS and storage tokens are dropped. That method is already an
+        FSDP entry point (`extra_forward_methods`) and already gathers a sequence-parallel stream
+        under `tp > 1`, so this adds no new path through either.
+        """
+        outputs = self.get_intermediate_layers(x, n=list(layers), norm=True)
+        grid = tuple(s // self.patch_size for s in x.shape[-SPATIAL_RANK:])
+        # With neither class nor extra tokens requested, every entry is a plain (B, N, C) tensor.
+        return list(outputs), grid  # type: ignore[return-value]
+
     def checkpointable_modules(self) -> tuple[nn.Module, ...]:
         """The transformer blocks: repeated, sequence-length-sized, and cheap to rerun."""
         return tuple(self.blocks)

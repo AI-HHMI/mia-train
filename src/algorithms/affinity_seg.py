@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from data.base import BaseDataset
-from layers.common.dense_heads import SubPixelHead, VoxelHead
+from layers.common.dense_heads import SubPixelHead, UNETRHead, VoxelHead
 from models.base import BaseModel
 
 from .affinity.lsd import (
@@ -47,7 +47,17 @@ from .base import BaseAlgorithm
 from .registry import AlgorithmRegistry
 
 SPATIAL_RANK = 3
-DECODERS = ("interpolate", "subpixel")
+DECODERS = ("interpolate", "subpixel", "unetr")
+
+
+def default_skip_layers(depth: int, levels: int) -> tuple[int, ...]:
+    """`levels` 0-based block indices evenly spaced through a `depth`-block encoder, ending at the last.
+
+    UNETR's own choice scaled to the encoder: blocks 3/6/9/12 (1-based) of its 12-block ViT-B are
+    the ends of the stack's quarters, and on a 24-block ViT-L at patch 16 the same rule gives blocks
+    6/12/18/24 -- (5, 11, 17, 23) here.
+    """
+    return tuple(round(depth * (k + 1) / levels) - 1 for k in range(levels))
 
 #: Label dtypes `_prepare_labels` passes through untouched. Signed, because `ignore_index` is
 #: negative; integer, because a float label cannot be trusted to have kept its ids distinct.
@@ -112,7 +122,20 @@ class AffinitySegmentation(BaseAlgorithm):
 
     Only the sub-pixel head can be chunked. The interpolating one resizes the whole patch grid in a
     single `F.interpolate`, whose scale factor comes from the sizes it is handed -- a slab plus halo
-    would sample at a different rate, and the seams would be wrong with no shape to catch it.
+    would sample at a different rate, and the seams would be wrong with no shape to catch it. The
+    UNETR head could be, but its convolutions at four resolutions reach ~30 voxels across a slab face
+    at patch 16 against the sub-pixel head's 2, and that halo is not built; a 256^3 crop decodes in
+    one piece anyway (16 GiB per rank, measured).
+
+    `decoder = "unetr"` is UNETR's decoder (Hatamizadeh et al., 2022; `layers.common.dense_heads.
+    UNETRHead`): tokens from `decoder_skip_layers` -- one encoder block per x2 stage, `log2(patch)`
+    of them, deepest last; by default the ends of the stack's quarters, see `default_skip_layers` --
+    are upsampled stage by stage and fused with each other and, at full resolution, with the raw
+    image. `decoder_widths` are its channel counts at strides 1, 2, 4, ... (default 16, 32, 64, 128),
+    `decoder_image_skip` switches the raw-image path, and `decoder_zero_init_output` means what it
+    means for the sub-pixel head. It needs an encoder that implements
+    `BaseModel.layer_patch_features`, and `decoder_hidden_dim` / `_readout_dim` / `_refine_depth`
+    play no part in it.
     """
 
     def __init__(
@@ -128,6 +151,9 @@ class AffinitySegmentation(BaseAlgorithm):
         decoder_readout_dim: int = 16,
         decoder_refine_depth: int = 2,
         decoder_zero_init_output: bool = True,
+        decoder_widths: Sequence[int] | None = None,
+        decoder_skip_layers: Sequence[int] | None = None,
+        decoder_image_skip: bool = True,
         ignore_index: int = -1,
         split_disconnected: bool = True,
         decode_chunks: int = 1,
@@ -149,7 +175,9 @@ class AffinitySegmentation(BaseAlgorithm):
             # chunk of that resize is not a resize of the chunk: the scale factor is derived from
             # the sizes it is given, so a slab plus halo would sample at a different rate and the
             # seams would be wrong in a way no shape check catches. The sub-pixel head decodes each
-            # token into its own disjoint block, which is what makes slabs exact.
+            # token into its own disjoint block, which is what makes slabs exact. The UNETR head's
+            # halo (~30 voxels at patch 16, through four resolutions) is not built, and too little
+            # halo is exactly the silent seam this refuses.
             raise ValueError(
                 f"decode_chunks > 1 needs decoder = 'subpixel', got {decoder!r}"
             )
@@ -219,12 +247,15 @@ class AffinitySegmentation(BaseAlgorithm):
         # Affinities first, descriptors after. One wider output convolution rather than two heads:
         # the two are the same function, and the reference network is built the same way.
         head_channels = len(self.offsets) + self.lsd_channels
-        if decoder == "subpixel":
+        #: 0-based encoder blocks the UNETR head reads, deepest last; None for the other heads.
+        self.skip_layers: tuple[int, ...] | None = None
+        if decoder in ("subpixel", "unetr"):
             # Scalar on the DINOv3 models, a tuple on `ViT3D`; normalised as `simmim` does it.
             patch = cast(Any, model).patch_size
             patch_size: tuple[int, ...] = (
                 (patch,) * SPATIAL_RANK if isinstance(patch, int) else tuple(patch)
             )
+        if decoder == "subpixel":
             # `_decode` is unchanged by the choice: `SubPixelHead` takes its own projection, so the
             # patch-grid stage is a no-op and both heads share the `(x, size)` call.
             self.decoder: nn.Module = nn.Identity()
@@ -232,6 +263,38 @@ class AffinitySegmentation(BaseAlgorithm):
                 embed_dim, patch_size, head_channels,
                 hidden=decoder_hidden_dim, readout=decoder_readout_dim,
                 refine_depth=decoder_refine_depth,
+                zero_init_output=decoder_zero_init_output,
+            )
+        elif decoder == "unetr":
+            if type(model).layer_patch_features is BaseModel.layer_patch_features:
+                raise ValueError(
+                    f"decoder = 'unetr' reads intermediate encoder layers, which "
+                    f"{type(model).__name__} does not provide (it does not implement "
+                    "layer_patch_features); use decoder = 'subpixel' or 'interpolate'"
+                )
+            levels = UNETRHead.levels_for(patch_size)
+            depth = len(cast(Any, model).blocks)
+            layers = (
+                tuple(int(layer) for layer in decoder_skip_layers)
+                if decoder_skip_layers is not None else default_skip_layers(depth, levels)
+            )
+            if (
+                len(layers) != levels
+                or any(b <= a for a, b in zip(layers, layers[1:]))
+                or layers[0] < 0 or layers[-1] >= depth
+            ):
+                raise ValueError(
+                    f"decoder_skip_layers must be {levels} strictly increasing 0-based block "
+                    f"indices below the encoder's depth {depth} (one per x2 stage of patch "
+                    f"{patch_size}, deepest last), got {layers}"
+                )
+            self.skip_layers = layers
+            # Every token grid goes straight to the head, which projects each itself.
+            self.decoder = nn.Identity()
+            self.decoder_out = UNETRHead(
+                embed_dim, patch_size, head_channels,
+                in_channels=cast(Any, model).in_chans,
+                widths=decoder_widths, image_skip=decoder_image_skip,
                 zero_init_output=decoder_zero_init_output,
             )
         else:
@@ -271,7 +334,8 @@ class AffinitySegmentation(BaseAlgorithm):
         upsampling performed outside would leave its full-resolution result held for the whole
         backward pass and give back only half of what checkpointing is worth here. Both heads
         therefore present a boundary at the patch grid, where a tensor is thousands of times
-        smaller than at voxel resolution.
+        smaller than at voxel resolution. The UNETR head's boundary is its token grids plus the raw
+        image, one channel at voxel resolution, which the step holds anyway.
         """
         return (self.decoder_out,)
 
@@ -402,17 +466,48 @@ class AffinitySegmentation(BaseAlgorithm):
         to reach for `encoder.patch_features` and the private `_decode` and reproduce their pairing,
         which is a copy of `_step`'s middle that could drift from it.
         """
-        tokens, grid = self.encoder.patch_features(volumes)
+        tokens, grid = self._encode(volumes)
         # The last SPATIAL_RANK axes are the spatial ones under both encoder layouts --
         # (B, C, D, H, W) from a single-scale encoder and (B, L, C, D, H, W) from a multi-scale
         # one -- so index from the end, exactly as `_step` does. The affinity block only: the
         # descriptor channels, when the head has them, are not part of a prediction.
-        return self._decode(tokens, grid, volumes.shape[-SPATIAL_RANK:])[:, : len(self.offsets)]
+        size = volumes.shape[-SPATIAL_RANK:]
+        return self._decode(tokens, grid, size, volumes)[:, : len(self.offsets)]
+
+    def _encode(
+        self, volumes: torch.Tensor
+    ) -> tuple[torch.Tensor | list[torch.Tensor], tuple[int, ...]]:
+        """What the head reads: the final layer's patch tokens, or the UNETR head's skip layers.
+
+        One `(B, N, C)` tensor, or for `decoder = "unetr"` one per entry of `skip_layers`, deepest
+        last, all on the same grid.
+        """
+        if self.skip_layers is not None:
+            return self.encoder.layer_patch_features(volumes, self.skip_layers)
+        return self.encoder.patch_features(volumes)
 
     def _decode(
-        self, tokens: torch.Tensor, grid: tuple[int, ...], size: torch.Size
+        self,
+        tokens: torch.Tensor | list[torch.Tensor],
+        grid: tuple[int, ...],
+        size: torch.Size,
+        volumes: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """(B, N, C) patch tokens on `grid` -> (B, n_offsets, *size) affinity logits."""
+        """`_encode`'s tokens on `grid` -> (B, n_offsets, *size) affinity logits.
+
+        `volumes` is the encoder's own input, which only the UNETR head reads (its full-resolution
+        skip); the other heads decode from the tokens alone.
+        """
+        if self.skip_layers is not None:
+            assert volumes is not None, "the UNETR head reads the raw image as well as the tokens"
+            return self.decoder_out([self._fold(t, grid) for t in tokens], volumes)
+        assert isinstance(tokens, torch.Tensor)
+        x = self.decoder(self._fold(tokens, grid))
+        return self.decoder_out(x, tuple(size))
+
+    @staticmethod
+    def _fold(tokens: torch.Tensor, grid: tuple[int, ...]) -> torch.Tensor:
+        """(B, N, C) patch tokens -> (B, C, *grid), refusing a sequence that does not fill `grid`."""
         batch, num_tokens, channels = tokens.shape
         expected = 1
         for extent in grid:
@@ -426,9 +521,7 @@ class AffinitySegmentation(BaseAlgorithm):
 
         # (B, N, C) -> (B, C, *grid). Tokens are in row-major grid order, which is what the
         # encoders' patch embeddings produce and what `patch_features` promises.
-        x = tokens.transpose(1, 2).reshape(batch, channels, *grid)
-        x = self.decoder(x)
-        return self.decoder_out(x, tuple(size))
+        return tokens.transpose(1, 2).reshape(batch, channels, *grid)
 
     def _split_labels(self, labels: torch.Tensor) -> torch.Tensor:
         """The connected-components split, unless the dataloader's workers already did it."""
@@ -663,7 +756,7 @@ class AffinitySegmentation(BaseAlgorithm):
         sigma = self._sigma_voxels(batch)
 
         with torch.profiler.record_function("encoder"):
-            tokens, grid = self.encoder.patch_features(volumes)
+            tokens, grid = self._encode(volumes)
 
         # Once, for the whole crop, before any slab: connectivity is a property of the volume, and
         # an object that leaves a slab and comes back is one object, not two.
@@ -672,7 +765,7 @@ class AffinitySegmentation(BaseAlgorithm):
 
         if self.decode_chunks == 1:
             with torch.profiler.record_function("decoder"):
-                logits = self._decode(tokens, grid, spatial)
+                logits = self._decode(tokens, grid, spatial, volumes)
             # NOTE `logits()` is the same pair of calls without the profiler regions; kept separate
             # so the training step's annotations stay where the profiler expects them.
             target, mask = self._affinity_targets(labels)

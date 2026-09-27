@@ -39,6 +39,10 @@
 #   4b_dinov3sat_axial_subpixel_p8
 #                              arm 4a initialised from SAT-493M instead of LVD-1689M; 4b vs 4a is the
 #                              pretraining corpus. Both start a COLD sub-pixel head too.
+#   5a_dinov3_axial_unetr      arm 1a with the UNETR decoder, on 2 GPUs x batch 4 (global batch 8, as 1a);
+#                              5a vs 1a is the decoder. A cold head too: the collapse check applies.
+#   5b_dinov3_axial_unetr_p8   arm 4a (patch 8) with the UNETR decoder, one full node; 5b vs 4a is the
+#                              decoder at 64 nm tokens, 5b vs 5a the token size.
 #
 # WHAT TO READ
 #
@@ -91,7 +95,8 @@ VENV=/groups/scicompsoft/home/orhane/myvenv
 ARMS=(1a_dinov3_axial_subpixel 1b_scratch_axial_subpixel 1c_dinov3_axial_subpixel_1m
       2a_simmim_lmd_mask60 2b_simmim_lmd_mask85
       3a_simmim60_axial_subpixel 3b_simmim85_axial_subpixel
-      4a_dinov3_axial_subpixel_p8 4b_dinov3sat_axial_subpixel_p8)
+      4a_dinov3_axial_subpixel_p8 4b_dinov3sat_axial_subpixel_p8
+      5a_dinov3_axial_unetr 5b_dinov3_axial_unetr_p8)
 
 PORT=6006 SMOKE=0 LIST=0
 for arg in "$@"; do
