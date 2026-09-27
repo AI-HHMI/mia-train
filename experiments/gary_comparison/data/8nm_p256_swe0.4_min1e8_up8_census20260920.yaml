@@ -1,0 +1,1464 @@
+# gary_comparison's SSL pretraining corpus (arms 2a, 2b). Copied on 2026-09-24 from lmd-configs c097651,
+#   /groups/miaai/miaai/lmd-v0.0.1/configs/configs/pretraining/singlescale/baseline/8nm_p256_swe0.4_min1e8_up8_census20260920.yaml
+# the path 2a and 2b were launched with, so this experiment no longer depends on lmd-configs' layout
+# (it is renaming pretraining/ -> unlabeled/). Everything below the header comments is identical to the
+# snapshot each run saved in its run directory. The header is lmd-configs' own: its rebuild command and
+# recipe paths refer to that repo as of c097651.
+#
+# lmd-v0.0.1 pretraining — single scale (8 nm) — SimMIM / DINOv3
+#
+# GENERATED FILE — do not edit by hand. Every setting that decides what is in here
+# lives in the recipe below; there are no command-line options that change content.
+#
+#   rebuild   python build.py recipes/pretraining/singlescale/baseline/8nm_p256_swe0.4_min1e8_up8.yaml
+#   verify    python build.py --check          # regenerates, diffs, writes nothing
+#
+#   recipe    recipes/pretraining/singlescale/baseline/8nm_p256_swe0.4_min1e8_up8.yaml  sha256:8c9a2f44b1189169
+#   corpus    corpus/census-20260920.csv  sha256:1ea34ed35b16d8ba  (1003 stores)
+#   input     corpus/windows.yaml  sha256:b74ce99b824f4ca9
+#   input     corpus/quarantine.yaml  sha256:2b6d2299221a9bd7
+#   builder   lmd/build_pretraining.py  sha256:68049fd76f511fa5
+#   miao      0.4.1
+#
+# 226 volumes: 5 with a per-volume `resolutions` override, 47 with an intensity window.
+# 777 of 1003 censused stores were dropped.
+# size floor    100,000,000 level-0 spatial voxels (0.1 G)
+# resolution cap max_upsample 8x8x8 (x, y, z): native voxel / finest rung may not exceed this; 5 volume(s) dropped as "too coarse", named below.
+#
+# `python describe.py <this file>` reports what the surviving set adds up to: size distribution,
+# species / modality mix, sampling concentration, and bytes read per epoch.
+#
+# Quarantined by corpus/quarantine.yaml:
+#   *-unstitched/*  (347 volumes, PERMANENT — never lifted)
+#     Unstitched crops are not a mosaic covering a large area — they are near-duplicate views
+#     of the same tissue. Measured from the BigStitcher dataset.xml the tiles carry: all 105
+#     tiles of FlyID45 come from one source file and their positions span 625 x 541 x 943 px,
+#     while each tile is 4096 x 2560 x 4301. Every one of the 5460 tile pairs overlaps, median
+#     87%. Their union bounding box is 76.8 G voxels against 4.74 T summed — a redundancy of
+#     ~62x. Across all four acquisitions, 14.8 T of apparent data is roughly 0.31 T of
+#     distinct tissue, 0.35% of the corpus. Downweighting them does not fix this. A per-volume
+#     weight sets how often the group is sampled; it cannot make 87% of any two tiles stop
+#     being the same voxels. The correct weight is ~1/62, which makes them a rounding error
+#     while still costing 347 volumes of dataloader overhead and heavy read amplification. NOT
+#     an argument about resolution. These are 8.72 x 8.72 x 55.56 nm, but the STITCHED
+#     mirrorscope volumes (FlyID49) are 4.906 x 4.906 x 31.25 nm — the same 6.4x anisotropy,
+#     and also upsampled in z (3.9x) to reach an 8 nm isotropic ladder. Both are kept or
+#     dropped on redundancy, not on z sampling; FlyID49 is in the config at ~11% of an epoch.
+#     This reverses no earlier decision: no config ever shipped with these. All four
+#     pretraining configs predating the recipe rewrite contain zero unstitched volumes, and
+#     the last census committed before it (570 stores) had none. The four acquisitions landed
+#     on 2026-08-26. What this prevents is them arriving by default — on the first rebuild
+#     after they landed they took 266 of 367 volumes, 72% of the config, at 0.35% of the real
+#     tissue. The fix is upstream and already possible: the stitching metadata exists, and
+#     FlyID49 shows the pipeline emits a stitched product. A stitched FlyID22/41/45 will not
+#     match this glob and is picked up automatically on the next census bump. Nothing is
+#     permanently lost.
+#
+# 5 volume(s) are too small to hold a 256-voxel patch at 8 nm
+# and were given a finer ladder (median coarsest rung 6.4 nm). Named below.
+#
+# Dropped, by cause:
+#   quarantined           347
+#   below floor           303
+#   multi-channel         121
+#   too coarse              5
+#   time axis               1
+#
+# Counted-only causes are mechanical and stated in the recipe. These are named:
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID22-mirrorscope-075pct-20260210   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID41-mirrorscope-S1-20260605-uns   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-drosophila-flyliconn-FlyID45-mirrorscope-fly1-20260615-u   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   quarantined          exm-mouse-mirrorscope-hippocampus-3ch-20250902-unstitched/cr   *-unstitched/* since 2026-09-01
+#   too coarse           em-human-PyTC-bvem-temporallobe/crop-001_temporallobe          264 nm z vs 8 nm rung = 33.0x (cap 8x)
+#   too coarse           em-macaque-PyTC-bvem-stg/crop-001_stg                          240 nm z vs 8 nm rung = 30.0x (cap 8x)
+#   too coarse           em-mouse-MitoVerse-xiao18-auditory-cortex/crop-001_vol0        50 nm z vs 4.84375 nm rung = 10.3x (cap 8x), after its ladde
+#   too coarse           exm-zebrafish-PyTC-nucexm-brain/crop-001_vol1                  357.1 nm z vs 8 nm rung = 44.6x (cap 8x)
+#   too coarse           exm-zebrafish-PyTC-nucexm-brain/crop-002_vol2                  357.1 nm z vs 8 nm rung = 44.6x (cap 8x)
+#
+# Ladder overrides (coarsest rung, nm):
+#       2.578  em-rat-lucchi-hippocampus/crop-001_train
+#       2.578  em-rat-lucchi-hippocampus/crop-002_test
+#         6.4  em-drosophila-MitoVerse-kunduri22-spermatocyte/crop-003_train02
+#         6.4  em-drosophila-flyem-cns-mito-gt-v6/crop-039_box038
+#         6.4  em-drosophila-flyem-cns-mito-gt-v6/crop-122_box121
+
+# ---------------------------------------------------------------------------
+# Global settings — apply to every volume unless overridden per volume below.
+# ---------------------------------------------------------------------------
+size_weighting_exponent: 0.4
+resolutions:
+- - 8.0
+  - 8.0
+  - 8.0
+patch_size:
+- 256
+- 256
+- 256
+output_axes: lcxyz
+samples_per_epoch: 1000
+
+# ---------------------------------------------------------------------------
+# Volumes (226). Per-volume keys override the globals above.
+# ---------------------------------------------------------------------------
+volumes:
+- name: em-celegans-funceworm-jrc-20250414/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-celegans-funceworm-jrc-20250414/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-celegans-funceworm-jrc-20250908/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-celegans-funceworm-jrc-20250908/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-celegans-funceworm-jrc-3fold-2/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-celegans-funceworm-jrc-3fold-2/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-celegans-funceworm-jrc-P3-E5-D1-N2/crop-001_ch0-jrc_P3_E5_D1_N2_trimmed_align_v2
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-celegans-funceworm-jrc-P3-E5-D1-N2/crop-001_ch0-jrc_P3_E5_D1_N2_trimmed_align_v2.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-celegans-funceworm-jrc-comma-1/crop-001_ch0-jrc_c-elegans-comma-1-two-channel_c0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-celegans-funceworm-jrc-comma-1/crop-001_ch0-jrc_c-elegans-comma-1-two-channel_c0.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 33742
+  normalize_min: 0
+- name: em-celegans-funceworm-jrc_HPF-TAOTO-ME-S2_6x6nm_RegAffine-flattened/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-celegans-funceworm-jrc_HPF-TAOTO-ME-S2_6x6nm_RegAffine-flattened/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 551
+  normalize_min: -1473
+- name: em-drosophila-CellMap-jrc-fly-mb-1a/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-CellMap-jrc-fly-mb-1a/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-CellMap-jrc-fly-vnc-1/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-CellMap-jrc-fly-vnc-1/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-FANC-vnc/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-FANC-vnc/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-FANC-vnc/crop-002
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-FANC-vnc/crop-002.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-MitoVerse-kunduri22-spermatocyte/crop-001_test01
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-MitoVerse-kunduri22-spermatocyte/crop-001_test01.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-MitoVerse-kunduri22-spermatocyte/crop-002_train01
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-MitoVerse-kunduri22-spermatocyte/crop-002_train01.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-MitoVerse-kunduri22-spermatocyte/crop-003_train02
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-MitoVerse-kunduri22-spermatocyte/crop-003_train02.zarr
+  image_key: raw
+  zarr_version: zarr3
+  resolutions:
+  - - 6.4
+    - 6.4
+    - 6.4
+- name: em-drosophila-banc/crop-001_centralbrain
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-banc/crop-001_centralbrain.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-banc/crop-002_centralbrain
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-banc/crop-002_centralbrain.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-banc/crop-003_vnc
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-banc/crop-003_vnc.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-banc/crop-004_vnc
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-banc/crop-004_vnc.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-cremi/crop-001_sampleA_train_padded
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-cremi/crop-001_sampleA_train_padded.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-cremi/crop-002_sampleB_train_padded
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-cremi/crop-002_sampleB_train_padded.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-cremi/crop-003_sampleC_train_padded
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-cremi/crop-003_sampleC_train_padded.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-cremi/crop-004_sampleAplus_test_padded
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-cremi/crop-004_sampleAplus_test_padded.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-cremi/crop-005_sampleBplus_test_padded
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-cremi/crop-005_sampleBplus_test_padded.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-cremi/crop-006_sampleCplus_test_padded
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-cremi/crop-006_sampleCplus_test_padded.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-019_box018
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-019_box018.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-031_box030
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-031_box030.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-037_box036
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-037_box036.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-039_box038
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-039_box038.zarr
+  image_key: raw
+  zarr_version: zarr3
+  resolutions:
+  - - 6.4
+    - 6.4
+    - 6.4
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-044_box043
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-044_box043.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-066_box065
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-066_box065.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-067_box066
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-067_box066.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-068_box067
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-068_box067.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-069_box068
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-069_box068.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-074_box073
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-074_box073.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-075_box074
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-075_box074.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-083_box082
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-083_box082.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-090_box089
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-090_box089.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-094_box093
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-094_box093.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-095_box094
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-095_box094.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-096_box095
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-096_box095.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-099_box098
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-099_box098.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-100_box099
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-100_box099.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-101_box100
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-101_box100.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-111_box110
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-111_box110.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-113_box112
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-113_box112.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-118_box117
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-118_box117.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-121_box120
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-121_box120.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-122_box121
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-122_box121.zarr
+  image_key: raw
+  zarr_version: zarr3
+  resolutions:
+  - - 6.4
+    - 6.4
+    - 6.4
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-130_box129
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-130_box129.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-131_box130
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-131_box130.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-140_box139
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-140_box139.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-141_box140
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-141_box140.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-150_box149
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-150_box149.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-162_box161
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-162_box161.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-164_box163
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-164_box163.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-166_box165
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-166_box165.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-170_box169
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-170_box169.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-172_box171
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-172_box171.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-173_box172
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-173_box172.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-174_box173
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-174_box173.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-175_box174
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-175_box174.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-176_box175
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-176_box175.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-180_box179
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-180_box179.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-181_box180
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-181_box180.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-182_box181
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-182_box181.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-184_box183
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-184_box183.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-193_box192
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-193_box192.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-194_box193
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-194_box193.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-195_box194
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-195_box194.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-cns-mito-gt-v6/crop-196_box195
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-cns-mito-gt-v6/crop-196_box195.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-hemibrain/crop-001_EllipsoidBody_x24000_y23000_z17000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-001_EllipsoidBody_x24000_y23000_z17000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-hemibrain/crop-002_11k_x18000_y17000_z11000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-002_11k_x18000_y17000_z11000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-hemibrain/crop-003_10k_x8000_y17000_z11000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-003_10k_x8000_y17000_z11000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-hemibrain/crop-004_aL_R_x16000_y28000_z6000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-004_aL_R_x16000_y28000_z6000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-hemibrain/crop-005_NO_x26000_y22000_z24000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-005_NO_x26000_y22000_z24000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-hemibrain/crop-006_CA_R_x12000_y12000_z11000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-006_CA_R_x12000_y12000_z11000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-hemibrain/crop-007_PB_x22000_y14000_z15000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-007_PB_x22000_y14000_z15000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-drosophila-flyem-hemibrain/crop-008_gL_R_x21000_y32000_z19000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-008_gL_R_x21000_y32000_z19000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-greenmonkey-CellMap-jrc-cos7-1a/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-greenmonkey-CellMap-jrc-cos7-1a/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-greenmonkey-CellMap-jrc-cos7-1b/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-greenmonkey-CellMap-jrc-cos7-1b/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-CellMap-jrc-hela-2/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-CellMap-jrc-hela-2/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-CellMap-jrc-hela-3/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-CellMap-jrc-hela-3/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-CellMap-jrc-jurkat-1/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-CellMap-jrc-jurkat-1/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-CellMap-jrc-macrophage-2/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-CellMap-jrc-macrophage-2/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-CellMap-jrc-sum159-1/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-CellMap-jrc-sum159-1/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-CellMap-jrc-sum159-4/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-CellMap-jrc-sum159-4/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-CellMap-jrc-ut21-1413-003/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-CellMap-jrc-ut21-1413-003/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-H01-cortex/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-H01-cortex/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-MitoVerse-wei20-temporal-lobe/crop-001_mitoEM-H
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-MitoVerse-wei20-temporal-lobe/crop-001_mitoEM-H.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-PyTC-axonem-cortex/crop-001_z0000_y0000_x0000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-PyTC-axonem-cortex/crop-001_z0000_y0000_x0000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-PyTC-axonem-cortex/crop-002_z0000_y0000_x3584
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-PyTC-axonem-cortex/crop-002_z0000_y0000_x3584.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-PyTC-axonem-cortex/crop-003_z0000_y3584_x0000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-PyTC-axonem-cortex/crop-003_z0000_y3584_x0000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-PyTC-axonem-cortex/crop-004_z0000_y3584_x3584
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-PyTC-axonem-cortex/crop-004_z0000_y3584_x3584.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-PyTC-axonem-cortex/crop-005_z0475_y1792_x1792
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-PyTC-axonem-cortex/crop-005_z0475_y1792_x1792.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-PyTC-axonem-cortex/crop-006_z0950_y0000_x0000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-PyTC-axonem-cortex/crop-006_z0950_y0000_x0000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-PyTC-axonem-cortex/crop-007_z0950_y0000_x3584
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-PyTC-axonem-cortex/crop-007_z0950_y0000_x3584.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-PyTC-axonem-cortex/crop-008_z0950_y3584_x0000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-PyTC-axonem-cortex/crop-008_z0950_y3584_x0000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-human-PyTC-axonem-cortex/crop-009_z0950_y3584_x3584
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-human-PyTC-axonem-cortex/crop-009_z0950_y3584_x3584.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-hydra-zhang2025/crop-001_x106212_y65861_z226
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-hydra-zhang2025/crop-001_x106212_y65861_z226.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-hydra-zhang2025/crop-002_x33815_y86408_z95
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-hydra-zhang2025/crop-002_x33815_y86408_z95.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-hydra-zhang2025/crop-003_x114198_y54198_z0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-hydra-zhang2025/crop-003_x114198_y54198_z0.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mosquito-bao2025-antennallobe/crop-001_x114369_y44359_z3105
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mosquito-bao2025-antennallobe/crop-001_x114369_y44359_z3105.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mosquito-bao2025-antennallobe/crop-002_x38748_y49136_z3426
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mosquito-bao2025-antennallobe/crop-002_x38748_y49136_z3426.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-CellMap-jrc-ctl-id8-1/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-CellMap-jrc-ctl-id8-1/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-CellMap-jrc-mus-heart-1/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-CellMap-jrc-mus-heart-1/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-CellMap-jrc-mus-kidney/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-CellMap-jrc-mus-kidney/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-CellMap-jrc-mus-kidney-3/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-CellMap-jrc-mus-kidney-3/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-CellMap-jrc-mus-kidney-glomerulus-2/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-CellMap-jrc-mus-kidney-glomerulus-2/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-CellMap-jrc-mus-liver/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-CellMap-jrc-mus-liver/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-CellMap-jrc-mus-liver-3/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-CellMap-jrc-mus-liver-3/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-CellMap-jrc-mus-liver-zon-1/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-CellMap-jrc-mus-liver-zon-1/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-CellMap-jrc-mus-liver-zon-2/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-CellMap-jrc-mus-liver-zon-2/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-CellMap-jrc-mus-nacc-1/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-CellMap-jrc-mus-nacc-1/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-Jiefu-cerebellum/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-Jiefu-cerebellum/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-Kasthuri15-ac3ac4-cortex/crop-001_ac3_100slices
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-Kasthuri15-ac3ac4-cortex/crop-001_ac3_100slices.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-Kasthuri15-ac3ac4-cortex/crop-002_ac4_100slices
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-Kasthuri15-ac3ac4-cortex/crop-002_ac4_100slices.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MICrONS-minnie65/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MICrONS-minnie65/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-conrad23-salivary-gland/crop-001_salivary_gland
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-conrad23-salivary-gland/crop-001_salivary_gland.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-han24-cerebellum-mossy-fiber/crop-001_neg0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-han24-cerebellum-mossy-fiber/crop-001_neg0.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-han24-cerebellum-mossy-fiber/crop-002_neg1
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-han24-cerebellum-mossy-fiber/crop-002_neg1.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-han24-cerebellum-mossy-fiber/crop-003_pos0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-han24-cerebellum-mossy-fiber/crop-003_pos0.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-han24-cerebellum-mossy-fiber/crop-004_pos1
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-han24-cerebellum-mossy-fiber/crop-004_pos1.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-han24-cerebellum-mossy-fiber/crop-005_pos2
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-han24-cerebellum-mossy-fiber/crop-005_pos2.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-jiang25-brainstem/crop-001_vol0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-jiang25-brainstem/crop-001_vol0.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-jiang25-brainstem/crop-002_vol1
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-jiang25-brainstem/crop-002_vol1.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-jiang25-brainstem/crop-003_vol2
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-jiang25-brainstem/crop-003_vol2.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-muller21-pancreas/crop-001_highglucose_cell1
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-muller21-pancreas/crop-001_highglucose_cell1.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-muller21-pancreas/crop-002_highglucose_cell2
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-muller21-pancreas/crop-002_highglucose_cell2.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-muller21-pancreas/crop-003_highglucose_cell3
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-muller21-pancreas/crop-003_highglucose_cell3.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-muller21-pancreas/crop-004_highglucose_cell4
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-muller21-pancreas/crop-004_highglucose_cell4.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-muller21-pancreas/crop-005_lowglucose_cell1
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-muller21-pancreas/crop-005_lowglucose_cell1.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-muller21-pancreas/crop-006_lowglucose_cell2
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-muller21-pancreas/crop-006_lowglucose_cell2.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-muller21-pancreas/crop-007_lowglucose_cell3
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-muller21-pancreas/crop-007_lowglucose_cell3.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-turner22-pinky-v1/crop-006_pinky_stitched_vol19-vol34
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-turner22-pinky-v1/crop-006_pinky_stitched_vol19-vol34.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-turner22-pinky-v1/crop-007_pinky_stitched_vol19-vol34_realigned
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-turner22-pinky-v1/crop-007_pinky_stitched_vol19-vol34_realigned.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-turner22-pinky-v1/crop-008_pinky_stitched_vol40-vol41
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-turner22-pinky-v1/crop-008_pinky_stitched_vol40-vol41.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-turner22-pinky-v1/crop-013_pinky_vol401
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-turner22-pinky-v1/crop-013_pinky_vol401.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-turner22-pinky-v1/crop-014_pinky_vol501
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-turner22-pinky-v1/crop-014_pinky_vol501.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-turner22-pinky-v1/crop-015_pinky_vol502
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-turner22-pinky-v1/crop-015_pinky_vol502.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-MitoVerse-turner22-pinky-v1/crop-016_pinky_vol503
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-MitoVerse-turner22-pinky-v1/crop-016_pinky_vol503.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-PYR-ca3-hippocampus/crop-001_ca3
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-PYR-ca3-hippocampus/crop-001_ca3.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-PYR-ca3-hippocampus/crop-002_ca3
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-PYR-ca3-hippocampus/crop-002_ca3.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-PYR-ca3-hippocampus/crop-003_ca3
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-PYR-ca3-hippocampus/crop-003_ca3.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-PyTC-axonem-cortex/crop-001_z0000_y3584_x0000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-PyTC-axonem-cortex/crop-001_z0000_y3584_x0000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-PyTC-axonem-cortex/crop-002_z0350_y1792_x1792
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-PyTC-axonem-cortex/crop-002_z0350_y1792_x1792.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-PyTC-axonem-cortex/crop-003_z0700_y0000_x0000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-PyTC-axonem-cortex/crop-003_z0700_y0000_x0000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-PyTC-axonem-cortex/crop-004_z0700_y0000_x3584
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-PyTC-axonem-cortex/crop-004_z0700_y0000_x3584.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-PyTC-axonem-cortex/crop-005_z0700_y3584_x0000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-PyTC-axonem-cortex/crop-005_z0700_y3584_x0000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-mouse-PyTC-axonem-cortex/crop-006_z0700_y3584_x3584
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-PyTC-axonem-cortex/crop-006_z0700_y3584_x3584.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-rat-MitoVerse-wei20-visual-cortex/crop-001_mitoEM-R
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-rat-MitoVerse-wei20-visual-cortex/crop-001_mitoEM-R.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-rat-lucchi-hippocampus/crop-001_train
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-rat-lucchi-hippocampus/crop-001_train.zarr
+  image_key: raw
+  zarr_version: zarr3
+  resolutions:
+  - - 2.578125
+    - 2.578125
+    - 2.578125
+- name: em-rat-lucchi-hippocampus/crop-002_test
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-rat-lucchi-hippocampus/crop-002_test.zarr
+  image_key: raw
+  zarr_version: zarr3
+  resolutions:
+  - - 2.578125
+    - 2.578125
+    - 2.578125
+- name: em-salamander-jrc-amphiuma-liver/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-salamander-jrc-amphiuma-liver/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-salamander-jrc-axolotl-heart/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-salamander-jrc-axolotl-heart/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-salamander-jrc-axolotl-liver/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-salamander-jrc-axolotl-liver/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-CellMap-jrc-zf-cardiac-1/crop-001_fullvol_tissuecrop
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-CellMap-jrc-zf-cardiac-1/crop-001_fullvol_tissuecrop.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-001_x27648_y32963_z3143
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-001_x27648_y32963_z3143.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-002_x58228_y25201_z3904
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-002_x58228_y25201_z3904.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-003_x98895_y29905_z4127
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-003_x98895_y29905_z4127.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-004_gt-box-8nm_x59517_y30379_z2000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-004_gt-box-8nm_x59517_y30379_z2000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-005_gt-em-8nm_x74367_y33700_z2000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-005_gt-em-8nm_x74367_y33700_z2000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-006_gt-em-roi14_x71500_y45000_z2000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-006_gt-em-roi14_x71500_y45000_z2000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-007_gt-em-roi16_x88500_y45000_z2000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-007_gt-em-roi16_x88500_y45000_z2000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-008_gt-em_x61364_y37130_z2000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-008_gt-em_x61364_y37130_z2000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-009_gt-roi1_x80000_y35000_z1350
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-009_gt-roi1_x80000_y35000_z1350.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-010_gt-roi12_x89000_y60000_z2000
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-010_gt-roi12_x89000_y60000_z2000.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-011_gt-roi2_x80000_y60000_z1350
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-011_gt-roi2_x80000_y60000_z1350.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-012_gt-roi3_x68000_y37500_z1350
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-012_gt-roi3_x68000_y37500_z1350.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-013_gt-roi4_x66500_y53500_z1350
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-013_gt-roi4_x66500_y53500_z1350.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-014_gt-roi5_x55000_y29000_z1350
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-014_gt-roi5_x55000_y29000_z1350.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish1/crop-015_gt-roi6_x55000_y63000_z1350
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish1/crop-015_gt-roi6_x55000_y63000_z1350.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish2/crop-001_doublecube1_x52000_y42500_z0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish2/crop-001_doublecube1_x52000_y42500_z0.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish2/crop-002_doublecube2_x120000_y45500_z0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish2/crop-002_doublecube2_x120000_y45500_z0.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish2/crop-003_quadcube1_x23908_y18314_z0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish2/crop-003_quadcube1_x23908_y18314_z0.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish2/crop-004_quadcube2_x15114_y10046_z0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish2/crop-004_quadcube2_x15114_y10046_z0.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish2/crop-005_quadcube3_x9638_y10314_z0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish2/crop-005_quadcube3_x9638_y10314_z0.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: em-zebrafish-fish2/crop-006_quadcube4_x48294_y6026_z0
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/em-zebrafish-fish2/crop-006_quadcube4_x48294_y6026_z0.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: exm-drosophila-flyliconn-ExPID06B-Brain2-PFA-AA-epox/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-ExPID06B-Brain2-PFA-AA-epox/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 478
+  normalize_min: 123
+- name: exm-drosophila-flyliconn-FlyID10-20250923_2ndGel_PBS_MES_B1_Atto488_40XW_002/crop-001_normalized
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID10-20250923_2ndGel_PBS_MES_B1_Atto488_40XW_002/crop-001_normalized.zarr
+  image_key: raw
+  zarr_version: zarr2
+  normalize_max: 630
+  normalize_min: 178
+- name: exm-drosophila-flyliconn-FlyID10-20250923_2ndGel_PBS_MES_B1_Atto488_40XW_002/crop-001_raw
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID10-20250923_2ndGel_PBS_MES_B1_Atto488_40XW_002/crop-001_raw.zarr
+  image_key: raw
+  zarr_version: zarr2
+  normalize_max: 523
+  normalize_min: 135
+- name: exm-drosophila-flyliconn-FlyID10-20250923_2ndGel_PBS_MES_B2_Atto488_40XW_002/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID10-20250923_2ndGel_PBS_MES_B2_Atto488_40XW_002/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 526
+  normalize_min: 146
+- name: exm-drosophila-flyliconn-FlyID10-20250923_2ndGel_PBS_PIPES_B2_Atto488_40XW_002/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID10-20250923_2ndGel_PBS_PIPES_B2_Atto488_40XW_002/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 456
+  normalize_min: 119
+- name: exm-drosophila-flyliconn-FlyID22-20260203_2ndGel_0.0655BIS_40XW004/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID22-20260203_2ndGel_0.0655BIS_40XW004/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1486
+  normalize_min: 277
+- name: exm-drosophila-flyliconn-FlyID25-20260216_MESFix_2ndGel_B1_40XW/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID25-20260216_MESFix_2ndGel_B1_40XW/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 953
+  normalize_min: 181
+- name: exm-drosophila-flyliconn-FlyID25-20260216_MESFix_2ndGel_B1_40XW003/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID25-20260216_MESFix_2ndGel_B1_40XW003/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 891
+  normalize_min: 198
+- name: exm-drosophila-flyliconn-FlyID25-20260216_MOPS_2ndGel_B1_40XW/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID25-20260216_MOPS_2ndGel_B1_40XW/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1164
+  normalize_min: 237
+- name: exm-drosophila-flyliconn-FlyID25-mitochondria-20260216_MOPS_2ndGel_B1_40XW003/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID25-mitochondria-20260216_MOPS_2ndGel_B1_40XW003/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 832
+  normalize_min: 214
+- name: exm-drosophila-flyliconn-FlyID26-20260221_2ndgel_S4_B1_40XW/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID26-20260221_2ndgel_S4_B1_40XW/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 954
+  normalize_min: 215
+- name: exm-drosophila-flyliconn-FlyID26-20260221_2ndgel_S4_B1_40XW003/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID26-20260221_2ndgel_S4_B1_40XW003/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 919
+  normalize_min: 207
+- name: exm-drosophila-flyliconn-FlyID26-20260221_2ndgel_S4_B1_40XW004/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID26-20260221_2ndgel_S4_B1_40XW004/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1713
+  normalize_min: 318
+- name: exm-drosophila-flyliconn-FlyID47-2ndgel-DUP-S7-40XW003-20260619/crop-001_clahe
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID47-2ndgel-DUP-S7-40XW003-20260619/crop-001_clahe.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 2512
+  normalize_min: 356
+- name: exm-drosophila-flyliconn-FlyID47-2ndgel-DUP-S7-40XW003-20260619/crop-001_raw
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID47-2ndgel-DUP-S7-40XW003-20260619/crop-001_raw.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 2447
+  normalize_min: 347
+- name: exm-drosophila-flyliconn-FlyID47-2ndgel-DUP-S7-B2-40XW-20260620/crop-001_clahe
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID47-2ndgel-DUP-S7-B2-40XW-20260620/crop-001_clahe.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 170
+  normalize_min: 20
+- name: exm-drosophila-flyliconn-FlyID47-2ndgel-DUP-S7-B2-40XW-20260620/crop-001_raw
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID47-2ndgel-DUP-S7-B2-40XW-20260620/crop-001_raw.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 168
+  normalize_min: 21
+- name: exm-drosophila-flyliconn-FlyID47-2ndgel-S2-40XW007-20260619/crop-001_clahe
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID47-2ndgel-S2-40XW007-20260619/crop-001_clahe.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 879
+  normalize_min: 181
+- name: exm-drosophila-flyliconn-FlyID47-2ndgel-S2-40XW007-20260619/crop-001_raw
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID47-2ndgel-S2-40XW007-20260619/crop-001_raw.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 971
+  normalize_min: 175
+- name: exm-drosophila-flyliconn-FlyID47-2ndgel-S2-40XW009-20260619/crop-001_clahe
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID47-2ndgel-S2-40XW009-20260619/crop-001_clahe.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1121
+  normalize_min: 189
+- name: exm-drosophila-flyliconn-FlyID47-2ndgel-S2-40XW009-20260619/crop-001_raw
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID47-2ndgel-S2-40XW009-20260619/crop-001_raw.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1145
+  normalize_min: 191
+- name: exm-drosophila-flyliconn-FlyID49-2ndgel-BIS-40XW002-20260625/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID49-2ndgel-BIS-40XW002-20260625/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1489
+  normalize_min: 221
+- name: exm-drosophila-flyliconn-FlyID49-2ndgel-DUP-BIS-40XW005-20260625/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID49-2ndgel-DUP-BIS-40XW005-20260625/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1526
+  normalize_min: 206
+- name: exm-drosophila-flyliconn-FlyID49-2ndgel-DUP-BIS-40XW006-20260625/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID49-2ndgel-DUP-BIS-40XW006-20260625/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1448
+  normalize_min: 210
+- name: exm-drosophila-flyliconn-FlyID49-mirrorscope-central-20260702/crop-001_central
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID49-mirrorscope-central-20260702/crop-001_central.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 4323
+  normalize_min: 0
+- name: exm-drosophila-flyliconn-FlyID49-mirrorscope-lobe-20260702/crop-001_lobe
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-FlyID49-mirrorscope-lobe-20260702/crop-001_lobe.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 4498
+  normalize_min: 0
+- name: exm-drosophila-flyliconn-matt-260601-60X-B2-1-027/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B2-1-027/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 2918
+  normalize_min: 750
+- name: exm-drosophila-flyliconn-matt-260601-60X-B2-1-028/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B2-1-028/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 2924
+  normalize_min: 726
+- name: exm-drosophila-flyliconn-matt-260601-60X-B2-1-029/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B2-1-029/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1876
+  normalize_min: 456
+- name: exm-drosophila-flyliconn-matt-260601-60X-B2-2-030/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B2-2-030/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1951
+  normalize_min: 394
+- name: exm-drosophila-flyliconn-matt-260601-60X-B2-2-031/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B2-2-031/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1761
+  normalize_min: 408
+- name: exm-drosophila-flyliconn-matt-260601-60X-B2-2-032/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B2-2-032/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 2908
+  normalize_min: 687
+- name: exm-drosophila-flyliconn-matt-260601-60X-B4-1-040/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B4-1-040/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 2331
+  normalize_min: 546
+- name: exm-drosophila-flyliconn-matt-260601-60X-B4-1-041/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B4-1-041/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 3114
+  normalize_min: 782
+- name: exm-drosophila-flyliconn-matt-260601-60X-B4-1-042/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B4-1-042/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 3107
+  normalize_min: 700
+- name: exm-drosophila-flyliconn-matt-260601-60X-B4-2-043/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B4-2-043/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1568
+  normalize_min: 329
+- name: exm-drosophila-flyliconn-matt-260601-60X-B4-2-044/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B4-2-044/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 2790
+  normalize_min: 720
+- name: exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 2729
+  normalize_min: 684
+- name: exm-drosophila-flyliconn-matt-phDye19-Gel2-OpticLobes-60x/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-flyliconn-matt-phDye19-Gel2-OpticLobes-60x/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 5281.46
+  normalize_min: 503.352
+- name: exm-drosophila-rubinlab-30X_lobeTm1_NHS546_687um_lower-laser_n2/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-rubinlab-30X_lobeTm1_NHS546_687um_lower-laser_n2/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1585
+  normalize_min: 336
+- name: exm-drosophila-rubinlab-Valentina-iSIM-Hari-101626/crop-001_16X_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-rubinlab-Valentina-iSIM-Hari-101626/crop-001_16X_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 18179.7
+  normalize_min: 8.0
+- name: exm-drosophila-rubinlab-Valentina-iSIM-Hari-101626/crop-002_30X_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-drosophila-rubinlab-Valentina-iSIM-Hari-101626/crop-002_30X_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1479.9
+  normalize_min: 35.55
+- name: exm-mouse-liconn-DG-20250809_ExPID19-02_2ndGel_C5_Atto488_40XW_002/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-mouse-liconn-DG-20250809_ExPID19-02_2ndGel_C5_Atto488_40XW_002/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 1130
+  normalize_min: 301
+- name: exm-mouse-liconn-ExPID124/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-mouse-liconn-ExPID124/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: exm-mouse-liconn-ExPID146/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-mouse-liconn-ExPID146/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: exm-mouse-liconn-ExPID150/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-mouse-liconn-ExPID150/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: exm-mouse-liconn-ExPID82-1/crop-001_fullvol
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-mouse-liconn-ExPID82-1/crop-001_fullvol.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: exm-mouse-liconn-ExPID82-1/crop-002_sub
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-mouse-liconn-ExPID82-1/crop-002_sub.zarr
+  image_key: raw
+  zarr_version: zarr3
+- name: exm-mouse-liconn-cortex-20250822_ExPID09_2ndGel_30percentSucrose-Glycerol_40XW_003/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-mouse-liconn-cortex-20250822_ExPID09_2ndGel_30percentSucrose-Glycerol_40XW_003/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 584
+  normalize_min: 172
+- name: exm-mouse-liconn-hippocampus-202507013_ExPID10-02_2percentAA_S2_Atto488_40XW_004/crop-001
+  path: /groups/miaai/miaai/lmd-v0.0.1/data/exm-mouse-liconn-hippocampus-202507013_ExPID10-02_2percentAA_S2_Atto488_40XW_004/crop-001.zarr
+  image_key: raw
+  zarr_version: zarr3
+  normalize_max: 919
+  normalize_min: 219

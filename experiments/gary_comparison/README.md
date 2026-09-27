@@ -144,6 +144,8 @@ label transform, which nothing in the data path does today.
 | 2b | `2b_simmim_lmd_mask85.toml` | arm 2a with `mask_ratio = 0.85`, nothing else (`diff` the two). 2a vs 2b, read through their eventual fine-tunes, is the value of a harder pretext task in 3D |
 | 3a | `3a_simmim60_axial_subpixel.toml` | arm 1a's recipe with `[init]` pointing at arm 2a's final SSL checkpoint (`prefix = "model."`, no inflation, no `skip`); every other non-comment line identical to 1a. 3a vs 1a: in-domain SimMIM against natural-image pretraining; 3a vs 1b: against no pretraining |
 | 3b | `3b_simmim85_axial_subpixel.toml` | the same from arm 2b's checkpoint. 3a vs 3b is the SSL mask ratio, read at equal supervised budget |
+| 4a | `4a_dinov3_axial_subpixel_p8.toml` | arm 1a at **patch 8**: `patch_size` 16 -> 8, every other non-comment line identical (64 nm tokens, 32,768 per 256^3 crop; the LVD patch kernel is resized to 8^3 by block sums). 4a vs 1a is the finer token with our own decoder. Created 2026-09-23 after the colleague's setup came to light (8 nm data, 8^3 patches, UNETR); submit with `WALL=240:00` |
+| 4b | `4b_dinov3sat_axial_subpixel_p8.toml` | arm 4a initialised from **SAT-493M** instead of LVD-1689M: only `[init].path` and `skip` (+ `local_cls_norm.`, as sam_lmd_v1 arm 12) differ. 4b vs 4a is the pretraining corpus at patch 8; submit with `WALL=240:00` |
 
     bash experiments/gary_comparison/submit.sh 1a_dinov3_axial_subpixel            # 20-step smoke on 1 GPU, then the real run chained on done(smoke)
     bash experiments/gary_comparison/submit.sh --dry-run 1a_dinov3_axial_subpixel  # print the bsub lines, write the job scripts
@@ -186,13 +188,25 @@ val loss at 100k-multiples 0.132, 0.109, 0.099, 0.108, 0.127, 0.092, 0.125, 0.11
 Scored at the **final checkpoint only**, by decision of 2026-09-22 (jobs 154398281-154398284; the 300k and 500k
 scorings that had been queued were cancelled before producing anything).
 
+Arms 4a (patch 8, LVD-1689M) and 4b (patch 8, SAT-493M) submitted 2026-09-23 17:22 with `WALL=240:00`: smoke
+jobs 154427914 / 154427916, real runs 154427915 / 154427917 chained on them. Both smokes PASSED (20 steps, val,
+checkpoint). Init: 366 copied, 1 inflated (the patch kernel, resized to 8^3), 1 skipped (`rope_embed.periods`),
+0 unused, for both checkpoints (SAT's `local_cls_norm.` tensors are removed by the skip prefix). A patch-8
+step is 431 TFLOP per rank (1a: 15.1) and ran at 0.54 s/step on one B300 (1.86 crops/s, MFU 0.36, no
+activation checkpointing needed at 32,768 tokens); expect ~0.55-0.65 s/step on 8 ranks, i.e. 3.2-3.8 days for
+500k steps. The cold-head check of 1a applies: judge the trivial-predictor plateau no earlier than ~3k steps.
+**4a running** on i09u02 from ~17:27: step 1k on the trivial predictor (accuracy 0.8880 vs positive rate 0.8875, boundary
+0.006), step 2k ESCAPED (0.913 vs 0.902, boundary 0.22; 1a had 0.07 at 2k); 14.46 crops/s = 0.553 s/step on 8 ranks, MFU
+0.35, data_wait 0.001 -> ~77 h, finish ~2026-09-26 evening. 4b PEND for a whole B300 node.
+
 ## SSL arms (2a, 2b): SimMIM pretraining on the lmd corpus
 
 Created 2026-09-20 on request. Two configs that differ in one non-comment line
 (`mask_ratio` 0.6 vs 0.85; `diff 2a_simmim_lmd_mask60.toml 2b_simmim_lmd_mask85.toml`). Each pretrains a 3D
 DINOv3 ViT-L/16 from random initialisation with SimMIM for 500k steps at global batch 128 (16 per rank on one
-B300 node) on lmd-configs' census-20260920 single-scale pretraining corpus,
-`/groups/miaai/miaai/lmd-v0.0.1/configs/configs/pretraining/singlescale/baseline/8nm_p256_swe0.4_min1e8_up8_census20260920.yaml`.
+B300 node) on lmd-configs' census-20260920 single-scale pretraining corpus, copied here as
+`data/8nm_p256_swe0.4_min1e8_up8_census20260920.yaml` (launched from lmd-configs'
+`configs/pretraining/singlescale/baseline/`; copied 2026-09-24 when that repo renamed `pretraining/` to `unlabeled/`).
 Only the SSL stage exists; the supervised stage (arm 1a's recipe initialised from an SSL checkpoint) is
 deliberately not chained yet. The template is lmd_ssl_v1's arm-1 stage A; every departure from it is listed
 and justified in the config header (SDPA + `compile`, 1M steps, the new corpus, 1M samples per epoch, the
@@ -422,6 +436,28 @@ same recipe and half the schedule:
 - **The cc_threshold gain is a different operating point, not a better model.** The fit block chose a lower
   threshold (logit +3 against +6) and a smaller size filter, which trades merges for fragments: pq rose, but VOI
   merge more than doubled and adapted Rand error worsened. Compare that row on pq only with care.
+
+**Arm 3b: in-domain SimMIM encoder, final checkpoint (scored 2026-09-24).** Arm 1a's recipe initialised from
+arm 2b's SSL encoder (SimMIM at mask ratio 0.85, 500k steps on the census-20260920 lmd corpus), against the
+natural-image (1a) and scratch (1b) encoders at the same supervised step:
+
+| record | route | test pq | VOI merge | VOI split | adapted Rand error |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1a, LVD-1689M init, 500k | mws | **0.1636** | 0.421 | 0.954 | 0.222 |
+| 3b, SimMIM-on-lmd init, 500k | mws | 0.1608 | 0.439 | 0.958 | 0.229 |
+| 1b, scratch, 500k | mws | 0.1531 | 0.480 | 0.965 | 0.237 |
+| 1a, 500k | cc_threshold | 0.1184 | 1.525 | 1.204 | 0.728 |
+| 3b, 500k | cc_threshold | 0.1162 | 1.550 | 1.189 | 0.728 |
+| 1b, 500k | cc_threshold | 0.1137 | 1.619 | 1.207 | 0.748 |
+
+- **In-domain SimMIM recovers most of the gap between scratch and natural-image pretraining**: 0.0077 of the 0.0105
+  pq under the watershed, 0.0025 of 0.0047 under thresholded components, with the same fitted post-processing as 1a
+  and 1b on both routes. As for 1a against 1b, the gain is in merges: VOI merge 0.480, 0.439, 0.421.
+- One seed and one test block, so the 0.003 gap to 1a is not separable from run-to-run variation. And the SSL corpus
+  held the whole hemibrain crop, test corner included (about 0.007% of SSL samples touched it, unlabelled; see "SSL
+  arms"), which LVD-1689M never saw.
+- Arm 3a (mask ratio 0.6) was not scored, by decision of 2026-09-24. The mws scoring took 55 minutes on the compiled
+  watershed.
 
 Records: `leaderboard/gary_comparison_neuron_instance/` in mia-evals; scored labellings under
 `/nrs/scicompsoft/orhane/mia-evals/gary_comparison_neuron_instance/scored/<record>/`.

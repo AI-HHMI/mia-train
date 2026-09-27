@@ -82,7 +82,7 @@ name = "miao_volumes"
 # Ellipsoid Body crop -- this experiment's volume -- WHOLE, test corner included, at 0.79% of an epoch. About
 # 0.9% of that volume's 256^3 crops touch the [4000, 5000)^3 corner, so ~0.007% of all samples (~4.5k of 64M) show
 # test-corner voxels, unlabelled. README, "SSL arms", for the strict alternative.
-config_path = "/groups/miaai/miaai/lmd-v0.0.1/configs/configs/pretraining/singlescale/baseline/8nm_p256_swe0.4_min1e8_up8_census20260920.yaml"
+config_path = "experiments/gary_comparison/data/8nm_p256_swe0.4_min1e8_up8_census20260920.yaml"
 # An epoch boundary respawns every loader worker (~4 s). 1M samples = 7,812 steps per epoch at global batch 128,
 # 64 boundaries in the run, <0.1% of wall. Sampling is with replacement, so the value changes nothing else.
 samples_per_epoch = 1000000

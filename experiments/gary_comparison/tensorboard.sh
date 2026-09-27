@@ -32,6 +32,13 @@
 #                              Read it against 1a (natural-image pretraining) and 1b (none).
 #   3b_simmim85_axial_subpixel the same from arm 2b's checkpoint; 3a vs 3b is the SSL mask ratio.
 #                              Both start a COLD sub-pixel head: the collapse check below applies.
+#   4a_dinov3_axial_subpixel_p8
+#                              arm 1a at patch 8 (64 nm tokens, 32,768 per crop), nothing else; 4a vs
+#                              1a is the finer token. Several times slower per step: compare at equal
+#                              steps, not equal wall time.
+#   4b_dinov3sat_axial_subpixel_p8
+#                              arm 4a initialised from SAT-493M instead of LVD-1689M; 4b vs 4a is the
+#                              pretraining corpus. Both start a COLD sub-pixel head too.
 #
 # WHAT TO READ
 #
@@ -83,7 +90,8 @@ VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
 ARMS=(1a_dinov3_axial_subpixel 1b_scratch_axial_subpixel 1c_dinov3_axial_subpixel_1m
       2a_simmim_lmd_mask60 2b_simmim_lmd_mask85
-      3a_simmim60_axial_subpixel 3b_simmim85_axial_subpixel)
+      3a_simmim60_axial_subpixel 3b_simmim85_axial_subpixel
+      4a_dinov3_axial_subpixel_p8 4b_dinov3sat_axial_subpixel_p8)
 
 PORT=6006 SMOKE=0 LIST=0
 for arg in "$@"; do

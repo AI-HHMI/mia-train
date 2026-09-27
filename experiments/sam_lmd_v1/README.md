@@ -616,8 +616,9 @@ must be labelled and evaluated with 352-voxel windows: the scoring scripts read 
 (see arm 9 on the leaderboard).
 
 **Arms 11 and 12: arm 8 from a random encoder and from the satellite checkpoint** (configs written
-and launched 2026-09-23 on gpu_b300; smokes 154399975 / 154399977, full runs 154399976 /
-154399978 held on them). Everything is arm 8's except where the encoder starts. Arm 11 has no
+and launched 2026-09-23 on gpu_b300; both smokes passed, arm 12's through the strict SAT load; full
+runs 154399976 on i07u02 and 154399978 on i01u02 training since 11:08 at 1.39-1.40 s/step, arm 8's
+compute exactly (438 TFLOP per step per rank), so about 78 h, due Saturday 2026-09-26 afternoon). Everything is arm 8's except where the encoder starts. Arm 11 has no
 `[init]` section: `dinov3_vit3d` keeps the random weights its constructor gives it, and the promptable
 head needs no change for that because its mask-feature projection is not zero-initialised; arm 8 vs
 arm 11 is the value of the pretrained weights for this task (gary_comparison's 1a vs 1b measured it
