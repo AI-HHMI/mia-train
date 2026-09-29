@@ -142,12 +142,18 @@ label transform, which nothing in the data path does today.
 | 1c | `1c_dinov3_axial_subpixel_1m.toml` | arm 1a trained twice as long: `max_steps` 1M and `checkpoint_every` 100k, nothing else changed (so the linear decay stretches to 1M). 1a vs 1c is the value of a longer schedule; submit with `WALL=168:00` |
 | 2a | `2a_simmim_lmd_mask60.toml` | **SSL only.** SimMIM pretraining of a 3D DINOv3 ViT-L/16 from random init on the census-20260920 lmd corpus (226 volumes), 500k steps at global batch 128 (16/rank, one B300 node), mask ratio 0.6, axial RoPE, SDPA + compile, in-plane rotation as the only augmentation; validates reconstruction on the hemibrain val slab. Created 2026-09-20 (written as 1M steps, cut to 500k before launch); submit with `WALL=336:00` |
 | 2b | `2b_simmim_lmd_mask85.toml` | arm 2a with `mask_ratio = 0.85`, nothing else (`diff` the two). 2a vs 2b, read through their eventual fine-tunes, is the value of a harder pretext task in 3D |
+| 2c | `2c_simmim_hemibrain_mask90.toml` | arm 2b with `mask_ratio = 0.9` and a different corpus: two hemibrain crops (crop-002 and crop-003, each its first 10,000^3 voxels, `data/hemibrain_ssl_crop002_crop003.yaml`) instead of the census corpus -- the boxes keep both scored blocks out of pretraining (pixel check in the data file). The colleague's "SSL on a large hemibrain crop" factor; scored through a 3b-style fine-tune (3c, written from this run's final checkpoint); submit with `WALL=336:00` |
 | 3a | `3a_simmim60_axial_subpixel.toml` | arm 1a's recipe with `[init]` pointing at arm 2a's final SSL checkpoint (`prefix = "model."`, no inflation, no `skip`); every other non-comment line identical to 1a. 3a vs 1a: in-domain SimMIM against natural-image pretraining; 3a vs 1b: against no pretraining |
 | 3b | `3b_simmim85_axial_subpixel.toml` | the same from arm 2b's checkpoint. 3a vs 3b is the SSL mask ratio, read at equal supervised budget |
+| 3c | `3c_simmim90_hemibrain_200k_axial_subpixel.toml` | arm 3b's recipe from arm **2c's step-200000** SSL checkpoint (SimMIM at mask 0.9 on two hemibrain crops) instead of 2b's final one: only `[init].path` and experiment_name differ from 3b. An early signal, launched before 2c finished; 3c vs 3b is corpus + mask ratio together, at 200k against 500k SSL steps |
+| 3d | `3d_simmim90_hemibrain_500k_axial_subpixel.toml` | arm 3c from arm **2c's FINAL step-500000** SSL checkpoint instead of its step-200000 one: only `experiment_name`, `[init] path` and `checkpoint_every` (100k, 3c: 50k) differ from 3c, so 3d vs 3c is SSL length alone (500k against 200k SimMIM steps). Requested 2026-09-28; launched by waiter job 154463704 once 2c completed |
 | 4a | `4a_dinov3_axial_subpixel_p8.toml` | arm 1a at **patch 8**: `patch_size` 16 -> 8, every other non-comment line identical (64 nm tokens, 32,768 per 256^3 crop; the LVD patch kernel is resized to 8^3 by block sums). 4a vs 1a is the finer token with our own decoder. Created 2026-09-23 after the colleague's setup came to light (8 nm data, 8^3 patches, UNETR); submit with `WALL=240:00` |
 | 4b | `4b_dinov3sat_axial_subpixel_p8.toml` | arm 4a initialised from **SAT-493M** instead of LVD-1689M: only `[init].path` and `skip` (+ `local_cls_norm.`, as sam_lmd_v1 arm 12) differ. 4b vs 4a is the pretraining corpus at patch 8; submit with `WALL=240:00` |
 | 5a | `5a_dinov3_axial_unetr.toml` | arm 1a with the **UNETR decoder** (`decoder = "unetr"`: blocks 6/12/18/24, widths 16/32/64/128, raw-image skip), every other recipe line identical. Runs on **2 B300s x batch 4** instead of 8 x 1 (same global batch 8; `num_workers` 11): submit with `GPUS=2 SMOKE_GPUS=2 WALL=240:00`. 5a vs 1a is the decoder |
-| 5b | `5b_dinov3_axial_unetr_p8.toml` | arm 4a (patch 8) with the **UNETR decoder** (3 stages: blocks 8/16/24, widths 16/32/64, raw-image skip), every other non-comment line identical to 4a, one full B300 node; submit with `WALL=240:00` from the worktree. 5b vs 4a is the decoder at 64 nm tokens, 5b vs 5a the token size under UNETR |
+| 5b | `5b_dinov3_axial_unetr_p8.toml` | arm 4a (patch 8) with the **UNETR decoder** (3 stages: blocks 8/16/24, widths 16/32/64, raw-image skip), every other non-comment line identical to 4a, one full B300 node; submit with `WALL=240:00`. 5b vs 4a is the decoder at 64 nm tokens, 5b vs 5a the token size under UNETR |
+| 6a | `6a_dinov3_axial_subpixel_erode1.toml` | arm 1a with **label erosion**: `label_erosion = 1` (gunpowder GrowBoundary through `miao.labels.erode_labels`, on the device before any target), every other non-comment line identical. 6a vs 1a is the colleague's erosion factor, training half; its validation metrics use eroded targets and are not comparable with other arms' |
+| 7a | `7a_dinov3_axial_subpixel_testcrop_50k.toml` | **deliberate test-set leakage control**: arm 1a trained on the TEST corner (`data/hemibrain_eb_test.yaml`) for 50k steps (warmup 5k), checkpointing every 5k; only experiment_name, the training data, max_steps and checkpoint_every differ from 1a. Calibrates what training on the test labels scores against the colleague's row; never rank it with the others. Scored OFF the mia-evals leaderboard, steps 10000, 20000, 30000, 40000 and 50000 (user's choice), mws: `LEADERBOARD=$EXP/probes/testcrop_leakage/leaderboard bash score.sh 7a_dinov3_axial_subpixel_testcrop_50k <step> --routes mws` (record, table and scored labellings under that directory; 10k-40k submitted directly 2026-09-28; 50k by the waiter `probes/testcrop_leakage/score_50k_off_leaderboard.sh`, job 154459216) |
+| 7b | `7b_dinov3_axial_subpixel_testcrop_100k.toml` | **test-set leakage control, longer**: arm 7a run for 100k steps (warmup 5k, linear decay to 100k) with ONE checkpoint, at 100k; only experiment_name, max_steps and checkpoint_every differ from 7a. Requested 2026-09-28 after 7a@50k scored pq 0.221, still rising. Score OFF the leaderboard like 7a (`LEADERBOARD=$EXP/probes/testcrop_leakage/leaderboard`, mws); never rank it. Scored 2026-09-28 (mws, off the leaderboard): pq 0.3178 (SQ 0.808, RQ 0.393, TP 908, FP 904; VOI split 0.761, merge 0.241; ARE 0.172; min_size 5000) -- above the colleague's row on all six numbers, while its held-out fit-block pq (0.152) equals 1a's |
 
     bash experiments/gary_comparison/submit.sh 1a_dinov3_axial_subpixel            # 20-step smoke on 1 GPU, then the real run chained on done(smoke)
     bash experiments/gary_comparison/submit.sh --dry-run 1a_dinov3_axial_subpixel  # print the bsub lines, write the job scripts
@@ -502,3 +508,34 @@ Arm 5b (UNETR at patch 8, branch `unetr-decoder`) submitted 2026-09-24 23:23 wit
 154450714 PASSED (1 GPU, 20 steps, val, 4.6 GB checkpoint; 434.5 TFLOP per step per rank vs 4a's 430.9),
 real run 154450715 dispatched on i04u22. Step 1k on the trivial predictor (0.8876 vs positive rate 0.8875),
 step 2k escaped (0.921 vs 0.902); 13.67 crops/s = 0.585 s/step: ~81 h for 500k steps, finish ~2026-09-28 morning.
+
+Arms 6a (label erosion) and 2c (SimMIM on two hemibrain crops, mask 0.9) submitted 2026-09-26 21:24, one full
+B300 node each. 6a: `WALL=96:00`, smoke 154455454 PASSED (1 GPU, 20 steps, val, checkpoint; val target positive
+rate 0.769 against 1a's ~0.86, i.e. the eroded targets are live), real run 154455455 on i03u02: step 1k on the
+trivial predictor (accuracy 0.8167 vs positive rate 0.8164), step 2k escaped (0.851 vs 0.830, boundary 0.35),
+step 3k 0.875 vs 0.823; 30.2 crops/s (1a 29.98: erosion costs nothing), data_wait 0.002 -> ~37 h, finish
+~2026-09-28 10:00. 2c: `WALL=336:00`, smoke 154455456 PASSED (loss 0.207 at step 20), real run 154455457 on
+i01u22: 399 samples/s (2b 369), MFU 0.26, data_wait 0.003 -> ~45 h, finish ~2026-09-28 18:00; then arm 3c.
+
+Arm 3c (3b's recipe from 2c's step-200000 SSL checkpoint, an early signal) launched 2026-09-27 by a waiter job that
+held until the checkpoint was complete (`.metadata` written and 2c logging step 201k; 15:46): smoke 154457697 PASSED
+(init: 368 copied, 0 skipped, 0 kept at initial value, 0 unused; 370 SimMIM-side tensors filtered out by the `model.`
+prefix), real run 154457698 on i04u22 from 15:49: step 1k on the trivial predictor (0.8875 vs 0.8875), step 3k
+escaped (0.921 vs 0.893, boundary 0.554; 1a 0.56); 30.3 crops/s -> finish ~2026-09-29 04:30. KILLED 2026-09-28 at
+the user's request at step ~323k (job 154457698, TERM_OWNER); checkpoints every 50k to step 300000 remain, unscored.
+
+Arm 3d (3c from 2c's FINAL step-500000 checkpoint, `checkpoint_every` 100k) launched 2026-09-28 by waiter job 154463704 once 2c completed (checkpoint complete 18:54): smoke 154463716 PASSED; real run 154463717 on i02u22 from 18:57 (init: 368 copied, 0 skipped, 0 kept at initial value, 0 unused, 370 SimMIM-side tensors filtered out by the `model.` prefix, as for 3c). Step 1k on the trivial predictor (0.8875 vs 0.8875), step 3k escaped (0.921 vs 0.893, boundary 0.548; 3c 0.554); 30.2 crops/s -> finish ~2026-09-30 07:45. KILLED 2026-09-29 at the user's request at step ~201k (job 154463717, TERM_OWNER), right after its step-200000 checkpoint completed (8 files, 4.8 GB, `.metadata` written, step 201k logged); that checkpoint is scored with mws on the leaderboard (predictions 154467067/154467068, scoring 154467069).
+
+Arm 6a scored at step 200000 (2026-09-27), both routes: `mws` pq 0.1433 (TP 312, FP 400, VOI merge 0.833, adapted
+Rand error 0.425: the size filter deletes the eroded gaps and leaves them unlabelled) and `mws_fill` (mia-evals,
+`fill_distances` fitted with `min_sizes`; chose min_size 20000, fill 1) pq 0.1569 (TP 326, FP 386, VOI merge 0.509,
+adapted Rand error 0.254) -- level with 1a at 300k (0.1570, TP 319), no recognition gain. Scoring jobs now run under
+`numa_local.py` (score.sh): a scorer whose cores straddled both sockets spent 73% of its time in the kernel's NUMA
+balancing and took 4197 s for a watershed that took 1904 s elsewhere; pinned to one socket the test watershed took
+1220 s against 1471 s.
+
+Arm 6a final (step 500000, 2026-09-28), both routes on the leaderboard: `mws` pq 0.1445 (TP 314, FP 388, VOI merge
+0.790, adapted Rand error 0.404) and `mws_fill` (chose min_size 20000, fill 1) pq 0.1560 (TP 322, FP 380, VOI merge
+0.470, adapted Rand error 0.240). Level with its own 200k scores (0.1433 / 0.1569) and below its control 1a@500k
+(0.1636, TP 333) on both routes: label erosion, with or without the fill, does not help. The fill changes only
+unlabelled voxels, which VOI and the adapted Rand error count as one segment -- hence VOI merge 0.790 -> 0.470.

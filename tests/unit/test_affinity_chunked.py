@@ -169,3 +169,16 @@ def test_label_dtype_does_not_change_what_is_computed():
     narrow = _algorithm().training_step({**batch, "label": batch["label"].to(torch.int32)})
     for name, expected in wide.items():
         assert float(narrow[name]) == pytest.approx(float(expected), rel=1e-6), name
+
+
+@pytest.mark.unit
+def test_eroded_targets_match_the_undivided_decode():
+    """Erosion runs once on the whole crop: eroded per slab, every seam would stay uneroded."""
+    torch.manual_seed(2)
+    blocks = torch.randint(1, 6, (2, 1, CROP // 8, CROP // 8, CROP // 8))
+    label = blocks.repeat_interleave(8, 2).repeat_interleave(8, 3).repeat_interleave(8, 4)
+    batch = {**_batch(), "label": label}
+    whole = _algorithm(label_erosion=1).training_step(batch)
+    split = _algorithm(label_erosion=1, decode_chunks=3).training_step(batch)
+    for name, expected in whole.items():
+        assert float(split[name]) == pytest.approx(float(expected), rel=1e-5, abs=1e-6), name

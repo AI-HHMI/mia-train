@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 import torch.nn as nn
+from torch.distributed.tensor.experimental import implicit_replication
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -157,6 +158,20 @@ def build_optimizer(model: nn.Module, config: TrainerConfig) -> Optimizer:
         betas=(config.beta1, config.beta2),
         weight_decay=config.weight_decay,
     )
+
+
+def optimizer_step(optimizer: Optimizer) -> None:
+    """`optimizer.step()` for a parameter set that may mix DTensors and plain tensors.
+
+    Tensor parallelism without FSDP (`tp > 1`, `dp_shard = 1`) turns only the plan's projections into
+    DTensors; the patch embedding, learned tokens, norms and the algorithm's head stay plain tensors,
+    and foreach AdamW -- torch's default on CUDA -- rejects the mixed list ("aten._foreach_mul_.Scalar
+    got mixed torch.Tensor and DTensor"). `implicit_replication` treats the plain ones as Replicate()
+    for the step; their gradients are already identical on every TP rank. No effect when every
+    parameter is a DTensor (FSDP) or none is (one process).
+    """
+    with implicit_replication():
+        optimizer.step()
 
 
 def decay_fraction(progress: float, schedule: str) -> float:

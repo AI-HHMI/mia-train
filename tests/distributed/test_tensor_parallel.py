@@ -19,6 +19,7 @@ from distributed.grad_norm import clip_grad_norm_
 from distributed.parallel_dims import ParallelDims
 from distributed.parallelize import apply_tensor_parallel, parallelize_model, shard_algorithm
 from engine.activation_checkpoint import apply_activation_checkpointing
+from engine.optimizer import optimizer_step
 from models.dinov3_vit3d import DinoVisionTransformer3D
 
 # Small enough to run on four CPU processes, but structurally the 7B model: SwiGLU feed-forward,
@@ -186,6 +187,38 @@ def _tp_fsdp_grad_clip_worker(rank: int, world_size: int) -> tuple[float, float]
     return float(norm), expected
 
 
+def _tp_only_optimizer_step_worker(rank: int, world_size: int) -> float:
+    """tp without FSDP (dp_shard 1) through the optimizer step the trainer runs.
+
+    Nothing is FSDP-wrapped, so the plan's projections are DTensors while the patch embedding, the
+    learned tokens, the norms and the head stay plain tensors -- and foreach AdamW, torch's default
+    on CUDA, rejects that mix. Forced on here because the CPU default is the per-tensor loop, which
+    would not exercise it. Returns the worst distance to the weights one process steps to. `eps` is
+    raised so parameters whose gradient is ~0 do not turn tiny TP-vs-one-process gradient
+    differences into lr-sized ones (Adam's first step is lr * g / (|g| + eps)).
+    """
+    dims = ParallelDims(tp=world_size)
+    mesh = dims.build_mesh("cpu")
+
+    reference = _Algorithm(_build())
+    algorithm = _Algorithm(_build())
+    apply_tensor_parallel(algorithm.model, mesh, dims)
+    kinds = {isinstance(parameter, DTensor) for parameter in algorithm.parameters()}
+    assert kinds == {True, False}, "expected a mix of DTensor and plain parameters"
+
+    reference(_volume()).square().mean().backward()
+    algorithm(_volume()).square().mean().backward()
+    torch.optim.AdamW(reference.parameters(), lr=1e-3, eps=1e-3, foreach=True).step()
+    optimizer_step(torch.optim.AdamW(algorithm.parameters(), lr=1e-3, eps=1e-3, foreach=True))
+
+    worst = 0.0
+    reference_parameters = dict(reference.named_parameters())
+    for name, parameter in algorithm.named_parameters():
+        full = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
+        worst = max(worst, _max_abs_diff(reference_parameters[name].detach(), full.detach()))
+    return worst
+
+
 def _tp_then_checkpointing_worker(rank: int, world_size: int) -> bool:
     """Applied in the trainer's order, the plan still reaches the projections.
 
@@ -269,6 +302,13 @@ def test_tp_composes_with_fsdp_through_grad_clipping(run_distributed):
             f"clipped on a norm of {norm} where one process measures {expected}"
         )
     assert all(norm == pytest.approx(results[0][0]) for norm, _ in results)
+
+
+@pytest.mark.cpu_dist
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_tp_only_optimizer_step_matches_one_process(run_distributed, world_size):
+    for worst in run_distributed(_tp_only_optimizer_step_worker, world_size=world_size):
+        assert worst < 1e-5, f"tp={world_size} without FSDP stepped {worst} away from one process"
 
 
 @pytest.mark.cpu_dist

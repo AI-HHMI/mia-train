@@ -1,0 +1,23 @@
+# large_inputs -- a training volume big enough for 2k^3 crops: the FlyEM hemibrain LMD crop-003.
+#
+# Copied 2026-09-29 from experiments/gary_comparison/data/hemibrain_eb_train.yaml and adapted: the
+# volume is crop-003 (10000^3 at x8000 y17000 z11000 in neuPrint voxels, 8 nm isotropic, OME-Zarr
+# 0.5 / zarr v3, axes x,y,z) instead of the ellipsoid-body crop, with no bounding box, and the patch
+# is 2048^3. Labels: the proofread FlyEM hemibrain v1.2 neuron segmentation (uint64), same shape,
+# pyramid and axis order as the image. crop-003 ends at x = 18000, so it does not touch crop-002,
+# which holds the ellipsoid body and the LSD paper's three hemibrain test ROIs (>= 34 um away).
+#
+# capability_sweep.py does NOT read this (its batch is synthetic); it is here so that a config whose
+# crop fitted in the sweep trains through src/train.py unchanged, on data where that crop exists.
+resolutions: [[8.0, 8.0, 8.0]]
+patch_size: [2048, 2048, 2048]
+output_axes: lcxyz
+samples_per_epoch: 1000   # the run config's [data] section overrides this
+defer_image_ops: true
+
+volumes:
+  - name: hemibrain_crop003
+    path: /groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-003_10k_x8000_y17000_z11000.zarr
+    image_key: raw
+    label_key: labels/proofread-cell-hemibrain-v1.2
+    zarr_version: zarr3

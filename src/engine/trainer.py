@@ -26,7 +26,7 @@ from .activation_checkpoint import apply_activation_checkpointing
 from .checkpoint import CheckpointManager
 from .config import TrainerConfig
 from .mfu import ThroughputMeter, measure_step_flops
-from .optimizer import build_lr_scheduler, build_optimizer, is_stem
+from .optimizer import build_lr_scheduler, build_optimizer, is_stem, optimizer_step
 from .profiler import StepProfiler, annotate, current_rank, should_profile
 
 _AUTOCAST_DTYPES = {"bf16": torch.bfloat16}
@@ -336,7 +336,7 @@ class Trainer:
                     metrics["grad_norm"] = grad_norm
 
                 with annotate("optimizer"):
-                    self.optimizer.step()
+                    optimizer_step(self.optimizer)
                     self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                 step += 1

@@ -1,0 +1,41 @@
+# gary_comparison arm 2c's SSL pretraining corpus: the two hemibrain crops specified on 2026-09-26, each
+# restricted to its first 10,000^3 voxels, and nothing else. 2 x 1.0 T voxels at 8 nm: 160 x 80 x 80 um of
+# central brain, crop-003 (x 8000-18000) and crop-002 (x 18000-28000) side by side, y 17000-27000,
+# z 11000-21000 in hemibrain voxels.
+#
+# The boxes keep both SCORED blocks out of pretraining. crop-002 contains the colleague's Ellipsoid Body
+# crop (the store the train/val YAMLs and mia-evals' fit/test blocks read): pixel-checked 2026-09-26,
+# EB[0:5000]^3 is exactly crop-002[6000:11000]^3 (64^3 blocks identical at the origin, the test corner
+# and the far corner). So mia-evals' test block (EB [4000,5000)^3) is crop-002 [10000,11000)^3 and its fit
+# block (EB [4000,5000)^2 x [3000,4000)) is crop-002 [10000,11000)^2 x [9000,10000): both outside
+# [0,10000) in x and y. miao keeps every patch strictly inside `bounding_box` (a hard constraint on the
+# patch origin), so no pretraining crop touches either. The train block and part of the val slab ARE
+# inside, unlabelled -- as in 2b, whose census corpus held the whole EB crop, test corner included.
+# crop-003 holds none of the EB crop; its box is the whole store.
+#
+# Two departures from the config as pasted, neither a change of content:
+#   - `weight: 1.0` and `normalize: true` written out where it said `${...weight}` / `${...normalize}`:
+#     miao reads this file with yaml.safe_load, so an interpolation would reach it as a literal string.
+#     Both are miao's defaults, which 2b's corpus relies on; `normalize` maps uint8 to [0, 1].
+#   - no `label_key`: SimMIM never reads labels, and with one set every sample would also read and
+#     decode the label array.
+size_weighting_exponent: 0.4   # 2b's corpus setting; the two boxes are the same size, so sampling is 50/50
+resolutions: [[8.0, 8.0, 8.0]]
+patch_size: [256, 256, 256]
+output_axes: lcxyz
+samples_per_epoch: 1000        # the run config's [data] section overrides this
+volumes:
+  - name: "flyem hemibrain 11k"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-002_11k_x18000_y17000_z11000.zarr"
+    image_key: "raw"
+    zarr_version: "zarr3"
+    weight: 1.0
+    normalize: true
+    bounding_box: [[0, 10000], [0, 10000], [0, 10000]]
+  - name: "flyem hemibrain 10k"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/data/em-drosophila-flyem-hemibrain/crop-003_10k_x8000_y17000_z11000.zarr"
+    image_key: "raw"
+    zarr_version: "zarr3"
+    weight: 1.0
+    normalize: true
+    bounding_box: [[0, 10000], [0, 10000], [0, 10000]]

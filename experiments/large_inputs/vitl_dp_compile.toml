@@ -1,0 +1,61 @@
+# large_inputs, arm vitl_dp_compile: vitl_dp under torch.compile.
+#
+# On the 7B, compile paid 2.02x at 256^3 and only 1.34x / 1.12x at 512^3 / 1024^3 while costing
+# ~2x memory past 256^3, because Inductor fuses elementwise work and attention's share grows with the
+# crop. A ViT-L spends a larger share of its step outside attention at a given crop, so the
+# crossover may move; this arm measures it. One node, so the 64-rank compiled-step hang seen on the
+# 7B does not apply. Compilation is ~2 min per crop shape. Everything else is vitl_dp.toml.
+#
+experiment_name = "large_inputs__vitl_dp_compile"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 512            # overridden per trial by capability_sweep.py --size
+patch_size = 16
+in_chans = 1
+embed_dim = 1024          # ViT-L/16, 303M parameters
+depth = 24
+num_heads = 16
+n_storage_tokens = 4
+layerscale_init = 1.0e-05
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+pos_embed_rope_type = "vanilla"
+drop_path_rate = 0.0      # tensor parallelism refuses stochastic depth; kept identical across arms
+use_fa4 = false           # B300: cuDNN SDPA wins end to end (b300_capability_run)
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder = "subpixel"
+input_axes = "lcxyz"      # stated because the sweep builds the algorithm without a dataset
+decoder_hidden_dim = 256
+decoder_readout_dim = 16
+decoder_refine_depth = 2
+decoder_zero_init_output = false
+split_disconnected = true # forced off inside the sweep, which has no dataloader workers to run it
+decode_chunks = 1         # overridden per crop by --decode-chunks auto
+
+[data]
+name = "miao_volumes"
+config_path = "experiments/large_inputs/data/hemibrain_crop003_train.yaml"
+samples_per_epoch = 100000
+defer_image_ops = true
+
+[trainer]
+max_steps = 100000
+batch_size = 1            # per data-parallel rank; the crop is the variable, not the batch
+lr = 1.0e-4
+warmup_steps = 500
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+compile = true
+activation_checkpointing = true
+num_workers = 8
+log_every = 50
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1

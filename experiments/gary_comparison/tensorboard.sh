@@ -27,8 +27,12 @@
 #                              mask ratio 0.6. Its curves are reconstruction losses, not affinity metrics.
 #   2b_simmim_lmd_mask85       arm 2a with mask_ratio 0.85, nothing else. A harder mask has a HIGHER
 #                              masked L1 by construction: never rank 2a against 2b on these curves.
+#   2c_simmim_hemibrain_mask90 arm 2b at mask_ratio 0.9 on two hemibrain crops only (crop-002/003,
+#                              first 10,000^3 each; the scored blocks excluded). Same L1 caveat.
 #   3a_simmim60_axial_subpixel arm 1a's recipe (affinity_seg sub-pixel head, 500k steps) with the encoder
 #                              initialised from arm 2a's final SSL checkpoint instead of the LVD weights.
+#   3c_simmim90_hemibrain_200k_axial_subpixel
+#                              the same recipe from arm 2c's step-200000 checkpoint (hemibrain SSL, mask 0.9).
 #                              Read it against 1a (natural-image pretraining) and 1b (none).
 #   3b_simmim85_axial_subpixel the same from arm 2b's checkpoint; 3a vs 3b is the SSL mask ratio.
 #                              Both start a COLD sub-pixel head: the collapse check below applies.
@@ -43,6 +47,12 @@
 #                              5a vs 1a is the decoder. A cold head too: the collapse check applies.
 #   5b_dinov3_axial_unetr_p8   arm 4a (patch 8) with the UNETR decoder, one full node; 5b vs 4a is the
 #                              decoder at 64 nm tokens, 5b vs 5a the token size.
+#   6a_dinov3_axial_subpixel_erode1
+#                              arm 1a with label_erosion = 1. Its targets are eroded: its val curves
+#                              are NOT comparable with any other arm's.
+#   7a_dinov3_axial_subpixel_testcrop_50k
+#                              DELIBERATE LEAKAGE CONTROL: arm 1a trained 50k steps on the TEST corner.
+#                              Its curves (and scores) are not results; never rank it with the others.
 #
 # WHAT TO READ
 #
@@ -93,10 +103,13 @@ RUNS=$EXP/runs
 VIEW=$EXP/tensorboard
 VENV=/groups/scicompsoft/home/orhane/myvenv
 ARMS=(1a_dinov3_axial_subpixel 1b_scratch_axial_subpixel 1c_dinov3_axial_subpixel_1m
-      2a_simmim_lmd_mask60 2b_simmim_lmd_mask85
-      3a_simmim60_axial_subpixel 3b_simmim85_axial_subpixel
+      2a_simmim_lmd_mask60 2b_simmim_lmd_mask85 2c_simmim_hemibrain_mask90
+      3a_simmim60_axial_subpixel 3b_simmim85_axial_subpixel 3c_simmim90_hemibrain_200k_axial_subpixel
       4a_dinov3_axial_subpixel_p8 4b_dinov3sat_axial_subpixel_p8
-      5a_dinov3_axial_unetr 5b_dinov3_axial_unetr_p8)
+      5a_dinov3_axial_unetr 5b_dinov3_axial_unetr_p8
+      6a_dinov3_axial_subpixel_erode1
+      7a_dinov3_axial_subpixel_testcrop_50k 7b_dinov3_axial_subpixel_testcrop_100k
+      3d_simmim90_hemibrain_500k_axial_subpixel)
 
 PORT=6006 SMOKE=0 LIST=0
 for arg in "$@"; do

@@ -23,6 +23,7 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from miao.labels import erode_labels
 from torch.utils.checkpoint import checkpoint
 
 from data.base import BaseDataset
@@ -76,6 +77,17 @@ class AffinitySegmentation(BaseAlgorithm):
     rather than treated as background. NISB itself has none -- every voxel is either background
     (0) or an instance -- but the reference pipeline reserves -1 for it and datasets with partial
     annotation need it.
+
+    `label_erosion` turns the outermost `label_erosion` voxels of every instance into background
+    before any target is built: gunpowder's `GrowBoundary`, through `miao.labels.erode_labels`,
+    which is pinned to that reference. A voxel is eroded when a face neighbour inside the crop
+    holds a different label, background included, so two touching instances end up
+    `2 * label_erosion` voxels apart; crop faces are not eroded. It runs on the device after the
+    connected-components split and after the batch's augmentation, and feeds both the affinity and
+    the descriptor targets -- the reference's order (augment, GrowBoundary, AddLocalShapeDescriptor,
+    AddAffinities). Ignored voxels stay ignored, though an instance does erode against them, unlike
+    the reference's masked `GrowBoundary`. Validation targets are eroded too, so an eroded run's
+    validation metrics are not comparable with an uneroded run's.
 
     `lsd_sigma` turns on the paper's MTLSD form: the head also predicts the ten local shape
     descriptors of Sheridan et al. (2023) as an auxiliary target, sharing everything but the last
@@ -156,6 +168,7 @@ class AffinitySegmentation(BaseAlgorithm):
         decoder_image_skip: bool = True,
         ignore_index: int = -1,
         split_disconnected: bool = True,
+        label_erosion: int = 0,
         decode_chunks: int = 1,
         lsd_sigma: float | Sequence[float] | None = None,
         lsd_weight: float = 1.0,
@@ -166,6 +179,8 @@ class AffinitySegmentation(BaseAlgorithm):
         super().__init__(model, dataset)
         if long_range < 1:
             raise ValueError(f"long_range must be at least 1 voxel, got {long_range}")
+        if label_erosion < 0:
+            raise ValueError(f"label_erosion must be non-negative, got {label_erosion}")
         if decoder not in DECODERS:
             raise ValueError(f"decoder must be one of {DECODERS}, got {decoder!r}")
         if decode_chunks < 1:
@@ -215,6 +230,7 @@ class AffinitySegmentation(BaseAlgorithm):
         self.label_key = label_key
         self.ignore_index = ignore_index
         self.split_disconnected = split_disconnected
+        self.label_erosion = label_erosion
         self.offsets = affinity_offsets(SPATIAL_RANK, long_range)
         self.decoder_kind = decoder
         self.decode_chunks = decode_chunks
@@ -532,6 +548,18 @@ class AffinitySegmentation(BaseAlgorithm):
                 labels = torch.stack([relabel_connected(sample) for sample in labels])
         return labels
 
+    def _erode_labels(self, labels: torch.Tensor) -> torch.Tensor:
+        """`label_erosion` voxels of every instance border -> background, per sample."""
+        if not self.label_erosion:
+            return labels
+        with torch.profiler.record_function("erode_labels"):
+            eroded = torch.stack(
+                [erode_labels(sample, steps=self.label_erosion) for sample in labels]
+            )
+            # The erosion knows only instances and background: without this an ignored voxel that
+            # borders an instance would become a supervised background voxel.
+            return torch.where(labels == self.ignore_index, labels, eroded)
+
     def _affinity_targets(self, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Split (B, X, Y, Z) instance ids -> (affinity target, loss mask), both float/bool.
 
@@ -550,7 +578,7 @@ class AffinitySegmentation(BaseAlgorithm):
         Splits first when that is this algorithm's job. The step itself calls the two halves
         separately, so that one split serves both the affinities and the descriptors.
         """
-        return self._affinity_targets(self._split_labels(labels))
+        return self._affinity_targets(self._erode_labels(self._split_labels(labels)))
 
     def _lsd_targets(
         self, labels: torch.Tensor, sigma: torch.Tensor
@@ -759,8 +787,9 @@ class AffinitySegmentation(BaseAlgorithm):
             tokens, grid = self._encode(volumes)
 
         # Once, for the whole crop, before any slab: connectivity is a property of the volume, and
-        # an object that leaves a slab and comes back is one object, not two.
-        labels = self._split_labels(labels)
+        # an object that leaves a slab and comes back is one object, not two. The same for the
+        # erosion, which would otherwise leave every slab face uneroded like a crop face.
+        labels = self._erode_labels(self._split_labels(labels))
         n_affinity = len(self.offsets)
 
         if self.decode_chunks == 1:

@@ -27,8 +27,8 @@ scale, the batch and the prompting recipe (below).
     bash experiments/sam_lmd_v1/predict_eval.sh feat64 0              # eight volumes -> instances
     bash experiments/sam_lmd_v1/score.sh feat64 0                     # -> the leaderboard table
 
-**Status (2026-09-23; version 4: arms 1-9 done and scored, arms 3-9 on the leaderboard, arms 10,
-11 and 12 training).** Nine arms on the encoder's scale, the batch size and the training
+**Status (2026-09-27; version 4: arms 1-12 trained; arms 3-9, 11 and 12 on the leaderboard; arm 10's
+scoring on hold because its 352-voxel lattice does not cover the task region on two volumes).** Nine arms on the encoder's scale, the batch size and the training
 recipe (below); version 3's single arm is superseded and its round-0 checkpoints remain for
 reference. **Arm 8 (128 objects per crop, click pairs, mask feedback) leads the
 `lmd_ssl_v1_neuron_instance` leaderboard at pq 0.2786, arm 7 (64 objects) is second at 0.2591, both
@@ -637,6 +637,20 @@ One asymmetry is kept on purpose: Meta normalises SAT input with unequal channel
 [0, 1] grayscale to an equally RGB-averaged kernel, so that average is close to LVD's effective
 grayscale kernel but weights red more than SAT's; both arms see identical input and the first layer
 is fine-tuned from step 1. `make_configs.py` arms take `init = "lvd" | "sat" | "scratch"`.
+
+**Arms 11 and 12 on the leaderboard** (scored 2026-09-27; predictions on gpu_h200 like arm 8's, so
+all three compare on one GPU type): **arm 12 (SAT-493M) pq 0.2775, second, level with arm 8's 0.2786;
+arm 11 (random encoder) pq 0.2254, sixth, below both affinity rows (1c 0.2369, 2c 0.2287) and level
+with arm 6.** Size filter 5000 for both; finetune-half fit 0.422 (arm 12) and 0.342 (arm 11) against
+arm 8's 0.419. Per volume, arm 12 / arm 11 / arm 8: kasthuri15_ac4 0.533 / 0.438 / 0.487, liconn
+hippocampus 0.362 / 0.340 / 0.391, liconn expid82 0.080 / 0.012 / 0.098, zebrafish doublecube1
+0.136 / 0.112 / 0.139. Components, same order: rq 0.388 / 0.313 / 0.395, sq 0.690 / 0.695 / 0.687,
+voi_merge 2.20 / 3.61 / 2.02, voi_split 1.10 / 0.88 / 1.19. So the pretrained weights are worth 0.053
+pq (19% relative) here, five times gary_comparison's affinity-head gap, almost all of it recognition
+and merges, and arm 11 repeats the expid82 collapse of arms 5-7; validation IoU had shown only a
+0.02 gap. Which images the encoder was pretrained on does not matter at this scale: satellite and
+natural-image weights tie overall, and the per-volume differences point both ways. One training seed
+per arm, so the 0.001 gap between arms 8 and 12 is noise.
 
 **Ceilings at the 4 nm lattice** (`pseudolabel.py oracle`, perfect masks, 2026-09-14; the
 reference for every arm-1/arm-2 number): single 1 um windows precision 0.885 / recall 0.988 pooled

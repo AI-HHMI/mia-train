@@ -20,7 +20,7 @@ while [[ "${1:-}" == --* ]]; do
 done
 
 EVALS=/groups/scicompsoft/home/orhane/projects/mia-evals
-PY=/groups/scicompsoft/home/orhane/banisvenv/bin/python
+PY=/groups/scicompsoft/home/orhane/myvenv/bin/python   # myvenv for everything (user directive 2026-09-23)
 EXP=/nrs/scicompsoft/orhane/mia-train-experiments/sam_lmd_v1   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
 RUNS=$EXP/runs
 STAGE=$EXP

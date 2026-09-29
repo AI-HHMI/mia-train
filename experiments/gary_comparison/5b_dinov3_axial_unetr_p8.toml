@@ -52,14 +52,7 @@ layerscale_init = 1.0e-05 # NOT optional: the released weights were trained with
 mask_k_bias = true
 pos_embed_rope_dtype = "fp32"
 pos_embed_rope_type = "vanilla"
-# 0.0 where 2b-c wrote 0.1, functionally the same setting: DINOv3's drop path is sample-level
-# stochastic depth, and at one sample per rank the dropped subset is always empty, so 0.1 dropped
-# nothing there either. Written as what happens, so it cannot switch on silently if the per-rank
-# batch ever changes.
 drop_path_rate = 0.0
-# torch SDPA (cuDNN on Hopper/Blackwell). FA4 is off because `[trainer].compile` below cannot be
-# combined with it, and on B300 it was no faster than cuDNN SDPA at 33k tokens either (0.88x end to
-# end for the 7B model in experiments/b300_capability_run).
 use_fa4 = false
 
 [init]

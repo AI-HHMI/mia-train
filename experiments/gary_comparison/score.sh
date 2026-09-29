@@ -29,6 +29,10 @@ LOGS=$EXP/jobs
 TASK=gary_comparison_neuron_instance
 TASK_DIR=/nrs/scicompsoft/orhane/mia-evals/$TASK
 QUEUE=${QUEUE:-gpu_b300}
+# LEADERBOARD=<dir> scores OFF the mia-evals leaderboard: the record, its table, the scored labellings and the
+# scratch all go under <dir>/<task>/ (arm 7a, the test-crop leakage control, is scored this way; never rank it).
+BOARD=${LEADERBOARD:-}
+if [[ -n "$BOARD" ]]; then TASK_DIR=$BOARD/$TASK; fi
 
 DRY=0 ROUTES="mws cc"
 ARGS=()
@@ -75,13 +79,14 @@ dep="done(${deps[0]}) && done(${deps[1]})"
 for route in $ROUTES; do
   case $route in
     mws) cfg=configs/$TASK/mws.toml;          slots=32; wall=24:00 ;;   # ~4 G edges in memory per volume, ~2 h each
+    mws_fill) cfg=configs/$TASK/mws_fill.toml; slots=32; wall=24:00 ;;  # mws + holes refilled; 4x the fit candidates
     cc)  cfg=configs/$TASK/cc_threshold.toml; slots=8;  wall=6:00;  route=cc_threshold ;;
-    *) echo "unknown route $route (mws|cc)" >&2; exit 2 ;;
+    *) echo "unknown route $route (mws|mws_fill|cc)" >&2; exit 2 ;;
   esac
   rec="${RUN_NAME}.step${STEP}.${route}"
-  cmd="export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8; cd '$EVALS' && '$MIA_EVALS' score '$cfg' \
+  cmd="export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8; cd '$EVALS' && '$VENV/bin/python' '$HERE/numa_local.py' '$MIA_EVALS' score '$cfg' \
 --test '$ART/test' --val '$ART/fit' --run-dir '$run' \
---scored-out '$TASK_DIR/scored/$rec' --scratch '$TASK_DIR/scorescratch/$rec'"
+--scored-out '$TASK_DIR/scored/$rec' --scratch '$TASK_DIR/scorescratch/$rec'${BOARD:+ --leaderboard '$BOARD'}"
   args=(-q local -n "$slots" -W "$wall")
   [[ ${deps[0]} != DRYRUN ]] && args+=(-w "$dep")
   id=$(submit "gary_sc_${ARM}_${STEP}_${route}" "${args[@]}" -- "$cmd")

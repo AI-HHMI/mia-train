@@ -1,0 +1,65 @@
+# large_inputs, arm vitl_dp: DINOv3 ViT-L/16 affinity fine-tune, one B300 node, pure data parallel.
+#
+# Every GPU trains on its own whole crop (dp_shard 8 x tp 1, batch 1 per rank, global batch 8), so
+# the crop that fits is what ONE GPU can hold. The model and head are gary_comparison's production
+# ViT-L arm (1a_dinov3_axial_subpixel): 1024 x 24 blocks x 16 heads, axial RoPE, sub-pixel head at
+# readout 16. capability_sweep.py overrides [model].img_size with the crop it measures and, with
+# `--decode-chunks auto`, [algorithm].decode_chunks with the fewest slabs that keep the head under
+# cuDNN's 2^31-element limit at that crop. [data] is not read by the sweep (synthetic batches).
+#
+# Initialisation is from scratch: weights cost no memory or time that the released checkpoint
+# would not. To train for real, add gary_comparison 1a's [init] section.
+
+experiment_name = "large_inputs__vitl_dp"
+
+[model]
+name = "dinov3_vit3d"
+img_size = 512            # overridden per trial by capability_sweep.py --size
+patch_size = 16
+in_chans = 1
+embed_dim = 1024          # ViT-L/16, 303M parameters
+depth = 24
+num_heads = 16
+n_storage_tokens = 4
+layerscale_init = 1.0e-05
+mask_k_bias = true
+pos_embed_rope_dtype = "fp32"
+pos_embed_rope_type = "vanilla"
+drop_path_rate = 0.0      # tensor parallelism refuses stochastic depth; kept identical across arms
+use_fa4 = false           # B300: cuDNN SDPA wins end to end (b300_capability_run)
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder = "subpixel"
+input_axes = "lcxyz"      # stated because the sweep builds the algorithm without a dataset
+decoder_hidden_dim = 256
+decoder_readout_dim = 16
+decoder_refine_depth = 2
+decoder_zero_init_output = false
+split_disconnected = true # forced off inside the sweep, which has no dataloader workers to run it
+decode_chunks = 1         # overridden per crop by --decode-chunks auto
+
+[data]
+name = "miao_volumes"
+config_path = "experiments/large_inputs/data/hemibrain_crop003_train.yaml"
+samples_per_epoch = 100000
+defer_image_ops = true
+
+[trainer]
+max_steps = 100000
+batch_size = 1            # per data-parallel rank; the crop is the variable, not the batch
+lr = 1.0e-4
+warmup_steps = 500
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+compile = false
+activation_checkpointing = true
+num_workers = 8
+log_every = 50
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1

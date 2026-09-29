@@ -381,6 +381,59 @@ def test_delegating_stops_the_algorithm_doing_it_twice(monkeypatch: pytest.Monke
     algorithm._targets(algorithm._prepare_labels(_reentering_labels()))
 
 
+# ------------------------------------------------------------------------------ label erosion
+
+
+def _touching_halves() -> torch.Tensor:
+    """(B, L, X, Y, Z) labels: instance 1 for x < 8, instance 2 from x = 8, touching at one face."""
+    label = torch.ones(1, 1, CROP, CROP, CROP, dtype=torch.int64)
+    label[:, :, CROP // 2:] = 2
+    return label
+
+
+@pytest.mark.unit
+def test_label_erosion_opens_a_two_voxel_gap_between_touching_instances():
+    """+1-in-x targets: one cut at the face without erosion, the face and both eroded sides with."""
+    labels = _touching_halves()
+    plain = _algorithm(split_disconnected=False)
+    eroded = _algorithm(split_disconnected=False, label_erosion=1)
+    along_x = [plain._targets(plain._prepare_labels(labels))[0][0, 0, :-1, 5, 5],
+               eroded._targets(eroded._prepare_labels(labels))[0][0, 0, :-1, 5, 5]]
+    cuts = [torch.nonzero(target == 0).flatten().tolist() for target in along_x]
+    assert cuts == [[7], [6, 7, 8]]
+
+
+@pytest.mark.unit
+def test_label_erosion_leaves_crop_faces_and_the_default_target_alone():
+    labels = _touching_halves()
+    plain = _algorithm(split_disconnected=False)
+    zero = _algorithm(split_disconnected=False, label_erosion=0)
+    eroded = _algorithm(split_disconnected=False, label_erosion=1)
+    target, _ = plain._targets(plain._prepare_labels(labels))
+    assert torch.equal(zero._targets(zero._prepare_labels(labels))[0], target)
+    # +1 in y at the y = 0 face, far from the instance face: a crop face is not a boundary.
+    assert eroded._targets(eroded._prepare_labels(labels))[0][0, 1, 2, 0, 5] == 1
+
+
+@pytest.mark.unit
+def test_label_erosion_keeps_ignored_voxels_ignored():
+    """The loss mask must not change: an ignored voxel becoming background would be supervised."""
+    labels = _touching_halves()
+    labels[:, :, :, :3] = -1
+    plain = _algorithm(split_disconnected=False)
+    eroded = _algorithm(split_disconnected=False, label_erosion=1)
+    _, mask = plain._targets(plain._prepare_labels(labels))
+    assert torch.equal(eroded._targets(eroded._prepare_labels(labels))[1], mask)
+
+
+@pytest.mark.unit
+def test_label_erosion_trains_and_refuses_negative_steps():
+    out = _algorithm(label_erosion=1).training_step(_batch())
+    assert torch.isfinite(out["loss"])
+    with pytest.raises(ValueError, match="label_erosion"):
+        _algorithm(label_erosion=-1)
+
+
 # ------------------------------------------------------------------------------------ UNETR head
 
 
