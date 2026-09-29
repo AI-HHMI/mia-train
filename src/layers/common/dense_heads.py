@@ -272,7 +272,17 @@ class SubPixelHead(nn.Module):
             expanded = expanded + bias.reshape(readout, *(1,) * rank)
         return expanded
 
-    def forward(self, x: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, size: tuple[int, ...], crop: tuple[int, int] | None = None
+    ) -> torch.Tensor:
+        """`crop = (lo, hi)` keeps only voxels `lo:hi` of the first spatial axis after the expansion.
+
+        For decoding a slab of a larger volume (`AffinitySegmentation`'s `decode_chunks`): the
+        caller expands whole halo tokens but keeps only the few voxels of them that the refinement
+        convolutions reach into, so those convolutions -- the head's only full-resolution work with
+        a spatial footprint -- run on the slab plus that reach rather than on whole halo patches.
+        The output then covers `lo:hi` along that axis.
+        """
         # `size` is checked rather than interpolated to. With kernel == stride the output is
         # exactly `grid * patch_size`, and an encoder reaches its grid by floor division, so a crop
         # that is not a whole number of patches would leave a rim of voxels this head never covers.
@@ -287,6 +297,8 @@ class SubPixelHead(nn.Module):
             )
         x = self.project(x)
         x = self._expand_tokens(x)
+        if crop is not None:
+            x = x[:, :, crop[0] : crop[1]]
         x = self.refine(x)
         return self.out(x)
 

@@ -154,17 +154,18 @@ def synthetic_batch(size: int, batch_size: int, device: torch.device, seed: int)
 CUDNN_ELEMENT_BUDGET = int(0.9 * 2**31)
 
 
-def auto_decode_chunks(size: int, patch: int, readout: int, halo_planes: int = 1) -> int:
-    """Fewest slabs along the first axis whose (slab + 2 halo planes) x size^2 x readout fits the budget.
+def auto_decode_chunks(size: int, patch: int, readout: int, reach: int = 2) -> int:
+    """Fewest slabs along the first axis whose (slab + 2 x reach) x size^2 x readout fits the budget.
 
-    A slab is whole patch planes; `AffinitySegmentation` adds `ceil(refine_reach / patch)` halo
-    planes on each side, one plane for the default two 3^3 refine convolutions. Falls back to one
-    plane per slab when even that is over the budget (the head then runs on the slow kernels).
+    A slab is whole patch planes; `AffinitySegmentation` hands the refinement convolutions the slab
+    plus `refine_reach` voxels of each neighbour -- one per 3^3 convolution, `decoder_refine_depth`
+    in all. Falls back to one plane per slab when even that is over the budget (above ~2590^3 at
+    readout 16, where the head then runs on the slow kernels).
     """
     planes = size // patch
     for chunks in range(1, planes + 1):
-        slab = -(-planes // chunks) + 2 * halo_planes
-        if slab * patch * size * size * readout <= CUDNN_ELEMENT_BUDGET:
+        depth = -(-planes // chunks) * patch + 2 * reach
+        if depth * size * size * readout <= CUDNN_ELEMENT_BUDGET:
             return chunks
     return planes
 
@@ -176,7 +177,10 @@ def main() -> int:
         kwargs = config.algorithm.kwargs
         kwargs["decode_chunks"] = (
             auto_decode_chunks(
-                args.size, config.model.kwargs["patch_size"], kwargs.get("decoder_readout_dim", 16)
+                args.size,
+                config.model.kwargs["patch_size"],
+                kwargs.get("decoder_readout_dim", 16),
+                kwargs.get("decoder_refine_depth", 2),
             )
             if args.decode_chunks == "auto"
             else int(args.decode_chunks)

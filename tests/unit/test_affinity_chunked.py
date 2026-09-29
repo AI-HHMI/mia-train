@@ -182,3 +182,23 @@ def test_eroded_targets_match_the_undivided_decode():
     split = _algorithm(label_erosion=1, decode_chunks=3).training_step(batch)
     for name, expected in whole.items():
         assert float(split[name]) == pytest.approx(float(expected), rel=1e-5, abs=1e-6), name
+
+
+@pytest.mark.unit
+def test_refinement_runs_on_the_slab_plus_its_reach():
+    """The halo is cropped to what the refinement convolutions reach *before* they run.
+
+    The equivalence tests above cannot see this: cropping only after the convolutions is just as
+    exact. But it hands them whole halo patches -- three times the input at one plane per slab --
+    and that input is what has to fit under cuDNN's 2^31 elements, so record what they are given.
+    """
+    grid = CROP // PATCH
+    algorithm = _algorithm(decode_chunks=grid)  # one patch plane per slab
+    reach = algorithm._refine_reach()
+    depths: list[int] = []
+    algorithm.decoder_out.refine.register_forward_pre_hook(
+        lambda _module, args: depths.append(args[0].shape[2])
+    )
+    algorithm.training_step(_batch())
+    # The end slabs border a volume face, where an undivided decode has no context either.
+    assert depths == [PATCH + reach] + [PATCH + 2 * reach] * (grid - 2) + [PATCH + reach]

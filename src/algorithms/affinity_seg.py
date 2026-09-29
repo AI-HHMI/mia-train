@@ -121,16 +121,21 @@ class AffinitySegmentation(BaseAlgorithm):
     Two things make the slabs exact rather than approximate, and both are pinned by
     `tests/unit/test_affinity_chunked.py` against the undivided path:
 
-      * each slab is decoded with a halo wide enough for `SubPixelHead.refine`'s convolutions and
-        cropped afterwards, so seam voxels see the context they would have seen, and
+      * each slab's refinement convolutions see as many voxels of its neighbours as they reach
+        (whole halo tokens are expanded, then cropped to that reach), and the result is cropped
+        back to the slab, so seam voxels see the context they would have seen, and
       * each slab's targets are built from labels reaching `long_range` past its end, because the
         affinity offsets are positive and a slab's last voxels are compared against the next
         slab's first.
 
     Metrics accumulate as ratios of sums, never as means of means, so uneven slabs weight
-    correctly. The halo costs roughly 1.25-1.5x the head's arithmetic depending on slab width, and
-    tends to buy more than it costs: a slab's tensors are small enough to stay under cuDNN's 2^31
-    element limit, where the same convolutions stop falling back to its int64 direct kernels.
+    correctly. The halo costs the expansion of one neighbouring token plane per side, plus
+    `2 x refine_reach` voxels of convolution per slab (4 at the default two refine convolutions),
+    and buys more than it costs: a slab's tensors are small enough to stay under cuDNN's 2^31
+    element limit, where the same convolutions stop falling back to its int64 direct kernels. The
+    convolution input is the slab plus that reach, so at one patch plane per slab a crop stays under
+    the limit up to ~2590^3 at readout 16 (it was ~1670^3 while the halo was cropped only after the
+    convolutions, which then ran on whole 16-voxel halo planes).
 
     Only the sub-pixel head can be chunked. The interpolating one resizes the whole patch grid in a
     single `F.interpolate`, whose scale factor comes from the sizes it is handed -- a slab plus halo
@@ -508,18 +513,22 @@ class AffinitySegmentation(BaseAlgorithm):
         grid: tuple[int, ...],
         size: torch.Size,
         volumes: torch.Tensor | None = None,
+        crop: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """`_encode`'s tokens on `grid` -> (B, n_offsets, *size) affinity logits.
 
         `volumes` is the encoder's own input, which only the UNETR head reads (its full-resolution
-        skip); the other heads decode from the tokens alone.
+        skip); the other heads decode from the tokens alone. `crop` is the sub-pixel head's (see
+        `SubPixelHead.forward`); the output then spans `crop` along the first spatial axis.
         """
         if self.skip_layers is not None:
             assert volumes is not None, "the UNETR head reads the raw image as well as the tokens"
             return self.decoder_out([self._fold(t, grid) for t in tokens], volumes)
         assert isinstance(tokens, torch.Tensor)
         x = self.decoder(self._fold(tokens, grid))
-        return self.decoder_out(x, tuple(size))
+        if crop is None:
+            return self.decoder_out(x, tuple(size))
+        return self.decoder_out(x, tuple(size), crop=crop)
 
     @staticmethod
     def _fold(tokens: torch.Tensor, grid: tuple[int, ...]) -> torch.Tensor:
@@ -715,15 +724,22 @@ class AffinitySegmentation(BaseAlgorithm):
         lo, hi = span
         # Halo tokens on each side feed the refine convolutions the context they would have had
         # in an undivided decode; the volume's own faces have none, which is also what an
-        # undivided decode sees there.
+        # undivided decode sees there. The head decodes whole tokens, so the halo is whole tokens
+        # when expanded -- but only `reach` voxels of it are what the convolutions read, so the
+        # expansion is cropped to the slab plus `reach` on each side *before* them (`crop`). At one
+        # patch plane per slab that is 16 + 2 x 2 voxels of convolution against 16 + 2 x 16 when the
+        # crop came after, and it is the convolution input that has to fit under cuDNN's 2^31.
         token_lo, token_hi = max(lo - halo, 0), min(hi + halo, grid[0])
         plane = grid[1] * grid[2]
         slab = tokens[:, token_lo * plane : token_hi * plane, :]
         slab_grid = (token_hi - token_lo, grid[1], grid[2])
+        reach = self._refine_reach()
+        start = max(lo * patch - reach, 0)  # the first voxel the cropped decode covers, globally
+        crop = (start - token_lo * patch, min(hi * patch + reach, grid[0] * patch) - token_lo * patch)
 
-        logits = self._decode(slab, slab_grid, torch.Size(s * patch for s in slab_grid))
-        # Back to the slab's own voxels, dropping the halo the convolutions have now consumed.
-        keep_lo, keep_hi = (lo - token_lo) * patch, (hi - token_lo) * patch
+        logits = self._decode(slab, slab_grid, torch.Size(s * patch for s in slab_grid), crop=crop)
+        # Back to the slab's own voxels, dropping the reach the convolutions have now consumed.
+        keep_lo, keep_hi = lo * patch - start, hi * patch - start
         logits = logits[:, :, keep_lo:keep_hi]
         width = keep_hi - keep_lo
         n_affinity = len(self.offsets)
