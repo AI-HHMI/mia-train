@@ -1,0 +1,58 @@
+# large_inputs, arm vit_l_dp_slide16_g4p2: vit_l_dp_win16_g4p2 with sliding windows -- each token attends to the
+# 16^3-token window centred on it, shifted inward at the faces, instead of to its block of the
+# grid, so there are no fixed seams (layers/common/window_attention.py, on FlexAttention).
+# Everything else is vit_l_dp_win16_g4p2.toml (diff them).
+
+experiment_name = "large_inputs__vit_l_dp_slide16_g4p2"
+
+[model]
+name = "vit3d"
+img_size = [512, 512, 512]      # overridden per trial by capability_sweep.py --size
+patch_size = [16, 16, 16]
+in_channels = 1
+embed_dim = 1024          # ViT-L width and depth, as vitl_dp
+depth = 24
+num_heads = 16
+mlp_ratio = 4.0
+attention_backend = "sdpa"      # B300: cuDNN SDPA, as vitl_dp's use_fa4 = false
+rotary_base = 10000.0
+attn_window = 16          # patches per axis: 16^3 tokens = a 256^3-voxel window
+attn_window_mode = "sliding"   # each token's window centred on it (FlexAttention)
+attn_global_blocks = [5, 11, 17, 23]   # ViTDet's four evenly spaced global blocks
+attn_global_kv_pool = 2   # global blocks attend over keys/values averaged per 2^3 tokens
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder = "subpixel"
+input_axes = "lcxyz"      # stated because the sweep builds the algorithm without a dataset
+decoder_hidden_dim = 256
+decoder_readout_dim = 16
+decoder_refine_depth = 2
+decoder_zero_init_output = false
+split_disconnected = true # forced off inside the sweep, which has no dataloader workers to run it
+decode_chunks = 1         # overridden per crop by --decode-chunks auto
+
+[data]
+name = "miao_volumes"
+config_path = "experiments/large_inputs/data/hemibrain_crop003_train.yaml"
+samples_per_epoch = 100000
+defer_image_ops = true
+
+[trainer]
+max_steps = 100000
+batch_size = 1            # per data-parallel rank; the crop is the variable, not the batch
+lr = 1.0e-4
+warmup_steps = 500
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+compile = false
+activation_checkpointing = true
+num_workers = 8
+log_every = 50
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1

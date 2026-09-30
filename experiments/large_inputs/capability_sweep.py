@@ -5,7 +5,13 @@ Copied 2026-09-29 from `experiments/b300_capability_run/capability_sweep.py` (th
 this experiment can change it as it moves to other architectures. Changes so far: `--decode-chunks`
 (an explicit count, or `auto` = the fewest slabs that keep each sub-pixel-head slab under cuDNN's
 2^31-element limit, so one config serves every crop size), and the record carries the chunk count,
-the readout width and the encoder's width and depth.
+the readout width, the encoder's width and depth, and its attention layout (`attn_window`,
+`attn_window_mode`, `attn_global_blocks`, `attn_global_kv_pool`). It also builds the plain `vit3d`
+as well as `dinov3_vit3d`: a per-axis `img_size` / `patch_size`, no `device` argument, no prefix
+tokens. And it builds `convnet3d`, whose patch size is the stride its stages add up to, so the
+slab count is read off the built model rather than the config, and whose record carries its block,
+widths and depths. With `decoder = "unet"`, `--decode-chunks auto` sizes the slabs by that head's
+largest tensor instead of the sub-pixel head's.
 
 One `torchrun` entry point that measures **one** crop size: it builds the model and algorithm named
 in an ordinary mia-train config, parallelizes them exactly as `engine.trainer` does, and runs a
@@ -34,6 +40,7 @@ design; leaving it on would put a CPU pass in the middle of a GPU measurement.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -170,21 +177,45 @@ def auto_decode_chunks(size: int, patch: int, readout: int, reach: int = 2) -> i
     return planes
 
 
+def first_axis_patch(model: torch.nn.Module) -> int:
+    """The patch extent along the first spatial axis, which the head's slabs are cut along.
+
+    Read off the built model: `dinov3_vit3d` holds one int for a cube, `vit3d` one per axis, and
+    `convnet3d` takes no patch size at all, its patch being the stride its stages add up to.
+    """
+    patch = model.patch_size
+    return patch if isinstance(patch, int) else int(patch[0])
+
+
+def model_kwargs_at(
+    name: str, model_kwargs: dict[str, Any], size: int, device: torch.device
+) -> dict[str, Any]:
+    """The config's model arguments with the crop set to `size`, in the form the model takes.
+
+    `img_size` is an int for `dinov3_vit3d` and a per-axis list for `vit3d`, so the override keeps
+    whichever form the config used. `device` is passed only to a model that takes it: building on
+    the device is what keeps a 7B from materialising on the host, and a ViT-L built on the host
+    and moved is only ~1 GB.
+    """
+    configured = model_kwargs.get("img_size")
+    kwargs = {
+        **model_kwargs,
+        "img_size": [size] * len(configured) if isinstance(configured, list | tuple) else size,
+    }
+    if "device" in inspect.signature(ModelRegistry.get(name)).parameters:
+        kwargs["device"] = device
+    return kwargs
+
+
+def prefix_tokens(model: torch.nn.Module) -> int:
+    """Tokens in front of the patch grid: DINOv3's CLS and storage tokens, none for `vit3d`."""
+    storage = getattr(model, "n_storage_tokens", None)
+    return 0 if storage is None else 1 + storage
+
+
 def main() -> int:
     args = parse_args()
     config = load_run_config(args.config)
-    if args.decode_chunks:
-        kwargs = config.algorithm.kwargs
-        kwargs["decode_chunks"] = (
-            auto_decode_chunks(
-                args.size,
-                config.model.kwargs["patch_size"],
-                kwargs.get("decoder_readout_dim", 16),
-                kwargs.get("decoder_refine_depth", 2),
-            )
-            if args.decode_chunks == "auto"
-            else int(args.decode_chunks)
-        )
     dims = (
         ParallelDims(*(int(part) for part in args.dims.split(",")))
         if args.dims
@@ -218,8 +249,25 @@ def main() -> int:
         # minute of `trunc_normal_` on one core. The blocks and the learned tokens take the device
         # argument; the norms and the patch convolution do not, so `.to()` still moves those.
         model = ModelRegistry.build(
-            config.model.name, **{**config.model.kwargs, "img_size": size, "device": device}
+            config.model.name,
+            **model_kwargs_at(config.model.name, config.model.kwargs, size, device),
         )
+        if args.decode_chunks:
+            kwargs = config.algorithm.kwargs
+            # The widest voxel-resolution tensor in a slab, and the planes past the slab it spans.
+            # For the sub-pixel head, the readout over the reach of its refinement convolutions.
+            # For the U-Net head, the full-resolution concatenation of the stream and the image
+            # path (2 x its finest width) over the two planes its residual block reads each side.
+            if kwargs.get("decoder") == "unet":
+                width, reach = 2 * list(kwargs.get("decoder_widths", [16]))[0], 2
+            else:
+                width = kwargs.get("decoder_readout_dim", 16)
+                reach = kwargs.get("decoder_refine_depth", 2)
+            kwargs["decode_chunks"] = (
+                auto_decode_chunks(args.size, first_axis_patch(model), width, reach)
+                if args.decode_chunks == "auto"
+                else int(args.decode_chunks)
+            )
         # `split_disconnected` is overridden, not merely left to the config. Built without a
         # dataset there is no `sample_transform` to delegate the components pass to, so the
         # algorithm would run its *device* implementation inside the step -- an iterative
@@ -314,6 +362,17 @@ def main() -> int:
         step_seconds = float(elapsed.item()) / args.steps
 
         if args.profile:
+            # The algorithm labels its encoder, decoder and affinity-target regions; the head's
+            # own share of the decoder is labelled here, on this instance only, so the split
+            # between the head and the targets/loss around it can be read off without touching
+            # the algorithm.
+            decode = algorithm._decode
+
+            def labelled_decode(*decode_args: Any, **decode_kwargs: Any) -> torch.Tensor:
+                with torch.profiler.record_function("head"):
+                    return decode(*decode_args, **decode_kwargs)
+
+            algorithm._decode = labelled_decode  # type: ignore[method-assign]
             # After the timed window, so it costs the measurement nothing. One step: at these
             # sizes a step is tens of seconds and the trace is already large.
             with torch.profiler.profile(
@@ -321,7 +380,7 @@ def main() -> int:
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=False,
+                record_shapes=True,
                 profile_memory=True,
             ) as prof:
                 one_step()
@@ -330,8 +389,16 @@ def main() -> int:
                 prof.export_chrome_trace(args.trace)
                 print(f"[trace] wrote {args.trace}", flush=True)
             if primary:
+                averages = prof.key_averages()
+                # The labelled regions' device time. Forward and the checkpoint recompute only:
+                # autograd runs the backward outside them, so backward kernels are in the op table.
+                for region in ("encoder", "decoder", "head", "affinity_targets"):
+                    total = sum(e.device_time_total for e in averages if e.key == region)
+                    print(f"[region] {region:17s} {total / 1e6:9.3f} s device time", flush=True)
+                print(averages.table(sort_by="self_device_time_total", row_limit=40), flush=True)
+                print("\n===== by input shape =====", flush=True)
                 print(
-                    prof.key_averages().table(
+                    prof.key_averages(group_by_input_shape=True).table(
                         sort_by="self_device_time_total", row_limit=25
                     ),
                     flush=True,
@@ -365,7 +432,7 @@ def main() -> int:
         record = {
             "experiment": config.experiment_name,
             "size": size,
-            "tokens": (size // model.patch_size) ** 3 + 1 + model.n_storage_tokens,
+            "tokens": model.num_patches + prefix_tokens(model),
             "dp_replicate": dims.dp_replicate,
             "dp_shard": dims.dp_shard,
             "tp": dims.tp,
@@ -373,9 +440,17 @@ def main() -> int:
             "decoder": config.algorithm.kwargs.get("decoder", "interpolate"),
             "decode_chunks": config.algorithm.kwargs.get("decode_chunks", 1),
             "decoder_readout_dim": config.algorithm.kwargs.get("decoder_readout_dim", 16),
+            "decoder_widths": config.algorithm.kwargs.get("decoder_widths"),
             "model": config.model.name,
             "embed_dim": config.model.kwargs.get("embed_dim"),
             "depth": config.model.kwargs.get("depth"),
+            "attn_window": config.model.kwargs.get("attn_window"),
+            "attn_window_mode": config.model.kwargs.get("attn_window_mode", "block"),
+            "attn_global_blocks": list(config.model.kwargs.get("attn_global_blocks", [])),
+            "attn_global_kv_pool": config.model.kwargs.get("attn_global_kv_pool", 1),
+            "block": config.model.kwargs.get("block"),
+            "widths": config.model.kwargs.get("widths"),
+            "depths": config.model.kwargs.get("depths"),
             "activation_checkpointing": trainer.activation_checkpointing,
             "compile": trainer.compile,
             "status": "ok",

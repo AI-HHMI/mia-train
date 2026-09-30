@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from algorithms.affinity_seg import AffinitySegmentation
+from models.convnet3d import ConvNet3D
 from models.vit import ViT3D
 
 CROP = 48
@@ -123,6 +124,59 @@ def test_uneven_chunks_are_allowed():
     five = _algorithm(decode_chunks=5)._chunk_spans(grid)
     assert sum(stop - start for start, stop in five) == grid
     assert len(_algorithm(decode_chunks=99)._chunk_spans(grid)) == grid
+
+
+def _unet_algorithm(seed: int = 0, **overrides: Any) -> AffinitySegmentation:
+    """A hierarchical encoder with the U-Net head: skips at strides 4 and 8, the image at 1."""
+    torch.manual_seed(seed)
+    encoder = ConvNet3D(img_size=CROP, widths=(8, 12), depths=(1, 1))
+    kwargs: dict[str, Any] = dict(
+        input_axes="lcxyz", decoder="unet", long_range=4, decoder_widths=(3, 4, 6),
+        decoder_zero_init_output=False, split_disconnected=False,
+    )
+    kwargs.update(overrides)
+    return AffinitySegmentation(encoder, **kwargs)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("chunks", [2, 3, 6])
+def test_unet_chunked_metrics_match_the_undivided_decode(chunks):
+    batch = _batch()
+    whole = _unet_algorithm().training_step(batch)
+    split = _unet_algorithm(decode_chunks=chunks).training_step(batch)
+    assert set(whole) == set(split)
+    for name, expected in whole.items():
+        assert float(split[name]) == pytest.approx(float(expected), rel=1e-5, abs=1e-6), (
+            f"{name} differs at decode_chunks={chunks}"
+        )
+
+
+@pytest.mark.unit
+def test_unet_chunked_gradients_match_the_undivided_decode():
+    """In float64, for the reason `test_chunked_gradients_match_the_undivided_decode` gives."""
+    torch.set_default_dtype(torch.float64)
+    try:
+        batch = {
+            name: value.double() if value.is_floating_point() else value
+            for name, value in _batch().items()
+        }
+        whole, split = _unet_algorithm(), _unet_algorithm(decode_chunks=3)
+        whole.training_step(batch)["loss"].backward()
+        split.training_step(batch)["loss"].backward()
+        reference = dict(whole.named_parameters())
+        for name, parameter in split.named_parameters():
+            assert parameter.grad is not None, f"{name} received no gradient when chunked"
+            expected = reference[name].grad
+            scale = max(float(expected.abs().max()), 1e-30)
+            assert float((parameter.grad - expected).abs().max()) / scale < 1e-12, name
+    finally:
+        torch.set_default_dtype(torch.float32)
+
+
+@pytest.mark.unit
+def test_unet_needs_an_encoder_with_a_pyramid():
+    with pytest.raises(ValueError, match="pyramid_features"):
+        _algorithm(decoder="unet")
 
 
 @pytest.mark.unit

@@ -1,0 +1,58 @@
+# large_inputs, arm cnn_fused_dp_compile: a convolutional encoder in place of the ViT, same
+# head, one B300 node, pure data parallel.
+#
+# Phase 3 (README): `convnet3d` with Fused-MBConv blocks, a dense 3^3 convolution to 4x width then
+# a 1^3 back, sized to the windowed ViT-L's arithmetic: ~250k forward FLOPs per voxel against its
+# 246k. 75% of them are at stride 16 (13 blocks at 512 channels), 19% at stride 8 (3 at 192) and 6%
+# at stride 4 (1 at 64); ~400M parameters. The sub-pixel head reads the stride-16 stage as it reads
+# ViT-L/16's tokens. Everything outside [model] is vitl_dp.toml (diff them).
+#
+# Compiled: cnn_fused_dp.toml with [trainer].compile = true (diff them).
+
+experiment_name = "large_inputs__cnn_fused_dp_compile"
+
+[model]
+name = "convnet3d"
+img_size = 512            # overridden per trial by capability_sweep.py --size
+in_chans = 1
+block = "fused"
+widths = [64, 192, 512]   # stage i at stride 4 x 2^i; the head reads the last, at stride 16
+depths = [1, 3, 13]
+expansion = 4
+layerscale_init = 1.0e-05
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder = "subpixel"
+input_axes = "lcxyz"      # stated because the sweep builds the algorithm without a dataset
+decoder_hidden_dim = 256
+decoder_readout_dim = 16
+decoder_refine_depth = 2
+decoder_zero_init_output = false
+split_disconnected = true # forced off inside the sweep, which has no dataloader workers to run it
+decode_chunks = 1         # overridden per crop by --decode-chunks auto
+
+[data]
+name = "miao_volumes"
+config_path = "experiments/large_inputs/data/hemibrain_crop003_train.yaml"
+samples_per_epoch = 100000
+defer_image_ops = true
+
+[trainer]
+max_steps = 100000
+batch_size = 1            # per data-parallel rank; the crop is the variable, not the batch
+lr = 1.0e-4
+warmup_steps = 500
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+compile = true
+activation_checkpointing = true
+num_workers = 8
+log_every = 50
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1

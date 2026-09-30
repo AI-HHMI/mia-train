@@ -16,6 +16,7 @@ import algorithms.promptable_seg  # noqa: F401  (imported for its registration s
 import algorithms.semantic_seg  # noqa: F401  (imported for its registration side effect)
 import algorithms.simmim  # noqa: F401  (imported for its registration side effect)
 import data.miao_dataset  # noqa: F401  (imported for its registration side effect)
+import models.convnet3d  # noqa: F401  (imported for its registration side effect)
 import models.dinov3_vit  # noqa: F401  (imported for its registration side effect)
 import models.dinov3_vit3d  # noqa: F401  (imported for its registration side effect)
 import models.muvit  # noqa: F401  (imported for its registration side effect)

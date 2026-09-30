@@ -195,13 +195,22 @@ def test_every_registered_model_is_covered_by_the_counted_kernel_sweep() -> None
             img_size=16, patch_size=8, in_chans=1, embed_dim=96, depth=1, num_heads=4,
             pos_embed_rope_dtype="fp32",
         ),
+        "convnet3d": dict(img_size=16, widths=(8, 16), depths=(1, 1)),
     }
+    # Nothing to switch off in these, which is asserted below rather than assumed.
+    attention_free = {"convnet3d"}
     assert set(ModelRegistry.available()) == set(tiny), (
         "the registry changed; add the new model here and confirm _counted_kernels reaches it"
     )
 
     for name, kwargs in tiny.items():
         model = ModelRegistry.build(name, **kwargs)
+        if name in attention_free:
+            attention = (SelfAttention, Dinov3SelfAttention)
+            assert not any(isinstance(layer, attention) for layer in model.modules()), (
+                f"{name} has attention layers now; arm them below like the other models'"
+            )
+            continue
         # Force both implementations on, so the sweep has something to switch off. This stands in
         # for a Hopper box, where "auto"/use_fa4 would select the custom kernel for real.
         for layer in model.modules():

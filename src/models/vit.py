@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
 
 from layers.common.blocks import TransformerBlock
+from layers.common.window_attention import (
+    attention_pairs,
+    block_attention_layout,
+    check_pool,
+    check_window_mode,
+    resolve_window,
+)
 
-from .base import BaseModel
+from .base import BaseModel, single_scale_volumes
 from .registry import ModelRegistry
 
 SPATIAL_RANK = 3
@@ -27,6 +35,14 @@ class ViT3D(BaseModel):
     which is the relationship a 3D grid actually has; and there is no per-position table to keep
     aligned when most of the tokens are thrown away, only coordinates that travel with the tokens
     that survive.
+
+    Attention is global in every block by default. `attn_window` makes blocks attend within
+    windows of the patch grid -- blocks of it, or windows sliding tile by tile when
+    `attn_window_mode = "sliding"` -- except those listed in `attn_global_blocks`, and
+    `attn_global_kv_pool` averages the global blocks' keys and values over boxes of the grid; see
+    `layers.common.window_attention`. Both need the whole grid in row-major order, which the dense
+    path (`patch_features`) has and masked encoding does not, so a model configured with either
+    serves the dense path only.
     """
 
     def __init__(
@@ -40,6 +56,10 @@ class ViT3D(BaseModel):
         mlp_ratio: float = 4.0,
         attention_backend: str = "auto",
         rotary_base: float = 10000.0,
+        attn_window: int | Sequence[int] | None = None,
+        attn_global_blocks: Sequence[int] = (),
+        attn_global_kv_pool: int = 1,
+        attn_window_mode: str = "block",
     ) -> None:
         super().__init__()
         img_size = tuple(img_size)  # type: ignore[assignment]
@@ -61,6 +81,18 @@ class ViT3D(BaseModel):
         self.attention_backend = attention_backend
         self.grid_size = tuple(s // p for s, p in zip(img_size, patch_size, strict=True))
 
+        # (window, kv_pool) per block. Checked against the grid here rather than per forward pass:
+        # `embed` admits exactly one volume, so this is the only grid the model will ever see.
+        self.attention_layout = block_attention_layout(
+            depth, attn_window, attn_global_blocks, attn_global_kv_pool, SPATIAL_RANK
+        )
+        check_window_mode(attn_window_mode)
+        self.attn_window_mode = attn_window_mode
+        for window, kv_pool in self.attention_layout:
+            if window is not None and attn_window_mode == "block":
+                resolve_window(self.grid_size, window)  # sliding windows need not tile the grid
+            check_pool(self.grid_size, kv_pool)
+
         self.patch_embed = nn.Conv3d(
             in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
         )
@@ -68,8 +100,9 @@ class ViT3D(BaseModel):
             TransformerBlock(
                 embed_dim, num_heads, mlp_ratio, attention_backend,
                 spatial_rank=SPATIAL_RANK, rotary_base=rotary_base,
+                window=window, kv_pool=kv_pool, window_mode=attn_window_mode,
             )
-            for _ in range(depth)
+            for window, kv_pool in self.attention_layout
         )
         self.norm = nn.LayerNorm(embed_dim)
 
@@ -87,52 +120,10 @@ class ViT3D(BaseModel):
         return tuple(self.blocks)
 
     def prepare_input(self, batch: torch.Tensor, axes: str) -> torch.Tensor:
-        """(B, *axes) -> (B, C, D, H, W). Single-scale: exactly one level per sample.
-
-        A plain ViT has one patch grid at one resolution, so it is single-scale by construction.
-        miao's scale levels share a centre but cover different physical extents, which makes them
-        neither pixel-aligned (so they cannot be channels) nor interchangeable with independent
-        samples (so folding them into the batch would quietly redefine `batch_size`). Rather than
-        pick one of those for you, this requires a single level and says how to configure it. A
-        multi-scale encoder overrides this and consumes the level axis itself.
+        """(B, *axes) -> (B, C, D, H, W). Single-scale: exactly one level per sample; see
+        `models.base.single_scale_volumes`, the contract every single-scale 3D encoder shares.
         """
-        if "l" not in axes:
-            raise ValueError(f"axis order must contain 'l' (scale level), got {axes!r}")
-
-        # After the level axis is dropped, what is left has to be readable as (C, D, H, W) or
-        # (D, H, W). A trailing channel such as "lzyxc" would otherwise put a spatial axis where
-        # the channel belongs, and no downstream shape check would catch it.
-        remainder = axes.replace("l", "", 1)
-        if not (len(remainder) == 3 or (len(remainder) == 4 and remainder[0] == "c")):
-            raise ValueError(
-                f"axis order {axes!r} is not usable by a 3D encoder: after the level axis it "
-                'must be three spatial axes, optionally preceded by \'c\' (e.g. "lzyx" or '
-                f'"lcxyz"), got {remainder!r}'
-            )
-
-        expected_dims = len(axes) + 1
-        if batch.dim() != expected_dims:
-            raise ValueError(
-                f"axis order {axes!r} implies a {expected_dims}-D batch (batch + {len(axes)} "
-                f"axes), got {tuple(batch.shape)}; it must match the dataset's output_axes"
-            )
-
-        level_dim = axes.index("l") + 1
-        levels = batch.shape[level_dim]
-        if levels != 1:
-            raise ValueError(
-                f"{type(self).__name__} is single-scale, but this batch carries {levels} scale "
-                f"levels on axis 'l' (shape {tuple(batch.shape)}). Configure the dataset for one "
-                "level per sample: give `resolutions` a single entry, or use "
-                "`resolution_sampling` with `n_scales = 1`, which still varies the resolution but "
-                "draws it independently per sample. A multi-scale encoder should override "
-                "prepare_input and consume the level axis itself."
-            )
-
-        volumes = batch.squeeze(level_dim)
-        if volumes.dim() == 4:  # axis order declared no channel; add a singleton
-            volumes = volumes.unsqueeze(1)
-        return volumes
+        return single_scale_volumes(self, batch, axes)
 
     def patch_coords(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Coordinates of every patch on the grid -> (B, num_patches, 3).
@@ -163,19 +154,34 @@ class ViT3D(BaseModel):
         tokens = self.patch_embed(x).flatten(2).transpose(1, 2)
         return tokens, self.patch_coords(x.shape[0], x.device)
 
-    def encode(self, tokens: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self, tokens: torch.Tensor, coords: torch.Tensor, grid: Sequence[int] | None = None
+    ) -> torch.Tensor:
         """Run the transformer over any number of tokens -> (B, N, embed_dim).
 
         The token count is free -- masked autoencoding passes a visible subset -- but every token
         must bring its coordinate, so `coords` is required rather than optional.
+
+        `grid` says the tokens are the whole patch grid in row-major order, as `embed` returns
+        them. Windowed and pooled blocks need that and refuse to run without it; a model whose
+        blocks are all global ignores it.
         """
         if coords.shape[:2] != tokens.shape[:2]:
             raise ValueError(
                 f"every token needs a coordinate: got {tokens.shape[1]} tokens but "
                 f"{coords.shape[1]} coordinates"
             )
+        if grid is None and any(
+            window is not None or kv_pool > 1 for window, kv_pool in self.attention_layout
+        ):
+            raise ValueError(
+                "this ViT3D has windowed or pooled attention blocks, which need the whole patch "
+                "grid in row-major order, and encode() was given no grid. Masked encoding passes "
+                "a subset of the tokens, so it needs every block global: leave attn_window unset "
+                "and attn_global_kv_pool at 1."
+            )
         for block in self.blocks:
-            tokens = block(tokens, coords)
+            tokens = block(tokens, coords, grid)
         return self.norm(tokens)
 
     def patch_features(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
@@ -185,7 +191,7 @@ class ViT3D(BaseModel):
         feature for every patch, so nothing is dropped here.
         """
         tokens, coords = self.embed(x)
-        return self.encode(tokens, coords), self.grid_size
+        return self.encode(tokens, coords, self.grid_size), self.grid_size
 
     def patchify(self, volumes: torch.Tensor) -> torch.Tensor:
         """(B, C, D, H, W) -> (B, num_patches, patch_volume), matching the encoder's grid.
@@ -204,7 +210,7 @@ class ViT3D(BaseModel):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Mean-pooled volume embedding, for downstream heads."""
         tokens, coords = self.embed(x)
-        return self.encode(tokens, coords).mean(dim=1)
+        return self.encode(tokens, coords, self.grid_size).mean(dim=1)
 
     def extra_forward_methods(self) -> tuple[str, ...]:
         """`embed` and `encode` are called directly by masked autoencoding, not through forward."""
@@ -249,5 +255,11 @@ class ViT3D(BaseModel):
         depth = len(self.blocks)
         hidden = int(d * self.mlp_ratio)
         patch_proj = 2 * n * self.patch_volume * d
-        per_block = 2 * (4 * n * d * d) + 2 * (2 * n * n * d) + 2 * (2 * n * d * hidden)
-        return int(patch_proj + depth * per_block)
+        per_block = 2 * (4 * n * d * d) + 2 * (2 * n * d * hidden)
+        # Attention is costed per block from the pairs it actually scores, which is `n^2` for a
+        # global block and far fewer for a windowed or pooled one.
+        pairs = sum(
+            attention_pairs(self.grid_size, 0, window, kv_pool, self.attn_window_mode)
+            for window, kv_pool in self.attention_layout
+        )
+        return int(patch_proj + depth * per_block + 4 * pairs * d)

@@ -260,6 +260,41 @@ def _stochastic_depth_refused_worker(rank: int, world_size: int) -> bool:
     return False
 
 
+# A 4^3 grid of patches: windowed blocks cut it into 2^3-token windows, and the global blocks
+# attend over keys pooled to a 2^3 grid.
+WINDOWED = dict(img_size=64, attn_window=2, attn_global_blocks=[1, 3], attn_global_kv_pool=2)
+
+
+def _windowed_worker(rank: int, world_size: int) -> tuple[float, float]:
+    """Windowed and pooled blocks under tp, forward and gradients, against one process.
+
+    Each rank holds `num_heads / tp` heads and windows or pools each on its own; a window or pool
+    built from another rank's slice would still run, just on the wrong tokens.
+    """
+    dims = ParallelDims(tp=world_size)
+    mesh = dims.build_mesh("cpu")
+
+    reference = _build(**WINDOWED)
+    sharded = _build(**WINDOWED)
+    apply_tensor_parallel(sharded, mesh, dims)
+
+    volume = _volume(size=64)
+    expected = reference.patch_features(volume)[0]
+    actual = sharded.patch_features(volume)[0]
+    forward = _max_abs_diff(expected, actual)
+
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    worst = 0.0
+    reference_grads = dict(reference.named_parameters())
+    for name, parameter in sharded.named_parameters():
+        grad = parameter.grad
+        assert grad is not None, f"{name} received no gradient under tp={world_size}"
+        full = grad.full_tensor() if isinstance(grad, DTensor) else grad
+        worst = max(worst, _max_abs_diff(reference_grads[name].grad, full))
+    return forward, worst
+
+
 @pytest.mark.cpu_dist
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_tp_forward_matches_one_process(run_distributed, world_size):
@@ -282,6 +317,35 @@ def test_tp_forward_matches_one_process_with_an_indivisible_sequence(run_distrib
 def test_tp_gradients_match_one_process(run_distributed):
     for worst in run_distributed(_gradient_worker, world_size=2):
         assert worst < 1e-5, f"gradients diverged by {worst}"
+
+
+def _sliding_forward_worker(rank: int, world_size: int) -> float:
+    """Sliding windows under tp against one process. Forward only: FlexAttention, which runs
+    them, has no CPU backward; `tests/unit/test_window_attention_gpu.py` covers that on CUDA."""
+    dims = ParallelDims(tp=world_size)
+    mesh = dims.build_mesh("cpu")
+    sliding = {**WINDOWED, "attn_window_mode": "sliding"}
+    reference = _build(**sliding)
+    sharded = _build(**sliding)
+    apply_tensor_parallel(sharded, mesh, dims)
+    volume = _volume(size=64)
+    with torch.no_grad():
+        return _max_abs_diff(reference.patch_features(volume)[0], sharded.patch_features(volume)[0])
+
+
+@pytest.mark.cpu_dist
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_tp_sliding_windows_match_one_process(run_distributed, world_size):
+    for difference in run_distributed(_sliding_forward_worker, world_size=world_size):
+        assert difference < 1e-5, f"tp={world_size} sliding forward diverged by {difference}"
+
+
+@pytest.mark.cpu_dist
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_tp_windowed_and_pooled_attention_match_one_process(run_distributed, world_size):
+    for forward, gradients in run_distributed(_windowed_worker, world_size=world_size):
+        assert forward < 1e-5, f"tp={world_size} windowed forward diverged by {forward}"
+        assert gradients < 1e-5, f"tp={world_size} windowed gradients diverged by {gradients}"
 
 
 @pytest.mark.cpu_dist

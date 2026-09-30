@@ -5,6 +5,7 @@
 #   bash experiments/large_inputs/submit.sh vitl_tp8_ro8 vitl_dp       # arms, default sizes
 #   SIZES="512 1024" bash experiments/large_inputs/submit.sh vitl_dp_compile
 #   SMOKE=1 SIZES=256 STEPS=1 WARMUP=1 bash experiments/large_inputs/submit.sh vitl_dp vitl_tp8
+#   PROBE=profile_1024 PROFILE=1 SIZES=1024 WARMUP=1 STEPS=2 bash experiments/large_inputs/submit.sh vitl_dp_win16_g4p4
 #
 # Adapted 2026-09-29 from experiments/b300_capability_run/submit.sh (the 7B run): single node by
 # default (a ViT-L needs no more than one node to hold a crop, and one node per arm lets several arms
@@ -24,6 +25,7 @@ VENV=/groups/scicompsoft/home/orhane/myvenv
 PROJECT=miaai
 EXP=/nrs/scicompsoft/orhane/mia-train-experiments/large_inputs   # runs/ jobs/ probes/ (nrs layout of 2026-09-16)
 STAGE=$EXP/jobs${SMOKE:+/smoke}   # job scripts, LSF logs and results; NOT /tmp, which is node-local
+[[ -n "${PROBE:-}" ]] && STAGE=$EXP/probes/$PROBE   # a one-off measurement, kept out of jobs/
 mkdir -p "$STAGE"
 
 GPUS=8

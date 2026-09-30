@@ -9,11 +9,19 @@ without touching the surrounding transformer.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Iterator
+import functools
+from collections.abc import Callable, Iterator, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .window_attention import (
+    check_window_mode,
+    pool_grid,
+    sliding_window_attention,
+    windowed_attention,
+)
 
 BACKENDS = ("auto", "flash4", "sdpa")
 
@@ -163,7 +171,14 @@ class _AttentionBase(nn.Module):
 
 
 class SelfAttention(_AttentionBase):
-    """Full (unmasked) multi-head self-attention over a token sequence."""
+    """Multi-head self-attention over a token sequence: global, or over a patch grid for less.
+
+    Global (unmasked) by default. `window` makes every grid token attend only within a window of
+    the grid -- its own block of it, or its tile's sliding window, per `window_mode` -- and
+    `kv_pool` keeps attention global but over keys and values averaged across `kv_pool`-sided
+    boxes. Both need the grid the tokens fill, passed per call, and are described in
+    `layers.common.window_attention`. A layer is one or the other, never both.
+    """
 
     def __init__(
         self,
@@ -171,8 +186,20 @@ class SelfAttention(_AttentionBase):
         num_heads: int,
         backend: str = "auto",
         qkv_bias: bool = True,
+        window: tuple[int, ...] | None = None,
+        kv_pool: int = 1,
+        window_mode: str = "block",
     ) -> None:
         super().__init__(dim, num_heads, backend)
+        if window is not None and kv_pool > 1:
+            raise ValueError(
+                f"a layer attends within windows or globally over pooled keys, not both: got "
+                f"window={window} and kv_pool={kv_pool}"
+            )
+        check_window_mode(window_mode)
+        self.window = window
+        self.kv_pool = kv_pool
+        self.window_mode = window_mode
         self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
 
@@ -180,26 +207,58 @@ class SelfAttention(_AttentionBase):
         self,
         x: torch.Tensor,
         rope: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        *,
+        grid: Sequence[int] | None = None,
+        pooled_rope: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """(B, N, dim) -> (B, N, dim).
 
         `rope` is any callable that rotates a (B, N, heads, head_dim) tensor in place of its
         position-free self, applied to queries and keys but not values. Typed as a plain callable
         so this layer stays independent of which position encoding is in use.
+
+        `grid` is the patch grid the N tokens fill in row-major order, which a windowed or pooled
+        layer needs and a global one ignores. A pooled layer rotates its pooled keys with
+        `pooled_rope`, built for the centres of the pooling boxes.
         """
         batch, tokens, _ = x.shape
+        if (self.window is not None or self.kv_pool > 1) and grid is None:
+            raise ValueError(
+                "windowed and pooled attention need the patch grid their tokens fill; pass grid="
+            )
 
         # (B, N, 3, H, head_dim). FlashAttention-4 reads (batch, seq, heads, dim) and so consumes
         # this directly; SDPA wants heads ahead of tokens and needs the transpose below.
         qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
         query, key, value = qkv.unbind(dim=2)
 
+        if self.kv_pool > 1:
+            assert grid is not None  # checked above
+            # Pooled *before* rotation, so each pooled key is rotated at the centre of its box by
+            # `pooled_rope` rather than being an average of rotations at different positions.
+            key, value = (pool_grid(t, grid, self.kv_pool) for t in (key, value))
+
         if rope is not None:
             # Values carry content, not position, so they are left alone; rotating them would
             # make the attention output itself position-dependent rather than the weights.
-            query, key = rope(query), rope(key)
+            if self.kv_pool > 1 and pooled_rope is None:
+                raise ValueError("a pooled layer needs `pooled_rope` to rotate its pooled keys")
+            query, key = rope(query), (pooled_rope if self.kv_pool > 1 else rope)(key)
 
-        attended = self._attend(query, key, value, x.is_cuda)
+        attend = functools.partial(self._attend, on_cuda=x.is_cuda)
+        if self.window is not None and self.window_mode == "sliding":
+            assert grid is not None  # checked above
+            # FlexAttention, whichever kernel `backend` names: a sliding window is a block mask.
+            attended = sliding_window_attention(
+                query, key, value, grid=grid, window=self.window, attend=attend, scale=self.scale
+            )
+        elif self.window is not None:
+            assert grid is not None  # checked above
+            attended = windowed_attention(
+                query, key, value, grid=grid, window=self.window, attend=attend
+            )
+        else:
+            attended = attend(query, key, value)
         return self.proj(attended.reshape(batch, tokens, -1))
 
 

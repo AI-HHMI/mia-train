@@ -27,7 +27,7 @@ from miao.labels import erode_labels
 from torch.utils.checkpoint import checkpoint
 
 from data.base import BaseDataset
-from layers.common.dense_heads import SubPixelHead, UNETRHead, VoxelHead
+from layers.common.dense_heads import SubPixelHead, UNetHead, UNETRHead, VoxelHead
 from models.base import BaseModel
 
 from .affinity.lsd import (
@@ -48,7 +48,7 @@ from .base import BaseAlgorithm
 from .registry import AlgorithmRegistry
 
 SPATIAL_RANK = 3
-DECODERS = ("interpolate", "subpixel", "unetr")
+DECODERS = ("interpolate", "subpixel", "unetr", "unet")
 
 
 def default_skip_layers(depth: int, levels: int) -> tuple[int, ...]:
@@ -137,12 +137,13 @@ class AffinitySegmentation(BaseAlgorithm):
     the limit up to ~2590^3 at readout 16 (it was ~1670^3 while the halo was cropped only after the
     convolutions, which then ran on whole 16-voxel halo planes).
 
-    Only the sub-pixel head can be chunked. The interpolating one resizes the whole patch grid in a
-    single `F.interpolate`, whose scale factor comes from the sizes it is handed -- a slab plus halo
-    would sample at a different rate, and the seams would be wrong with no shape to catch it. The
-    UNETR head could be, but its convolutions at four resolutions reach ~30 voxels across a slab face
-    at patch 16 against the sub-pixel head's 2, and that halo is not built; a 256^3 crop decodes in
-    one piece anyway (16 GiB per rank, measured).
+    The sub-pixel and U-Net heads can be chunked. The interpolating one resizes the whole patch grid
+    in a single `F.interpolate`, whose scale factor comes from the sizes it is handed -- a slab plus
+    halo would sample at a different rate, and the seams would be wrong with no shape to catch it.
+    The UNETR head could be, but its convolutions at four resolutions reach ~30 voxels across a slab
+    face at patch 16 against the sub-pixel head's 2, and that halo is not built; a 256^3 crop
+    decodes in one piece anyway (16 GiB per rank, measured). The U-Net head cuts each of its
+    strides to what a slab reads itself (`UNetHead`), so it takes the span rather than a halo.
 
     `decoder = "unetr"` is UNETR's decoder (Hatamizadeh et al., 2022; `layers.common.dense_heads.
     UNETRHead`): tokens from `decoder_skip_layers` -- one encoder block per x2 stage, `log2(patch)`
@@ -153,6 +154,12 @@ class AffinitySegmentation(BaseAlgorithm):
     means for the sub-pixel head. It needs an encoder that implements
     `BaseModel.layer_patch_features`, and `decoder_hidden_dim` / `_readout_dim` / `_refine_depth`
     play no part in it.
+
+    `decoder = "unet"` is the same decoder for a hierarchical encoder (`layers.common.dense_heads.
+    UNetHead`): the encoder's own feature maps at each stride (`BaseModel.pyramid_features`, e.g.
+    `convnet3d`'s stages) are the skips, concatenated as they are rather than lifted from one grid,
+    with the raw image at full resolution. `decoder_widths` and `decoder_image_skip` mean what they
+    mean for UNETR, and it needs an encoder that implements `pyramid_features`.
     """
 
     def __init__(
@@ -190,16 +197,17 @@ class AffinitySegmentation(BaseAlgorithm):
             raise ValueError(f"decoder must be one of {DECODERS}, got {decoder!r}")
         if decode_chunks < 1:
             raise ValueError(f"decode_chunks must be at least 1, got {decode_chunks}")
-        if decode_chunks > 1 and decoder != "subpixel":
+        if decode_chunks > 1 and decoder not in ("subpixel", "unet"):
             # The interpolating head resizes the *whole* patch grid in one `F.interpolate`, and a
             # chunk of that resize is not a resize of the chunk: the scale factor is derived from
             # the sizes it is given, so a slab plus halo would sample at a different rate and the
             # seams would be wrong in a way no shape check catches. The sub-pixel head decodes each
-            # token into its own disjoint block, which is what makes slabs exact. The UNETR head's
-            # halo (~30 voxels at patch 16, through four resolutions) is not built, and too little
-            # halo is exactly the silent seam this refuses.
+            # token into its own disjoint block, which is what makes slabs exact, and the U-Net
+            # head cuts every stride to exactly what a slab reads. The UNETR head's halo (~30
+            # voxels at patch 16, through four resolutions) is not built, and too little halo is
+            # exactly the silent seam this refuses.
             raise ValueError(
-                f"decode_chunks > 1 needs decoder = 'subpixel', got {decoder!r}"
+                f"decode_chunks > 1 needs decoder = 'subpixel' or 'unet', got {decoder!r}"
             )
 
         self.lsd_sigma: tuple[float, ...] | None = None
@@ -314,6 +322,21 @@ class AffinitySegmentation(BaseAlgorithm):
             self.decoder = nn.Identity()
             self.decoder_out = UNETRHead(
                 embed_dim, patch_size, head_channels,
+                in_channels=cast(Any, model).in_chans,
+                widths=decoder_widths, image_skip=decoder_image_skip,
+                zero_init_output=decoder_zero_init_output,
+            )
+        elif decoder == "unet":
+            if type(model).pyramid_features is BaseModel.pyramid_features:
+                raise ValueError(
+                    f"decoder = 'unet' reads the encoder's feature map at every stride, which "
+                    f"{type(model).__name__} does not provide (it does not implement "
+                    "pyramid_features); a ViT has one grid, which is what decoder = 'unetr' is for"
+                )
+            # The maps go straight to the head, which fuses each at its own stride.
+            self.decoder = nn.Identity()
+            self.decoder_out = UNetHead(
+                cast(Any, model).pyramid_dims, cast(Any, model).pyramid_strides, head_channels,
                 in_channels=cast(Any, model).in_chans,
                 widths=decoder_widths, image_skip=decoder_image_skip,
                 zero_init_output=decoder_zero_init_output,
@@ -501,8 +524,11 @@ class AffinitySegmentation(BaseAlgorithm):
         """What the head reads: the final layer's patch tokens, or the UNETR head's skip layers.
 
         One `(B, N, C)` tensor, or for `decoder = "unetr"` one per entry of `skip_layers`, deepest
-        last, all on the same grid.
+        last, all on the same grid. For `decoder = "unet"`, the encoder's map at each stride,
+        finest first, with the deepest map's grid.
         """
+        if self.decoder_kind == "unet":
+            return self.encoder.pyramid_features(volumes)
         if self.skip_layers is not None:
             return self.encoder.layer_patch_features(volumes, self.skip_layers)
         return self.encoder.patch_features(volumes)
@@ -521,6 +547,9 @@ class AffinitySegmentation(BaseAlgorithm):
         skip); the other heads decode from the tokens alone. `crop` is the sub-pixel head's (see
         `SubPixelHead.forward`); the output then spans `crop` along the first spatial axis.
         """
+        if self.decoder_kind == "unet":
+            assert volumes is not None, "the U-Net head reads the raw image as well as the maps"
+            return self.decoder_out(tokens, volumes)
         if self.skip_layers is not None:
             assert volumes is not None, "the UNETR head reads the raw image as well as the tokens"
             return self.decoder_out([self._fold(t, grid) for t in tokens], volumes)
@@ -694,33 +723,15 @@ class AffinitySegmentation(BaseAlgorithm):
             start = stop
         return spans
 
-    def _chunk_terms(
+    def _subpixel_slab(
         self,
         tokens: torch.Tensor,
         grid: tuple[int, ...],
-        labels: torch.Tensor,
         span: tuple[int, int],
         halo: int,
         patch: int,
-        sigma: torch.Tensor | None,
-        lsd_halo: int,
-    ) -> tuple[torch.Tensor, ...]:
-        """One slab's contribution to every metric, as unnormalized sums.
-
-        Sums rather than means because that is what composes: each reported metric is a ratio of
-        two of these, so a run split into slabs reports exactly what an undivided one does
-        regardless of how the slabs are sized.
-
-        `labels` arrive already split. Their slab reaches `lsd_halo` voxels *before* the slab and
-        `max(long_range, lsd_halo)` past it: the affinity offsets are positive and compare a slab's
-        last voxels against the next slab's first, while a descriptor's window is symmetric and
-        reads `kernel_radius` cells on either side. Both targets are built on the extended slab
-        and cropped back, which is what keeps them equal to the undivided volume's
-        (`tests/unit/test_affinity_chunked.py`). Being inside the checkpointed region, they are
-        rebuilt in the backward pass with the slab's activations; that is the price of not holding
-        a voxel-resolution target per slab across the whole backward, and it is a price only the
-        descriptors make noticeable.
-        """
+    ) -> torch.Tensor:
+        """The sub-pixel head's logits for voxels `span * patch` of the first axis, via halos."""
         lo, hi = span
         # Halo tokens on each side feed the refine convolutions the context they would have had
         # in an undivided decode; the volume's own faces have none, which is also what an
@@ -740,8 +751,44 @@ class AffinitySegmentation(BaseAlgorithm):
         logits = self._decode(slab, slab_grid, torch.Size(s * patch for s in slab_grid), crop=crop)
         # Back to the slab's own voxels, dropping the reach the convolutions have now consumed.
         keep_lo, keep_hi = lo * patch - start, hi * patch - start
-        logits = logits[:, :, keep_lo:keep_hi]
-        width = keep_hi - keep_lo
+        return logits[:, :, keep_lo:keep_hi]
+
+    def _chunk_terms(
+        self,
+        tokens: torch.Tensor | list[torch.Tensor],
+        grid: tuple[int, ...],
+        labels: torch.Tensor,
+        span: tuple[int, int],
+        halo: int,
+        patch: int,
+        sigma: torch.Tensor | None,
+        lsd_halo: int,
+        volumes: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """One slab's contribution to every metric, as unnormalized sums.
+
+        Sums rather than means because that is what composes: each reported metric is a ratio of
+        two of these, so a run split into slabs reports exactly what an undivided one does
+        regardless of how the slabs are sized.
+
+        `labels` arrive already split. Their slab reaches `lsd_halo` voxels *before* the slab and
+        `max(long_range, lsd_halo)` past it: the affinity offsets are positive and compare a slab's
+        last voxels against the next slab's first, while a descriptor's window is symmetric and
+        reads `kernel_radius` cells on either side. Both targets are built on the extended slab
+        and cropped back, which is what keeps them equal to the undivided volume's
+        (`tests/unit/test_affinity_chunked.py`). Being inside the checkpointed region, they are
+        rebuilt in the backward pass with the slab's activations; that is the price of not holding
+        a voxel-resolution target per slab across the whole backward, and it is a price only the
+        descriptors make noticeable.
+        """
+        lo, hi = span
+        width = (hi - lo) * patch
+        if self.decoder_kind == "unet":
+            # The head cuts each of its strides to what these voxels read (`UNetHead`), from maps
+            # and an image it is handed whole, so there is no halo to build here.
+            logits = self.decoder_out(tokens, volumes, span=(lo * patch, hi * patch))
+        else:
+            logits = self._subpixel_slab(tokens, grid, span, halo, patch)
         n_affinity = len(self.offsets)
 
         # Past the volume's end there is nothing to reach for, and `affinities_from_labels` masks
@@ -887,6 +934,7 @@ class AffinitySegmentation(BaseAlgorithm):
                     patch,
                     sigma,
                     lsd_halo,
+                    volumes,
                     use_reentrant=False,
                 )
                 totals = list(terms) if totals is None else [

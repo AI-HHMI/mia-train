@@ -85,6 +85,22 @@ class BaseModel(nn.Module, abc.ABC):
             "head that reads intermediate encoder layers"
         )
 
+    def pyramid_features(self, x: torch.Tensor) -> tuple[list[torch.Tensor], tuple[int, ...]]:
+        """Encode one input -> a feature map per stride, finest first, and the last map's grid.
+
+        The hierarchical sibling of `patch_features`, for a decoder that takes an encoder map at
+        every resolution it climbs through (a U-Net's skip connections). One `(B, C_i, *grid_i)` map
+        per stage, each at twice the previous stride. The last map carries the features
+        `patch_features` hands a head, on the grid it returns. An encoder that implements this also
+        names the maps' widths and strides as `pyramid_dims` and `pyramid_strides`, so a head can be
+        built before anything runs. Declines by default, since a ViT has a single grid; for it,
+        `layer_patch_features` and the UNETR head are the equivalent.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement pyramid_features, so it cannot drive a "
+            "head that reads a feature map at each stride"
+        )
+
     def extra_forward_methods(self) -> tuple[str, ...]:
         """Methods besides `forward` through which this model's parameters get used.
 
@@ -163,3 +179,52 @@ class BaseModel(nn.Module, abc.ABC):
     def tensor_parallel_plan(self) -> dict[str, ParallelStyle] | None:
         """Optional module-path -> ParallelStyle plan for TP; None means unsupported."""
         return None
+
+
+def single_scale_volumes(model: nn.Module, batch: torch.Tensor, axes: str) -> torch.Tensor:
+    """(B, *axes) -> (B, C, D, H, W): the `prepare_input` of every single-scale 3D encoder.
+
+    An encoder with one input grid at one resolution is single-scale by construction. miao's scale
+    levels share a centre but cover different physical extents, which makes them neither
+    pixel-aligned (so they cannot be channels) nor interchangeable with independent samples (so
+    folding them into the batch would quietly redefine `batch_size`). Rather than pick one of those
+    for the caller, this requires a single level and says how to configure it. A multi-scale encoder
+    overrides `prepare_input` and consumes the level axis itself.
+    """
+    if "l" not in axes:
+        raise ValueError(f"axis order must contain 'l' (scale level), got {axes!r}")
+
+    # After the level axis is dropped, what is left has to be readable as (C, D, H, W) or
+    # (D, H, W). A trailing channel such as "lzyxc" would otherwise put a spatial axis where
+    # the channel belongs, and no downstream shape check would catch it.
+    remainder = axes.replace("l", "", 1)
+    if not (len(remainder) == 3 or (len(remainder) == 4 and remainder[0] == "c")):
+        raise ValueError(
+            f"axis order {axes!r} is not usable by a 3D encoder: after the level axis it "
+            'must be three spatial axes, optionally preceded by \'c\' (e.g. "lzyx" or '
+            f'"lcxyz"), got {remainder!r}'
+        )
+
+    expected_dims = len(axes) + 1
+    if batch.dim() != expected_dims:
+        raise ValueError(
+            f"axis order {axes!r} implies a {expected_dims}-D batch (batch + {len(axes)} "
+            f"axes), got {tuple(batch.shape)}; it must match the dataset's output_axes"
+        )
+
+    level_dim = axes.index("l") + 1
+    levels = batch.shape[level_dim]
+    if levels != 1:
+        raise ValueError(
+            f"{type(model).__name__} is single-scale, but this batch carries {levels} scale "
+            f"levels on axis 'l' (shape {tuple(batch.shape)}). Configure the dataset for one "
+            "level per sample: give `resolutions` a single entry, or use "
+            "`resolution_sampling` with `n_scales = 1`, which still varies the resolution but "
+            "draws it independently per sample. A multi-scale encoder should override "
+            "prepare_input and consume the level axis itself."
+        )
+
+    volumes = batch.squeeze(level_dim)
+    if volumes.dim() == 4:  # axis order declared no channel; add a singleton
+        volumes = volumes.unsqueeze(1)
+    return volumes

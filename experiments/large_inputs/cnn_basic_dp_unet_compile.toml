@@ -1,0 +1,52 @@
+# large_inputs, arm cnn_basic_dp_unet_compile: cnn_basic_dp_compile with a U-Net decoder in place of the sub-pixel head.
+#
+# Phase 3 (README): `UNetHead` fuses the encoder's own stages as skips, at strides 8 and 4
+# (256 and 64 channels), and a residual block on the raw image at full resolution, with widths
+# 16/32/64/128 at strides 1/2/4/8 as UNETR's defaults. `--decode-chunks auto` decodes it in
+# slabs sized to its full-resolution concatenation. Everything else is cnn_basic_dp_compile.toml (diff them).
+
+experiment_name = "large_inputs__cnn_basic_dp_unet_compile"
+
+[model]
+name = "convnet3d"
+img_size = 512            # overridden per trial by capability_sweep.py --size
+in_chans = 1
+block = "basic"
+widths = [64, 256, 768]   # stage i at stride 4 x 2^i; the head reads the last, at stride 16
+depths = [1, 4, 12]
+layerscale_init = 1.0e-05
+
+[algorithm]
+name = "affinity_seg"
+long_range = 10
+decoder = "unet"
+input_axes = "lcxyz"      # stated because the sweep builds the algorithm without a dataset
+decoder_widths = [16, 32, 64, 128]  # at strides 1, 2, 4, 8: UNETR's default
+decoder_image_skip = true
+decoder_zero_init_output = false
+split_disconnected = true # forced off inside the sweep, which has no dataloader workers to run it
+decode_chunks = 1         # overridden per crop by --decode-chunks auto
+
+[data]
+name = "miao_volumes"
+config_path = "experiments/large_inputs/data/hemibrain_crop003_train.yaml"
+samples_per_epoch = 100000
+defer_image_ops = true
+
+[trainer]
+max_steps = 100000
+batch_size = 1            # per data-parallel rank; the crop is the variable, not the batch
+lr = 1.0e-4
+warmup_steps = 500
+weight_decay = 0.05
+grad_clip_norm = 1.0
+precision = "bf16"
+compile = true
+activation_checkpointing = true
+num_workers = 8
+log_every = 50
+
+[parallelism]
+dp_replicate = 1
+dp_shard = 8
+tp = 1

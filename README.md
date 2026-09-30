@@ -61,9 +61,10 @@ for single-node, multi-node and resume recipes.
 | name | |
 |---|---|
 | `dinov3_vit` | DINOv3 vision transformer, 2D. Can load Meta's released checkpoints. |
-| `dinov3_vit3d` | The same architecture for volumes, with 2D/3D RoPE variants. A released 2D checkpoint can be inflated into it via `[init].inflate_2d_to_3d`. |
-| `vit3d` | Plain 3D ViT with split `embed`/`encode`, so an algorithm can drop tokens between them. |
+| `dinov3_vit3d` | The same architecture for volumes, with 2D/3D RoPE variants and optional windowed attention (`attn_window`). A released 2D checkpoint can be inflated into it via `[init].inflate_2d_to_3d`. |
+| `vit3d` | Plain 3D ViT with split `embed`/`encode`, so an algorithm can drop tokens between them. Optional windowed attention (`attn_window`). |
 | `muvit3d` | Multi-scale ViT consuming several resolution levels at once. |
+| `convnet3d` | Hierarchical 3D convnet: ConvNeXt layout with dense 3³-convolution blocks (`block = "basic"` or `"fused"`). |
 
 **Algorithms** (`[algorithm].name`)
 

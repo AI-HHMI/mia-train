@@ -1,4 +1,4 @@
-"""Unit tests for the dense prediction heads: interpolating, sub-pixel and UNETR."""
+"""Unit tests for the dense prediction heads: interpolating, sub-pixel, UNETR and U-Net."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import torch
 
-from layers.common.dense_heads import SubPixelHead, UNETRHead, VoxelHead
+from layers.common.dense_heads import SubPixelHead, UNetHead, UNETRHead, VoxelHead
 
 IN_DIM = 8
 PATCH = (4, 4, 4)
@@ -227,6 +227,28 @@ def test_matmul_expansion_equals_the_transposed_convolution(patch_size):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("patch_size", "layout"),
+    [((4, 4, 4), torch.channels_last_3d), ((8, 8), torch.channels_last)],
+)
+def test_expansion_is_channels_last_and_the_head_returns_channels_first(patch_size, layout):
+    """The refinement convolutions run on cuDNN's native layout; the logits leave as they did.
+
+    Channels-first, cuDNN transposes every refinement convolution's input and output -- ~0.9 s of a
+    1024-cube step (`experiments/large_inputs`) -- so the expansion lays the volume out
+    channels-last. Nothing downstream should see the difference: the head returns the ordinary
+    contiguous layout, and values are the same either way (the equivalence test above).
+    """
+    rank = len(patch_size)
+    grid = (3, 2, 4)[:rank]
+    head = SubPixelHead(in_dim=6, patch_size=patch_size, out_channels=2, hidden=5, readout=3)
+    x = torch.randn(2, 6, *grid)
+    size = tuple(g * p for g, p in zip(grid, patch_size, strict=True))
+    assert head._expand_tokens(head.project(x)).is_contiguous(memory_format=layout)
+    assert head(x, size).is_contiguous()
+
+
+@pytest.mark.unit
 def test_matmul_expansion_places_each_token_in_its_own_block():
     """A single non-zero token must light up exactly its own block and nothing else.
 
@@ -388,3 +410,86 @@ def test_unetr_zero_initialised_output_starts_constant() -> None:
     features, image, _ = _unetr_inputs(head, GRID)
     out = head(features, image)
     assert torch.equal(out, torch.zeros_like(out))
+
+
+# ---------------------------------------------------------------- U-Net
+
+
+UNET_IMAGE = (40, 16, 24)  # the first axis long enough for several slabs
+
+
+def _unet(**overrides: Any) -> UNetHead:
+    kwargs: dict[str, Any] = dict(
+        dims=(5, 7), strides=(4, 8), out_channels=OUT, widths=(3, 4, 6), zero_init_output=False
+    )
+    kwargs.update(overrides)
+    torch.manual_seed(0)
+    return UNetHead(**kwargs).double()
+
+
+def _pyramid(
+    dims: tuple[int, ...] = (5, 7), strides: tuple[int, ...] = (4, 8)
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    torch.manual_seed(1)
+    maps = [
+        torch.randn(2, d, *(e // s for e in UNET_IMAGE), dtype=torch.float64)
+        for d, s in zip(dims, strides, strict=True)
+    ]
+    return maps, torch.randn(2, 1, *UNET_IMAGE, dtype=torch.float64)
+
+
+@pytest.mark.unit
+def test_unet_decodes_to_the_image_grid() -> None:
+    maps, image = _pyramid()
+    assert _unet()(maps, image).shape == (2, OUT, *UNET_IMAGE)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("span", [(0, 40), (0, 8), (8, 16), (13, 29), (32, 40), (39, 40)])
+@pytest.mark.parametrize("image_skip", [True, False])
+def test_unet_slab_equals_the_same_voxels_of_an_undivided_decode(span, image_skip) -> None:
+    """Each stride is cut to what the slab reads; a shortfall would be a seam, so: exact."""
+    maps, image = _pyramid()
+    head = _unet(image_skip=image_skip)
+    whole = head(maps, image)
+    lo, hi = span
+    sliced = head(maps, image, span=span)
+    torch.testing.assert_close(sliced, whole[:, :, lo:hi], rtol=0, atol=1e-12)
+
+
+@pytest.mark.unit
+def test_unet_takes_an_encoder_map_at_any_stride_below_the_deepest() -> None:
+    """A skip at stride 2 and none at 4 changes which strides concatenate; slabs still hold."""
+    dims, strides = (5, 7), (2, 8)
+    maps, image = _pyramid(dims, strides)
+    head = _unet(dims=dims, strides=strides)
+    torch.testing.assert_close(
+        head(maps, image, span=(10, 30)), head(maps, image)[:, :, 10:30], rtol=0, atol=1e-12
+    )
+
+
+@pytest.mark.unit
+def test_unet_gradient_reaches_every_map_and_the_image() -> None:
+    maps, image = _pyramid()
+    for tensor in (*maps, image):
+        tensor.requires_grad_(True)
+    _unet()(maps, image).sum().backward()
+    assert all(t.grad is not None and t.grad.abs().sum() > 0 for t in (*maps, image))
+
+
+@pytest.mark.unit
+def test_unet_zero_initialised_output_starts_constant() -> None:
+    maps, image = _pyramid()
+    out = _unet(zero_init_output=True)(maps, image)
+    assert torch.equal(out, torch.zeros_like(out))
+
+
+@pytest.mark.unit
+def test_unet_refuses_what_it_cannot_decode() -> None:
+    with pytest.raises(ValueError, match="powers of two"):
+        _unet(strides=(4, 12))
+    with pytest.raises(ValueError, match="widths needs 3"):
+        _unet(widths=(3, 4))
+    maps, image = _pyramid()
+    with pytest.raises(ValueError, match="divisible"):
+        _unet()(maps, image[:, :, :36])

@@ -5,7 +5,8 @@ times coarser than the input on every axis, and the head has to produce a value 
 first two heads here are alternative answers from the final layer's tokens alone, and they share a
 signature -- `forward(x, size)` -- so an algorithm can offer the choice as configuration without
 branching at the call site. The third, `UNETRHead`, also reads intermediate layers and the raw
-image, so it takes those instead (see its docstring).
+image, so it takes those instead (see its docstring). The fourth, `UNetHead`, is the same kind of
+decoder for a hierarchical encoder, whose stages are already the skips UNETR has to build.
 
 `VoxelHead` interpolates and then convolves at full resolution. Every sub-token detail is therefore
 the responsibility of the convolutions that follow, which act on an already-smooth field and see
@@ -257,15 +258,20 @@ class SubPixelHead(nn.Module):
         # in (out_channel, *kernel) order -- exactly what the reshape below unpacks.
         expanded = tokens @ self.expand.weight.reshape(hidden, -1)
 
-        # (B, *grid, readout, *patch) -> (B, readout, grid_0, patch_0, grid_1, patch_1, ...), so
-        # that each axis pairs its token index with its within-block offset before they are merged.
+        # (B, *grid, readout, *patch) -> (B, grid_0, patch_0, grid_1, patch_1, ..., readout), so
+        # that each axis pairs its token index with its within-block offset before they are merged,
+        # and the channel axis comes last: the volume is laid out channels-last, which is cuDNN's
+        # native layout. Handed channels-first, cuDNN transposes the input and output of every
+        # refinement convolution and falls back to Ampere kernels for their backward -- ~0.9 s of
+        # a 1024-cube step on a B300, where the same convolution runs 1.7x faster channels-last
+        # (`experiments/large_inputs`). The permute is a copy either way; only its order changes.
         expanded = expanded.reshape(batch, *grid, readout, *self.patch_size)
-        order = [0, rank + 1]
+        order = [0]
         for axis in range(rank):
             order += [1 + axis, rank + 2 + axis]
-        expanded = expanded.permute(*order).reshape(
-            batch, readout, *[g * p for g, p in zip(grid, self.patch_size, strict=True)]
-        )
+        order.append(rank + 1)
+        spatial = [g * p for g, p in zip(grid, self.patch_size, strict=True)]
+        expanded = expanded.permute(*order).reshape(batch, *spatial, readout).movedim(-1, 1)
 
         bias = self.expand.bias
         if bias is not None:
@@ -296,11 +302,13 @@ class SubPixelHead(nn.Module):
                 "whole number of patches; use a crop divisible by the patch size."
             )
         x = self.project(x)
-        x = self._expand_tokens(x)
+        x = self._expand_tokens(x)  # channels-last; the convolutions below keep it
         if crop is not None:
             x = x[:, :, crop[0] : crop[1]]
         x = self.refine(x)
-        return self.out(x)
+        # Back to the layout every consumer of the logits has always received: a copy of the
+        # `out_channels` logits, far smaller than the `readout`-wide volume the layout served.
+        return self.out(x).contiguous()
 
 
 class _ResidualBlock(nn.Module):
@@ -456,4 +464,141 @@ class UNETRHead(nn.Module):
             elif self.image is not None:
                 x = torch.cat([x, self.image(image)], dim=1)
             x = self.fuse[index](x)
+        return self.out(x)
+
+
+class UNetHead(nn.Module):
+    """A hierarchical encoder's feature pyramid and the raw image -> `(B, out_channels, *grid)`.
+
+    The U-Net decoder (Ronneberger et al., 2015) that `UNETRHead` builds for a ViT, for an encoder
+    with a real feature pyramid (`BaseModel.pyramid_features`). A ViT has one grid, so UNETR lifts
+    same-grid tokens to each resolution with chains of transposed convolutions. A hierarchical
+    encoder's stages are skips at their own strides already, and they are concatenated as they are.
+
+    From the deepest map, x2 transposed convolutions climb to voxel resolution. At each stride the
+    stream is concatenated with the encoder's map at that stride, if it has one, and fused by
+    UNETR's residual block. At full resolution the skip is a residual block on the raw image, as in
+    UNETR. `widths[k]` is the stream's width at stride `2^k`, finest first, with UNETR's default.
+    `zero_init_output` means what it means for `SubPixelHead`.
+
+    **Slabs.** `span = (lo, hi)` decodes only voxels `lo:hi` of the first spatial axis. It equals
+    the same voxels of an undivided decode (`tests/unit/test_dense_heads.py`), without a halo sized
+    for the deepest stride. Each stride computes just the planes the next finer one reads: its own
+    output plus `REACH` planes each side, which is what a residual block's two 3-wide convolutions
+    read. Through the x2 stages that costs a few extra voxels at full resolution, where the ~30 a
+    uniform halo would need at stride 16 would be paid on the most expensive tensors.
+    """
+
+    #: Planes a `_ResidualBlock` reads past its output on each side: two 3-wide convolutions.
+    REACH = 2
+
+    def __init__(
+        self,
+        dims: Sequence[int],
+        strides: Sequence[int],
+        out_channels: int,
+        in_channels: int = 1,
+        widths: Sequence[int] | None = None,
+        image_skip: bool = True,
+        zero_init_output: bool = True,
+    ) -> None:
+        super().__init__()
+        deepest = strides[-1] if strides else 0
+        if (
+            len(dims) != len(strides)
+            or deepest < 2
+            or deepest & (deepest - 1)
+            or any(
+                s >= t or s < 1 or s & (s - 1)
+                for s, t in zip(strides[:-1], strides[1:], strict=True)
+            )
+        ):
+            raise ValueError(
+                f"strides {tuple(strides)} must be increasing powers of two, one per entry of dims "
+                f"{tuple(dims)}, the deepest at least 2"
+            )
+        self.levels = deepest.bit_length() - 1
+        if widths is None:
+            widths = tuple(16 * 2**k for k in range(self.levels))
+        widths = tuple(widths)
+        if len(widths) != self.levels or any(w < 1 for w in widths):
+            raise ValueError(
+                f"a deepest stride of {deepest} takes {self.levels} x2 stages, so widths needs "
+                f"{self.levels} positive entries (finest first), got {widths}"
+            )
+        self.dims, self.strides, self.widths = tuple(dims), tuple(strides), widths
+        self.skip_index = {stride: index for index, stride in enumerate(self.strides[:-1])}
+
+        self.ups = nn.ModuleList()
+        self.fuse = nn.ModuleList()
+        channels = self.dims[-1]
+        for k in reversed(range(self.levels)):
+            skip = self.dims[self.skip_index[2**k]] if 2**k in self.skip_index else 0
+            if k == 0 and image_skip:
+                skip += widths[0]
+            self.ups.append(nn.ConvTranspose3d(channels, widths[k], kernel_size=2, stride=2))
+            self.fuse.append(_ResidualBlock(3, widths[k] + skip, widths[k]))
+            channels = widths[k]
+        self.image: nn.Module | None = (
+            _ResidualBlock(3, in_channels, widths[0]) if image_skip else None
+        )
+        self.out = nn.Conv3d(widths[0], out_channels, kernel_size=1)
+
+        if zero_init_output:
+            nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(cast(torch.Tensor, self.out.bias))
+
+    def forward(
+        self,
+        features: Sequence[torch.Tensor],
+        image: torch.Tensor,
+        span: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """The encoder's maps `(B, dims[i], *grid_i)`, finest first, and the image `(B, C, *grid)`.
+
+        The output covers voxels `span` of the first spatial axis, or all of them without it.
+        """
+        extent = tuple(image.shape[2:])
+        if len(features) != len(self.dims) or any(
+            tuple(f.shape[2:]) != tuple(e // stride for e in extent)
+            for f, stride in zip(features, self.strides, strict=False)
+        ):
+            raise ValueError(
+                f"an image of {extent} takes {len(self.dims)} maps at strides {self.strides}, got "
+                f"{[tuple(f.shape[2:]) for f in features]}; use a crop divisible by "
+                f"{self.strides[-1]}"
+            )
+        lo, hi = span if span is not None else (0, extent[0])
+
+        # Top-down: the planes each stride must produce (`keep`) and read (`read`), finest first.
+        plan = []
+        keep = (lo, hi)
+        for k in range(self.levels):
+            planes = extent[0] >> k
+            read = (max(keep[0] - self.REACH, 0), min(keep[1] + self.REACH, planes))
+            plan.append((keep, read))
+            keep = (read[0] // 2, -(-read[1] // 2))
+
+        # Bottom-up, cutting every tensor to its plan. `start` is the first plane `x` holds.
+        x = features[-1][:, :, keep[0] : keep[1]]
+        start = keep[0]
+        for index, k in enumerate(reversed(range(self.levels))):
+            (keep_lo, keep_hi), (read_lo, read_hi) = plan[k]
+            x = self.ups[index](x)
+            start *= 2
+            parts = [x[:, :, read_lo - start : read_hi - start]]
+            if 2**k in self.skip_index:
+                parts.append(features[self.skip_index[2**k]][:, :, read_lo:read_hi])
+            if k == 0 and self.image is not None:
+                image_lo = max(read_lo - self.REACH, 0)
+                image_hi = min(read_hi + self.REACH, extent[0])
+                # A copy into channels-last strides, so cuDNN keeps the whole path channels-last:
+                # with one channel the two layouts share one memory order, and the default
+                # strides read as contiguous.
+                raw = image[:, :, image_lo:image_hi]
+                raw = torch.empty_like(raw, memory_format=torch.channels_last_3d).copy_(raw)
+                parts.append(self.image(raw)[:, :, read_lo - image_lo : read_hi - image_lo])
+            x = self.fuse[index](torch.cat(parts, dim=1) if len(parts) > 1 else parts[0])
+            x = x[:, :, keep_lo - read_lo : keep_hi - read_lo]
+            start = keep_lo
         return self.out(x)

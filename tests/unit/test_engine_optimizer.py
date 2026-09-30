@@ -276,6 +276,7 @@ _TINY_MODELS = {
                        num_heads=2, pos_embed_rope_dtype="fp32"),
     "dinov3_vit3d": dict(img_size=16, patch_size=8, in_chans=1, embed_dim=32, depth=2,
                          num_heads=2, pos_embed_rope_dtype="fp32"),
+    "convnet3d": dict(img_size=16, widths=(8, 16), depths=(1, 1)),
 }
 
 

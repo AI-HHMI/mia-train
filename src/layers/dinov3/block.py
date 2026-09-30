@@ -43,6 +43,9 @@ class SelfAttentionBlock(nn.Module):
         ffn_layer: Callable[..., Mlp | SwiGLUFFN] = Mlp,
         mask_k_bias: bool = False,
         use_fa4: bool = False,
+        window: tuple[int, ...] | None = None,
+        kv_pool: int = 1,
+        window_mode: str = "block",
         device=None,
     ) -> None:
         super().__init__()
@@ -56,6 +59,9 @@ class SelfAttentionBlock(nn.Module):
             proj_drop=drop,
             mask_k_bias=mask_k_bias,
             use_fa4=use_fa4,
+            window=window,
+            kv_pool=kv_pool,
+            window_mode=window_mode,
             device=device,
         )
         self.ls1: nn.Module = (
@@ -99,7 +105,9 @@ class SelfAttentionBlock(nn.Module):
             # No batch dimension, do not index
             return sin, cos  # [heads, patches, embed_dim] or [patches, embed_dim]
 
-    def _forward(self, x: torch.Tensor, rope=None) -> torch.Tensor:
+    def _forward(
+        self, x: torch.Tensor, rope=None, grid=None, pooled_rope=None
+    ) -> torch.Tensor:
         """Reference implementation for a single tensor, matching what is done below for a list.
 
         `forward` calls the list op on `[x]` instead of this, so both paths stay bit-identical.
@@ -120,7 +128,12 @@ class SelfAttentionBlock(nn.Module):
 
             x_subset_1 = x[indices_1]
             rope_subset = self._maybe_index_rope(rope, indices_1)
-            residual_1 = self.attn(self.norm1(x_subset_1), rope=rope_subset)
+            residual_1 = self.attn(
+                self.norm1(x_subset_1),
+                rope=rope_subset,
+                grid=grid,
+                pooled_rope=self._maybe_index_rope(pooled_rope, indices_1),
+            )
 
             x_attn = torch.index_add(
                 x,
@@ -143,16 +156,30 @@ class SelfAttentionBlock(nn.Module):
                 alpha=residual_scale_factor,
             )
         else:
-            x_attn = x + self.ls1(self.attn(self.norm1(x), rope=rope))
+            x_attn = x + self.ls1(
+                self.attn(self.norm1(x), rope=rope, grid=grid, pooled_rope=pooled_rope)
+            )
             x_ffn = x_attn + self.ls2(self.mlp(self.norm2(x_attn)))
 
         return x_ffn
 
-    def _forward_list(self, x_list: list[torch.Tensor], rope_list=None) -> list[torch.Tensor]:
+    def _forward_list(
+        self,
+        x_list: list[torch.Tensor],
+        rope_list=None,
+        grid_list=None,
+        pooled_rope_list=None,
+    ) -> list[torch.Tensor]:
         """Concatenate the crops' tokens for the elementwise ops, to save on kernel launches.
 
-        Torch-compile memory planning hides the overhead of the concat ops.
+        Torch-compile memory planning hides the overhead of the concat ops. `grid_list` and
+        `pooled_rope_list` carry, per crop, what windowed and pooled attention need; a block of
+        global attention ignores both.
         """
+        if grid_list is None:
+            grid_list = [None for _ in x_list]
+        if pooled_rope_list is None:
+            pooled_rope_list = [None for _ in x_list]
         b_list = [x.shape[0] for x in x_list]
         sample_subset_sizes = [max(int(b * (1 - self.sample_drop_ratio)), 1) for b in b_list]
         residual_scale_factors = [
@@ -183,10 +210,19 @@ class SelfAttentionBlock(nn.Module):
                 ]
             else:
                 rope_subset_list = rope_list
+            pooled_rope_subset_list = [
+                self._maybe_index_rope(pooled_rope, indices_1)
+                for pooled_rope, indices_1 in zip(pooled_rope_list, indices_1_list, strict=True)
+            ]
 
             flattened, shapes, num_tokens = cat_keep_shapes(x_subset_1_list)
             norm1 = uncat_with_shapes(self.norm1(flattened), shapes, num_tokens)
-            residual_1_list = self.attn.forward_list(norm1, rope_list=rope_subset_list)
+            residual_1_list = self.attn.forward_list(
+                norm1,
+                rope_list=rope_subset_list,
+                grid_list=grid_list,
+                pooled_rope_list=pooled_rope_subset_list,
+            )
 
             x_attn_list = [
                 torch.index_add(
@@ -234,22 +270,48 @@ class SelfAttentionBlock(nn.Module):
             ]
         else:
             x_out = []
-            for x, rope in zip(x_list, rope_list, strict=True):
-                x_attn = x + self.ls1(self.attn(self.norm1(x), rope=rope))
+            for x, rope, grid, pooled_rope in zip(
+                x_list, rope_list, grid_list, pooled_rope_list, strict=True
+            ):
+                x_attn = x + self.ls1(
+                    self.attn(self.norm1(x), rope=rope, grid=grid, pooled_rope=pooled_rope)
+                )
                 x_ffn = x_attn + self.ls2(self.mlp(self.norm2(x_attn)))
                 x_out.append(x_ffn)
             x_ffn = x_out
 
         return x_ffn
 
-    def forward(self, x_or_x_list, rope_or_rope_list=None) -> torch.Tensor | list[torch.Tensor]:
+    def forward(
+        self,
+        x_or_x_list,
+        rope_or_rope_list=None,
+        grid_or_grid_list=None,
+        pooled_rope_or_rope_list=None,
+    ) -> torch.Tensor | list[torch.Tensor]:
+        """One crop's tokens, or a list of crops'; each positional argument follows that form.
+
+        The grid is the patch grid a crop's tokens after the prefix fill, and the pooled rope the
+        tables of that grid pooled by the attention's `kv_pool`: what windowed and pooled attention
+        need (`layers.common.window_attention`), and ignored by a block of global attention.
+        """
         if isinstance(x_or_x_list, torch.Tensor):
             # Routed through the list op rather than `_forward` so the single-tensor and
             # multi-crop paths cannot drift apart.
-            return self._forward_list([x_or_x_list], rope_list=[rope_or_rope_list])[0]
+            return self._forward_list(
+                [x_or_x_list],
+                rope_list=[rope_or_rope_list],
+                grid_list=[grid_or_grid_list],
+                pooled_rope_list=[pooled_rope_or_rope_list],
+            )[0]
         elif isinstance(x_or_x_list, list):
             if rope_or_rope_list is None:
                 rope_or_rope_list = [None for _ in x_or_x_list]
-            return self._forward_list(x_or_x_list, rope_list=rope_or_rope_list)
+            return self._forward_list(
+                x_or_x_list,
+                rope_list=rope_or_rope_list,
+                grid_list=grid_or_grid_list,
+                pooled_rope_list=pooled_rope_or_rope_list,
+            )
         else:
             raise AssertionError

@@ -12,7 +12,8 @@ DINOv3 architecture depends on:
 
 The FlashAttention-4 path reuses `layers.common.attention.flash4_status` rather than re-probing
 the import, so both attention implementations agree on when the kernel is usable and give the same
-diagnostics when it is not.
+diagnostics when it is not. Likewise the windowed and pooled-key variants come from
+`layers.common.window_attention`, so the two implementations window and pool identically.
 """
 
 from __future__ import annotations
@@ -27,6 +28,12 @@ import torch.nn.functional as F
 
 from layers.common.attention import flash4_status
 from layers.common.batched_tokens import cat_keep_shapes, uncat_with_shapes
+from layers.common.window_attention import (
+    check_window_mode,
+    pool_grid,
+    sliding_window_attention,
+    windowed_attention,
+)
 
 
 @contextlib.contextmanager
@@ -67,6 +74,22 @@ def rope_apply(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.T
     return (x * cos) + (rope_rotate_half(x) * sin)
 
 
+def rope_apply_to_suffix(x: torch.Tensor, rope: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """Rotate the patch tokens of a [B, heads, N, head_dim] tensor, leaving its prefix alone.
+
+    The rope tables cover only the patch tokens, so however many tokens lead the sequence -- the
+    CLS and storage tokens, which have no position on the grid -- stay unrotated. Computed in the
+    tables' dtype and cast back to `x`'s.
+    """
+    sin, cos = rope
+    dtype = x.dtype
+    x = x.to(dtype=sin.dtype)
+    prefix = x.shape[-2] - sin.shape[-2]
+    assert prefix >= 0
+    rotated = rope_apply(x[:, :, prefix:, :], sin, cos)  # [B, head, hw, D//head]
+    return torch.cat((x[:, :, :prefix, :], rotated), dim=-2).to(dtype=dtype)
+
+
 class LinearKMaskedBias(nn.Linear):
     """A fused QKV Linear whose key-half bias is masked out.
 
@@ -102,9 +125,25 @@ class SelfAttention(nn.Module):
         proj_drop: float = 0.0,
         mask_k_bias: bool = False,
         use_fa4: bool = False,
+        window: tuple[int, ...] | None = None,
+        kv_pool: int = 1,
+        window_mode: str = "block",
         device=None,
     ) -> None:
         super().__init__()
+
+        # Global by default. `window` restricts each patch token to a window of the grid -- its
+        # own block of it, or its tile's sliding window, per `window_mode` -- and `kv_pool`
+        # averages the keys and values over boxes; `layers.common.window_attention`.
+        if window is not None and kv_pool > 1:
+            raise ValueError(
+                f"a layer attends within windows or globally over pooled keys, not both: got "
+                f"window={window} and kv_pool={kv_pool}"
+            )
+        check_window_mode(window_mode)
+        self.window = window
+        self.kv_pool = kv_pool
+        self.window_mode = window_mode
 
         if use_fa4:
             usable, reason = flash4_status()
@@ -133,76 +172,118 @@ class SelfAttention(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor, rope: tuple[torch.Tensor, torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # All operations use the dtype of rope; the output is cast back to the dtype of q and k.
-        q_dtype = q.dtype
-        k_dtype = k.dtype
-        sin, cos = rope
-        rope_dtype = sin.dtype
-        q = q.to(dtype=rope_dtype)
-        k = k.to(dtype=rope_dtype)
-        N = q.shape[-2]
-        # The rope tables cover only the patch tokens, so the leading CLS and storage tokens are
-        # left unrotated -- they have no position on the grid.
-        prefix = N - sin.shape[-2]
-        assert prefix >= 0
-        q_prefix = q[:, :, :prefix, :]
-        q = rope_apply(q[:, :, prefix:, :], sin, cos)  # [B, head, hw, D//head]
-        q = torch.cat((q_prefix, q), dim=-2)  # [B, head, N, D//head]
-        k_prefix = k[:, :, :prefix, :]
-        k = rope_apply(k[:, :, prefix:, :], sin, cos)  # [B, head, hw, D//head]
-        k = torch.cat((k_prefix, k), dim=-2)  # [B, head, N, D//head]
-        q = q.to(dtype=q_dtype)
-        k = k.to(dtype=k_dtype)
-        return q, k
+        return rope_apply_to_suffix(q, rope), rope_apply_to_suffix(k, rope)
 
-    def forward(self, x: torch.Tensor, attn_bias=None, rope=None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, attn_bias=None, rope=None, grid=None, pooled_rope=None
+    ) -> torch.Tensor:
         qkv = self.qkv(x)
-        attn_v = self.compute_attention(qkv=qkv, attn_bias=attn_bias, rope=rope)
+        attn_v = self.compute_attention(
+            qkv=qkv, attn_bias=attn_bias, rope=rope, grid=grid, pooled_rope=pooled_rope
+        )
         x = self.proj(attn_v)
         x = self.proj_drop(x)
         return x
 
-    def forward_list(self, x_list, attn_bias=None, rope_list=None) -> list[torch.Tensor]:
+    def forward_list(
+        self, x_list, attn_bias=None, rope_list=None, grid_list=None, pooled_rope_list=None
+    ) -> list[torch.Tensor]:
         assert len(x_list) == len(rope_list)  # should be enforced by the Block
+        grid_list = grid_list if grid_list is not None else [None] * len(x_list)
+        if pooled_rope_list is None:
+            pooled_rope_list = [None] * len(x_list)
         x_flat, shapes, num_tokens = cat_keep_shapes(x_list)
         qkv_flat = self.qkv(x_flat)
         qkv_list = uncat_with_shapes(qkv_flat, shapes, num_tokens)
         att_out = []
-        for _, (qkv, _, rope) in enumerate(zip(qkv_list, shapes, rope_list, strict=True)):
-            att_out.append(self.compute_attention(qkv, attn_bias=attn_bias, rope=rope))
+        for qkv, rope, grid, pooled_rope in zip(
+            qkv_list, rope_list, grid_list, pooled_rope_list, strict=True
+        ):
+            att_out.append(
+                self.compute_attention(
+                    qkv, attn_bias=attn_bias, rope=rope, grid=grid, pooled_rope=pooled_rope
+                )
+            )
         x_flat, shapes, num_tokens = cat_keep_shapes(att_out)
         x_flat = self.proj(x_flat)
         return uncat_with_shapes(x_flat, shapes, num_tokens)
 
-    def compute_attention(self, qkv: torch.Tensor, attn_bias=None, rope=None) -> torch.Tensor:
+    def compute_attention(
+        self, qkv: torch.Tensor, attn_bias=None, rope=None, grid=None, pooled_rope=None
+    ) -> torch.Tensor:
+        """Attention over one crop's fused q/k/v: global, windowed, or over pooled keys.
+
+        `grid` is the patch grid the tokens after the prefix fill, which windowed and pooled
+        layers need (`layers.common.window_attention`). A pooled layer rotates its pooled keys with
+        `pooled_rope`, the rope tables of the pooled grid: DINOv3 normalises coordinates to the
+        grid's extent, so a grid `pool` times coarser puts each pooled token exactly at the centre
+        of the box it averages.
+        """
         assert attn_bias is None
         B, N, _ = qkv.shape
         # Read off the projection's *output* rather than from `self.qkv.in_features` and
         # `self.num_heads`, which describe the whole layer. Under tensor parallelism the fused
         # projection is sharded by head (`distributed.tensor_parallel.FusedQKVParallel`), so this
         # tensor holds `num_heads / tp` heads' worth of q, k and v while both of those attributes
-        # still report the unsharded model. The two agree exactly when tp = 1.
+        # still report the unsharded model. The two agree exactly when tp = 1. Windows and pooling
+        # act on each head separately, so they need nothing from the other ranks.
         C = qkv.shape[-1] // 3
         heads = C // self.head_dim
 
         qkv = qkv.reshape(B, N, 3, heads, self.head_dim)
         q, k, v = torch.unbind(qkv, 2)
 
+        prefix = 0
+        if self.window is not None or self.kv_pool > 1:
+            if grid is None:
+                raise ValueError(
+                    "windowed and pooled attention need the patch grid their tokens fill; "
+                    "pass grid="
+                )
+            prefix = N - math.prod(grid)
+        if self.kv_pool > 1:
+            # Pooled *before* rotation, so each pooled key is rotated at the centre of its box
+            # rather than being an average of rotations at different positions. The prefix tokens
+            # are not on the grid and pass through unpooled.
+            k, v = (
+                torch.cat((t[:, :prefix], pool_grid(t[:, prefix:], grid, self.kv_pool)), dim=1)
+                for t in (k, v)
+            )
+
         q, k = (t.transpose(1, 2) for t in [q, k])
         if rope is not None:
-            q, k = self.apply_rope(q, k, rope)
+            if self.kv_pool > 1:
+                if pooled_rope is None:
+                    raise ValueError("a pooled layer needs `pooled_rope` to rotate its pooled keys")
+                q, k = rope_apply_to_suffix(q, rope), rope_apply_to_suffix(k, pooled_rope)
+            else:
+                q, k = self.apply_rope(q, k, rope)
+        q, k = (t.transpose(1, 2) for t in [q, k])
 
+        if self.window is not None and self.window_mode == "sliding":
+            # FlexAttention whatever `use_fa4` says: a sliding window is a block mask.
+            x = sliding_window_attention(
+                q, k, v, grid=grid, window=self.window, attend=self._attend, scale=self.scale,
+                prefix=prefix,
+            )
+        elif self.window is not None:
+            x = windowed_attention(
+                q, k, v, grid=grid, window=self.window, attend=self._attend, prefix=prefix
+            )
+        else:
+            x = self._attend(q, k, v)
+        return x.reshape([B, N, C])
+
+    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """[B, N, heads, head_dim] q, k and v -> [B, N, heads, head_dim], on this layer's kernel."""
         if self.use_fa4:
             from flash_attn.cute import flash_attn_func
 
-            # FA4 reads (batch, seq, heads, head_dim); v is already in that layout. The scale is
-            # passed explicitly even though the default matches, so the two paths are comparable
-            # by construction rather than by coincidence.
-            q, k = (t.transpose(1, 2) for t in [q, k])
+            # FA4 reads (batch, seq, heads, head_dim), the layout given. The scale is passed
+            # explicitly even though the default matches, so the two paths are comparable by
+            # construction rather than by coincidence.
             x, _ = flash_attn_func(q, k, v, softmax_scale=self.scale, causal=False)
-        else:
-            # fall back on F.sdpa()
-            v = v.transpose(1, 2)
-            x = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
-            x = x.transpose(1, 2)
-
-        return x.reshape([B, N, C])
+            return x
+        # fall back on F.sdpa(), which wants heads ahead of tokens
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+        return F.scaled_dot_product_attention(q, k, v, scale=self.scale).transpose(1, 2)

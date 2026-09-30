@@ -15,6 +15,14 @@ The one genuine choice a 3D model has to make is how depth enters the rotary emb
     a pretrained 2D DINOv3 checkpoint's rotary buffers transfer unchanged and the model starts out
     numerically identical to its 2D self, learning how much depth to mix in. The natural choice
     when adapting 2D pretrained weights.
+
+Attention is global in every block by default, as upstream. `attn_window` makes blocks attend
+within windows of the patch grid -- blocks of it, or windows sliding tile by tile when
+`attn_window_mode = "sliding"` -- except those in `attn_global_blocks`, and `attn_global_kv_pool`
+averages the global blocks' keys and values over boxes of the grid: ViTDet-style local attention
+with cheap global mixing, for crops too large for global attention to be affordable
+(`layers.common.window_attention`). Neither adds a parameter, so every checkpoint loads under any
+setting of them; the CLS and storage tokens attend globally in every block.
 """
 
 from __future__ import annotations
@@ -29,6 +37,12 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import ParallelStyle
 
 from distributed.tensor_parallel import self_attention_stack_plan
+from layers.common.window_attention import (
+    attention_pairs,
+    block_attention_layout,
+    check_pool,
+    check_window_mode,
+)
 from layers.dinov3.block import SelfAttentionBlock
 from layers.dinov3.config import dtype_dict, ffn_layer_dict, init_weights_vit, norm_layer_dict
 from layers.dinov3.ffn import SwiGLUFFN
@@ -36,7 +50,7 @@ from layers.dinov3.patch_embed import PatchEmbed3D
 from layers.dinov3.rope import RopePositionEmbedding3D, RopePositionEmbedding3DSuperposition
 from utils.module_ops import named_apply
 
-from .base import BaseModel
+from .base import BaseModel, single_scale_volumes
 from .registry import ModelRegistry
 
 SPATIAL_RANK = 3
@@ -77,6 +91,10 @@ class DinoVisionTransformer3D(BaseModel):
         use_fa4: bool = False,
         untie_cls_and_patch_norms: bool = False,
         untie_global_and_local_cls_norm: bool = False,
+        attn_window: int | Sequence[int] | None = None,
+        attn_global_blocks: Sequence[int] = (),
+        attn_global_kv_pool: int = 1,
+        attn_window_mode: str = "block",
         device: Any | None = None,
     ):
         super().__init__()
@@ -161,6 +179,29 @@ class DinoVisionTransformer3D(BaseModel):
                 device=device,
             )
 
+        # (window, kv_pool) per block. The windows are checked against each crop's grid when it
+        # runs, not here: this model runs at many crop sizes.
+        self.attention_layout = block_attention_layout(
+            depth, attn_window, attn_global_blocks, attn_global_kv_pool, SPATIAL_RANK
+        )
+        check_window_mode(attn_window_mode)
+        self.attn_window_mode = attn_window_mode
+        augmented = {
+            "pos_embed_rope_shift_coords": pos_embed_rope_shift_coords,
+            "pos_embed_rope_jitter_coords": pos_embed_rope_jitter_coords,
+            "pos_embed_rope_rescale_coords": pos_embed_rope_rescale_coords,
+        }
+        augmented = {name: value for name, value in augmented.items() if value is not None}
+        if attn_global_kv_pool > 1 and augmented:
+            # The pooled keys' rope tables are a second call to `rope_embed`, which in training
+            # draws its coordinate augmentation afresh: queries and pooled keys would be rotated
+            # under two different random transforms of the grid.
+            raise ValueError(
+                f"attn_global_kv_pool > 1 cannot be combined with RoPE coordinate augmentation "
+                f"({', '.join(augmented)}): the pooled keys' rotary tables would be drawn under a "
+                "different random coordinate transform than the queries'"
+            )
+
         ffn_layer_cls = ffn_layer_dict[ffn_layer]
         ffn_ratio_sequence = [ffn_ratio] * depth
         blocks_list = [
@@ -178,9 +219,12 @@ class DinoVisionTransformer3D(BaseModel):
                 init_values=layerscale_init,
                 mask_k_bias=mask_k_bias,
                 use_fa4=use_fa4,
+                window=window,
+                kv_pool=kv_pool,
+                window_mode=attn_window_mode,
                 device=device,
             )
-            for i in range(depth)
+            for i, (window, kv_pool) in enumerate(self.attention_layout)
         ]
 
         self.chunked_blocks = False
@@ -260,6 +304,21 @@ class DinoVisionTransformer3D(BaseModel):
 
         return x, (D, H, W)
 
+    def _pooled_rope(
+        self, index: int, grid: tuple[int, int, int]
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Block `index`'s rope tables for its pooled keys on `grid`, or None if it does not pool.
+
+        The tables of the grid `kv_pool` times coarser: the rope coordinates are normalised to the
+        grid's extent, so each of its tokens sits exactly at the centre of the box it averages.
+        """
+        _, kv_pool = self.attention_layout[index]
+        if kv_pool == 1 or self.rope_embed is None:
+            return None
+        check_pool(grid, kv_pool)
+        D, H, W = grid
+        return self.rope_embed(D=D // kv_pool, H=H // kv_pool, W=W // kv_pool)
+
     def forward_features_list(
         self, x_list: list[torch.Tensor], masks_list: list[torch.Tensor | None]
     ) -> list[dict[str, torch.Tensor]]:
@@ -269,12 +328,17 @@ class DinoVisionTransformer3D(BaseModel):
             t2_x, dhw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
             tokens_list.append(t2_x)
             rope.append(dhw_tuple)
-        for _, blk in enumerate(self.blocks):
+        for index, blk in enumerate(self.blocks):
             if self.rope_embed is not None:
                 rope_sincos = [self.rope_embed(D=D, H=H, W=W) for D, H, W in rope]
             else:
                 rope_sincos = [None for _ in rope]
-            tokens_list = blk(tokens_list, rope_sincos)
+            tokens_list = blk(
+                tokens_list,
+                rope_sincos,
+                grid_or_grid_list=rope,
+                pooled_rope_or_rope_list=[self._pooled_rope(index, dhw) for dhw in rope],
+            )
         # Leave sequence parallelism here, rather than in a hook on the last block. Under
         # `tp > 1` the stream between the first and last block is a `Shard(1)` DTensor (see
         # `distributed.tensor_parallel`), while everything below -- the norms, the CLS/patch split,
@@ -344,7 +408,12 @@ class DinoVisionTransformer3D(BaseModel):
                 rope_sincos = self.rope_embed(D=D, H=H, W=W)
             else:
                 rope_sincos = None
-            x = blk(x, rope_sincos)
+            x = blk(
+                x,
+                rope_sincos,
+                grid_or_grid_list=(D, H, W),
+                pooled_rope_or_rope_list=self._pooled_rope(i, (D, H, W)),
+            )
             if i in blocks_to_take:
                 # Under tensor parallelism the stream between the first and last block is sharded
                 # along the token axis, so a layer taken from the middle of the stack comes back as
@@ -514,49 +583,10 @@ class DinoVisionTransformer3D(BaseModel):
         return ()
 
     def prepare_input(self, batch: torch.Tensor, axes: str) -> torch.Tensor:
-        """(B, *axes) -> (B, C, D, H, W). Single-scale: exactly one level per sample.
-
-        Same contract as `ViT3D.prepare_input`: miao's scale levels share a centre but cover
-        different physical extents, so they are neither pixel-aligned (they cannot be channels) nor
-        interchangeable with independent samples (folding them into the batch would quietly
-        redefine `batch_size`). This requires a single level and says how to configure it.
+        """(B, *axes) -> (B, C, D, H, W). Single-scale: exactly one level per sample; see
+        `models.base.single_scale_volumes`, the contract every single-scale 3D encoder shares.
         """
-        if "l" not in axes:
-            raise ValueError(f"axis order must contain 'l' (scale level), got {axes!r}")
-
-        remainder = axes.replace("l", "", 1)
-        if not (
-            len(remainder) == SPATIAL_RANK
-            or (len(remainder) == SPATIAL_RANK + 1 and remainder[0] == "c")
-        ):
-            raise ValueError(
-                f"axis order {axes!r} is not usable by a 3D encoder: after the level axis it "
-                'must be three spatial axes, optionally preceded by \'c\' (e.g. "lzyx" or '
-                f'"lcxyz"), got {remainder!r}'
-            )
-
-        expected_dims = len(axes) + 1
-        if batch.dim() != expected_dims:
-            raise ValueError(
-                f"axis order {axes!r} implies a {expected_dims}-D batch (batch + {len(axes)} "
-                f"axes), got {tuple(batch.shape)}; it must match the dataset's output_axes"
-            )
-
-        level_dim = axes.index("l") + 1
-        levels = batch.shape[level_dim]
-        if levels != 1:
-            raise ValueError(
-                f"{type(self).__name__} is single-scale, but this batch carries {levels} scale "
-                f"levels on axis 'l' (shape {tuple(batch.shape)}). Configure the dataset for one "
-                "level per sample: give `resolutions` a single entry, or use "
-                "`resolution_sampling` with `n_scales = 1`, which still varies the resolution but "
-                "draws it independently per sample."
-            )
-
-        volumes = batch.squeeze(level_dim)
-        if volumes.dim() == SPATIAL_RANK + 1:  # axis order declared no channel; add a singleton
-            volumes = volumes.unsqueeze(1)
-        return volumes
+        return single_scale_volumes(self, batch, axes)
 
     def extra_forward_methods(self) -> tuple[str, ...]:
         """Both are entry points in their own right: SSL training drives `forward_features`
@@ -635,5 +665,12 @@ class DinoVisionTransformer3D(BaseModel):
         else:
             ffn = 2 * (2 * n * d * mlp.fc1.out_features)
 
-        per_block = 2 * (4 * n * d * d) + 2 * (2 * n * n * d) + ffn
-        return int(patch_proj + depth * per_block)
+        per_block = 2 * (4 * n * d * d) + ffn
+        # Attention is costed per block from the pairs it actually scores: `n^2` for a global
+        # block, far fewer for a windowed or pooled one. Raises, like the checks above, for a
+        # grid the configured windows cannot tile, which is a shape this model cannot run.
+        pairs = sum(
+            attention_pairs(grid, 1 + self.n_storage_tokens, window, kv_pool, self.attn_window_mode)
+            for window, kv_pool in self.attention_layout
+        )
+        return int(patch_proj + depth * per_block + 4 * pairs * d)

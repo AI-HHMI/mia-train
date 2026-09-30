@@ -9,11 +9,14 @@ across resolution levels -- and that is the model's business, not the block's.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 
 from .attention import SelfAttention
 from .rope import AxialRotaryEmbedding
+from .window_attention import pool_grid
 
 
 class TransformerBlock(nn.Module):
@@ -32,16 +35,38 @@ class TransformerBlock(nn.Module):
         attention_backend: str = "auto",
         spatial_rank: int = 3,
         rotary_base: float = 10000.0,
+        window: tuple[int, ...] | None = None,
+        kv_pool: int = 1,
+        window_mode: str = "block",
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = SelfAttention(dim, num_heads, backend=attention_backend)
+        self.attn = SelfAttention(
+            dim,
+            num_heads,
+            backend=attention_backend,
+            window=window,
+            kv_pool=kv_pool,
+            window_mode=window_mode,
+        )
         self.rotary = AxialRotaryEmbedding(dim // num_heads, spatial_rank, base=rotary_base)
         self.norm2 = nn.LayerNorm(dim)
         hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
 
-    def forward(self, x: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-        """(B, N, dim) tokens at (B, N, spatial_rank) coordinates -> (B, N, dim)."""
-        x = x + self.attn(self.norm1(x), rope=self.rotary(coords))
+    def forward(
+        self, x: torch.Tensor, coords: torch.Tensor, grid: Sequence[int] | None = None
+    ) -> torch.Tensor:
+        """(B, N, dim) tokens at (B, N, spatial_rank) coordinates -> (B, N, dim).
+
+        `grid` is the patch grid the tokens fill in row-major order, which windowed and pooled
+        attention need (`layers.common.window_attention`) and global attention ignores.
+        """
+        pooled_rope = None
+        if self.attn.kv_pool > 1 and grid is not None:
+            # A pooled key is rotated at the mean coordinate of the tokens it pools: the centre of
+            # its box.
+            pooled_rope = self.rotary(pool_grid(coords, grid, self.attn.kv_pool))
+        rope = self.rotary(coords)
+        x = x + self.attn(self.norm1(x), rope=rope, grid=grid, pooled_rope=pooled_rope)
         return x + self.mlp(self.norm2(x))
