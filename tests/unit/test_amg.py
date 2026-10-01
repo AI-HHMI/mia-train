@@ -26,6 +26,7 @@ from algorithms.promptable.amg import (
     stability_score,
     tiled_wholes,
 )
+from prediction.grid import AxisOrder
 
 
 def _random_masks(n: int, shape: tuple[int, ...], seed: int) -> torch.Tensor:
@@ -226,6 +227,7 @@ class _Oracle:
     """
 
     mask_stride = (2, 2, 2)
+    input_axes = "lcxyz"            # answers in its own frame, which `_FakeGrid`'s store shares
 
     def __init__(self, labels: torch.Tensor) -> None:
         self.labels = labels  # (X, Y, Z) at voxel resolution
@@ -291,6 +293,7 @@ class _FakeGrid:
 
     patch = [32, 32, 32]
     output_shape = (48, 32, 32)
+    axes = "xyz"
 
     def __init__(self, labels: torch.Tensor) -> None:
         self.labels = labels
@@ -323,6 +326,56 @@ class _TiledOracle(_Oracle):
 
 
 @pytest.mark.unit
+@pytest.mark.unit
+def test_a_store_in_another_axis_order_is_segmented_in_the_models_and_returned_in_its_own():
+    """The oracle answers in its training frame, x, y, z; the store is laid out z, y, x. The tile
+    must reach it transposed and its masks come back transposed, so each of its objects lands
+    where it is in the store -- shapes chosen so a transposition would cut or merge them."""
+    model_frame = torch.zeros(32, 32, 32, dtype=torch.long)      # x, y, z
+    model_frame[2:14, 2:14, 2:14] = 11
+    model_frame[18:30, 4:10, 4:28] = 22                         # long along z
+    model_frame[4:30, 20:26, 20:26] = 33                        # long along x
+    oracle = _Oracle(model_frame)
+    seen: list[torch.Tensor] = []
+    original = oracle.encode
+
+    def record(volume):
+        seen.append(volume.clone())
+        return original(volume)
+
+    oracle.encode = record
+
+    class _StoreZYX(_FakeGrid):
+        patch = [32, 32, 32]
+        output_shape = (32, 32, 32)
+        axes = "zyx"
+
+        @property
+        def tiles(self):
+            return [((0, 0, 0), (0, 0, 0))]
+
+        def read_image(self, handle, origin):
+            return marker
+
+    marker = np.random.default_rng(0).random((32, 32, 32), dtype=np.float32)
+    predictor = PromptGridPredictor(
+        oracle, points_per_side=8, points_per_batch=16, pred_iou_thresh=0.5, stability_thresh=0.5,
+        min_mask_voxels=8,
+    )
+    result = predictor.run(_StoreZYX(model_frame), torch.device("cpu"))
+
+    assert torch.equal(seen[0][0, 0], torch.from_numpy(marker.transpose(2, 1, 0)))
+    in_store = model_frame.numpy().transpose(2, 1, 0)           # where each object is, z, y, x
+    ids = set()
+    for identifier in (11, 22, 33):
+        predicted = np.unique(result.array[in_store == identifier])
+        assert len(predicted) == 1 and predicted[0] != 0, f"object {identifier} -> {predicted}"
+        ids.add(int(predicted[0]))
+    assert len(ids) == 3
+    assert (result.array[in_store == 0] == 0).mean() > 0.95
+    assert result.attrs["model_axes"] == "xyz"
+
+
 def test_whole_volume_run_assembles_one_id_per_object_across_tiles():
     full = torch.zeros(48, 32, 32, dtype=torch.long)
     full[4:28, 4:12, 4:12] = 5          # spans both tiles: cut by the first tile's far face
@@ -576,7 +629,8 @@ def test_a_continuation_is_accepted_on_coverage_not_on_the_iou_head():
     assert canvas.instances == 1
     # Tile B: propagation alone must extend id 1 across the seam, with the head saying 0.0.
     image, coords, token_grid = predictor.algorithm.encode(volume_a)   # advances the oracle's tile
-    painted = predictor._propagate(canvas, (8, 0, 0), image, coords, token_grid, (32, 32, 32))
+    painted = predictor._propagate(canvas, (8, 0, 0), image, coords, token_grid, (32, 32, 32),
+                                   AxisOrder("xyz", "xyz"))
     assert painted > 0, "a continuation covering its fragment must be painted despite pred IoU 0"
     assert canvas.labels[16:20, 2:6, 2:6].unique().tolist() == [1], "beyond the seam, still id 1"
     assert canvas.instances == 1

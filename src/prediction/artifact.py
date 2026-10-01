@@ -74,6 +74,21 @@ def multiscales(axes: str, voxel_nm: list[float], translation_nm: list[float],
     }
 
 
+def default_chunks(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """256 along every axis, or the whole axis where it is shorter (all channels in one chunk)."""
+    return tuple(min(256, s) for s in shape)
+
+
+def _check_rank(ndim: int, axes: str) -> bool:
+    """Whether an array of rank `ndim` on `axes` has a leading channel axis; other ranks refused."""
+    if ndim not in (len(axes), len(axes) + 1):
+        raise ValueError(
+            f"array of rank {ndim} does not fit axes {axes!r} (with or without a leading "
+            "channel axis)"
+        )
+    return ndim == len(axes) + 1
+
+
 def write_ome_artifact(
     path: Path,
     array: np.ndarray,
@@ -85,16 +100,11 @@ def write_ome_artifact(
     chunks: tuple[int, ...] | None = None,
 ) -> Path:
     """Write `array` as `<path>/s0` inside an OME-Zarr 0.5 group carrying `attrs`."""
-    if array.ndim not in (len(axes), len(axes) + 1):
-        raise ValueError(
-            f"array of rank {array.ndim} does not fit axes {axes!r} (with or without a leading "
-            "channel axis)"
-        )
-    channels = array.ndim == len(axes) + 1
+    channels = _check_rank(array.ndim, axes)
     group = zarr.open_group(str(path), mode="w", zarr_format=3)
     level = group.create_array(
         name=LEVEL, shape=array.shape, dtype=array.dtype,
-        chunks=chunks or tuple(min(256, s) for s in array.shape),
+        chunks=chunks or default_chunks(array.shape),
     )
     level[:] = array
     group.attrs.update(
@@ -102,3 +112,32 @@ def write_ome_artifact(
     )
     level.attrs.update(**attrs)
     return Path(path)
+
+
+def create_ome_artifact(
+    path: Path,
+    shape: tuple[int, ...],
+    dtype: Any,
+    *,
+    axes: str,
+    voxel_nm: list[float],
+    translation_nm: list[float],
+    attrs: dict[str, Any],
+    chunks: tuple[int, ...],
+    name: str | None = None,
+) -> Any:
+    """An empty artifact, laid out as `write_ome_artifact` lays one out, to be filled region by
+    region -> its `s0` array.
+
+    Never overwrites: an existing `s0` raises `zarr.errors.ContainsArrayError`, which is how
+    concurrent writers find that another has already made it. `name` is the OME name, by default
+    the directory's own; a group written under a temporary name and renamed into place passes its
+    final one.
+    """
+    channels = _check_rank(len(shape), axes)
+    name = Path(path).name if name is None else name
+    group = zarr.open_group(str(path), mode="a", zarr_format=3)
+    level = group.create_array(name=LEVEL, shape=shape, dtype=dtype, chunks=chunks)
+    group.attrs.update(ome=multiscales(axes, voxel_nm, translation_nm, channels, name), **attrs)
+    level.attrs.update(**attrs)
+    return level

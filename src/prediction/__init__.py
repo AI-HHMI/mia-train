@@ -10,6 +10,10 @@ CLI that loads a run and writes artifacts -- so that strategies can build on it.
   * `dense` -- `predict_volume` and `DensePredictor`: the weighted-average tiling every
     fixed-channel output gets for free, and `select_predictor`, the one-line dispatch.
 
+Beside them, imported by `predict.py` only and so not re-exported here: `artifact` writes the
+OME-Zarr artifacts, and `blockwise` runs the dense path one block at a time, straight to disk,
+for regions too large for memory.
+
 **This package is a leaf.** It imports numpy, torch and miao and nothing from `algorithms/`,
 `models/`, `engine/`, `data/` or the entrypoints, and `tests/unit/test_package_layout.py` keeps it
 that way. That is the reason it exists: `algorithms/` imports it at runtime to type
@@ -23,6 +27,7 @@ different `VolumeGrid` class from the one `__main__` holds.
 
 from .dense import DENSE_PROTOCOL, DensePredictor, blend_weight, predict_volume, select_predictor
 from .grid import (
+    AxisOrder,
     VolumeGrid,
     aligned_tiling,
     normalize,
@@ -33,6 +38,7 @@ from .grid import (
 from .types import VolumePrediction, VolumePredictor
 
 __all__ = [
+    "AxisOrder",
     "DENSE_PROTOCOL",
     "DensePredictor",
     "VolumeGrid",

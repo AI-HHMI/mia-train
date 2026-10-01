@@ -1,6 +1,7 @@
 """Run a trained checkpoint over a whole OME-NGFF volume and write the prediction as an artifact.
 
     python src/predict.py <run_dir> --data-config <miao.yaml> --out <dir> [--step N] [--volume <name>]
+    python src/predict.py ... --block 1536 [--worker K --workers N]     # a region too large for RAM
 
 Runs over every volume in the data config, or over the one named by `--volume`, and writes two
 artifacts per volume, on one shared grid:
@@ -35,6 +36,14 @@ the provenance needed to reproduce them.
 was made on, so the two artifacts share a lattice by construction; a scorer that resampled labels
 onto a prediction's grid itself would be a second transform chain with a second chance to be wrong.
 Every input to the chain is recorded in the artifact's attrs, so the result stays auditable.
+
+**`--block` is for regions that do not fit in memory.** The whole-region path holds ~40 bytes a
+voxel at 6 channels until it writes; `--block` cuts the same lattice into blocks written straight
+into the artifact, and `--worker`/`--workers` deal them out, one process per GPU -- an LSF job array
+of `--workers` elements, each passing its own index. The values are bit-identical to the
+whole-region path's, and the artifact appears only when its last block is done
+(`prediction.blockwise`). Dense outputs only, and no ground truth: the regions this is for are
+scored against skeletons, and a labelling that large would not fit in memory either.
 """
 
 from __future__ import annotations
@@ -50,7 +59,8 @@ import numpy as np
 import torch
 
 from prediction.artifact import ome_geometry, write_ome_artifact
-from prediction.dense import select_predictor
+from prediction.blockwise import predict_blocks
+from prediction.dense import DensePredictor, select_predictor
 from prediction.grid import VolumeGrid, storage_axes_of
 from prediction.types import VolumePredictor
 
@@ -332,6 +342,21 @@ def volumes_to_predict(config: Any, requested: str | None) -> list[str]:
     return [requested]
 
 
+def block_shape(spec: str, rank: int) -> list[int]:
+    """`--block` as output voxels per storage axis: one number for every axis, or one per axis."""
+    try:
+        values = [int(v) for v in spec.split(",")]
+    except ValueError:
+        raise SystemExit(
+            f"--block {spec!r}: expected N or N,N,N (output voxels, in the volume's storage order)"
+        ) from None
+    if len(values) == 1:
+        return values * rank
+    if len(values) != rank:
+        raise SystemExit(f"--block {spec!r} has {len(values)} axes but the volume has {rank}")
+    return values
+
+
 def run_volume(
     config: Any,
     name: str,
@@ -343,10 +368,27 @@ def run_volume(
     predictor: VolumePredictor | None,
     device: torch.device,
     patch_override: int | None,
+    block: str | None = None,
+    worker: int = 0,
+    workers: int = 1,
 ) -> None:
-    """Predict one volume (unless `predictor` is None) and write its ground truth beside it."""
+    """Predict one volume (unless `predictor` is None) and write its ground truth beside it.
+
+    With `block`, this worker's share of the volume's blocks instead, and no ground truth.
+    """
     grid = VolumeGrid(config, name, resolve_patch(config, resolved, name, patch_override))
     geometry = ome_geometry(grid)
+
+    if block is not None:
+        assert isinstance(predictor, DensePredictor)            # checked in main() up front
+        predict_blocks(
+            predictor.algorithm, grid, device, path=out / f"{name}.zarr",
+            attrs={"kind": predictor.kind, **predictor.attrs,
+                   **shared_attrs(grid, run_dir, step, data_config)},
+            geometry=geometry, block=block_shape(block, grid.rank),
+            worker=worker, workers=workers,
+        )
+        return
 
     if predictor is not None:
         if device.type == "cuda":
@@ -410,7 +452,22 @@ def main() -> None:
                         help="patch one [algorithm] or [model] setting from the run's resolved "
                              "config before rebuilding it; repeatable. For knobs decided after "
                              "training, e.g. algorithm.pred_iou_thresh=0.7. Values are TOML.")
+    parser.add_argument("--block", type=str, default=None, metavar="N[,N,N]",
+                        help="predict in blocks of N output voxels per axis (one number, or one "
+                             "per axis in the volume's storage order), each written straight "
+                             "into the artifact, for a region that does not fit in memory; see "
+                             "prediction.blockwise. Dense outputs only; writes no ground truth")
+    parser.add_argument("--worker", type=int, default=0,
+                        help="with --block: which share of the blocks this process predicts, "
+                             "0-based")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="with --block: how many processes share the blocks, e.g. the size "
+                             "of an LSF job array")
     args = parser.parse_args()
+    if args.block is None and (args.worker != 0 or args.workers != 1):
+        raise SystemExit("--worker and --workers share out blocks, so they need --block")
+    if args.block is not None and args.truth_only:
+        raise SystemExit("--block is for predictions; the ground truth is not written in blocks")
 
     from miao.config import load_config
 
@@ -434,6 +491,11 @@ def main() -> None:
         # Resolved before any store is opened, so a strategy that cannot be run over a volume fails
         # here in a second rather than after the reads.
         predictor = select_predictor(algorithm)
+        if args.block is not None and not isinstance(predictor, DensePredictor):
+            raise SystemExit(
+                f"--block needs the dense path, whose tiles are a weighted average; "
+                f"{type(predictor).__name__} reconciles its tiles its own way"
+            )
 
     names = volumes_to_predict(config, args.volume)
     for index, name in enumerate(names, 1):
@@ -441,7 +503,7 @@ def main() -> None:
             print(f"[{index}/{len(names)}] {name}", flush=True)
         run_volume(
             config, name, args.out, args.run_dir, args.data_config, step, resolved,
-            predictor, device, args.patch,
+            predictor, device, args.patch, args.block, args.worker, args.workers,
         )
         # One volume's blend buffers can be hundreds of GB; release them before the next.
         gc.collect()

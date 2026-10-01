@@ -100,11 +100,14 @@ def test_normalisation_follows_the_volume_not_the_dtype():
     "volume", ["liconn_mouse_hippocampus", "kasthuri15_ac4", "liconn_expid82"]
 )
 def test_reader_matches_miao_exactly(volume: str) -> None:
-    """Same patch, read both ways, required to agree to the bit.
+    """Same patch, read both ways: what the model is handed must be miao's sample, to the bit.
 
     Covers the three shapes of the problem present in this eval set: a uint16 volume with an
     intensity window, an anisotropic uint8 volume whose axes are up-sampled in z and down-sampled in
-    x and y at once, and a volume whose storage axis order differs from the config's.
+    x and y at once, and a volume whose storage axis order differs from the config's. The last is
+    why the comparison goes through `AxisOrder`, the transform inference applies: this test once
+    transposed predict.py's read by hand before comparing, so the values agreed while the model,
+    which never got that transpose, was handed every such tile with z and x exchanged.
     """
     pytest.importorskip("miao")
     if not DATA_CONFIG.is_file():
@@ -113,7 +116,7 @@ def test_reader_matches_miao_exactly(volume: str) -> None:
     from miao.dataset import VolumeDataset
 
     from predict import resolve_patch
-    from prediction.grid import VolumeGrid
+    from prediction.grid import AxisOrder, VolumeGrid
 
     base = load_config(DATA_CONFIG)
     out_axes = "".join(axis for axis in base.output_axes if axis in "xyz")
@@ -141,9 +144,8 @@ def test_reader_matches_miao_exactly(volume: str) -> None:
     )
 
     grid.read = read                        # compare at miao's own read shape, not the even one
-    mine = np.transpose(
-        grid.read_image(grid.image_handle(), read_origin),
-        [grid.axes.index(axis) for axis in out_axes],
+    mine = AxisOrder(grid.axes, out_axes).to_model(
+        grid.read_image(grid.image_handle(), read_origin)
     )
     assert mine.shape == theirs.shape
     assert np.abs(mine - theirs).max() == 0.0
@@ -324,6 +326,8 @@ class _DenseAlgorithm:
     prediction_kind = "affinity"
     prediction_channels = 3
     squash_convention = "sigmoid(0.2 * logit)"
+    input_axes = "lczyx"                         # trained in the fake grid's own order
+    offsets = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
 
     def volume_predictor(self):
         return None
@@ -352,7 +356,94 @@ def test_the_dense_predictor_is_byte_identical_to_the_bare_dense_path():
     assert wrapped.attrs == {
         "convention": "sigmoid(0.2 * logit), blended in that space",
         "channels": 3,
+        "model_axes": "zyx",
+        "offsets": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
     }
+
+
+@pytest.mark.unit
+def test_axes_are_matched_by_name_and_an_affinity_channel_follows_its_axis():
+    from prediction.grid import AxisOrder
+
+    order = AxisOrder("zyx", "xyz")                 # a z, y, x store; a model trained x, y, z
+    store = np.arange(2 * 3 * 4).reshape(2, 3, 4)          # z = 2, y = 3, x = 4
+    assert order.to_model(store).shape == (4, 3, 2)
+    assert np.array_equal(order.to_storage(order.to_model(store)), store)
+    assert order.shape_to_storage((4, 3, 2)) == (2, 3, 4)
+    six = ((1, 0, 0), (0, 1, 0), (0, 0, 1), (10, 0, 0), (0, 10, 0), (0, 0, 10))
+    # The model's +z channel (2) is the store's first axis, and so on.
+    assert order.channel_order(six) == [2, 1, 0, 5, 4, 3]
+    same = AxisOrder("xyz", "xyz")
+    assert same.to_model(store) is store and same.channel_order(six) == list(range(6))
+    with pytest.raises(SystemExit, match="not the same axes"):
+        AxisOrder("zyx", "xyc")
+    with pytest.raises(SystemExit, match="no counterpart"):
+        order.channel_order(((1, 0, 0), (0, 1, 0), (0, 0, 3)))
+
+
+class _StoreZYX:
+    """One tile over a 6 x 8 x 10 store laid out z, y, x -- not the order the model trained in."""
+
+    patch = [6, 8, 10]
+    output_shape = (6, 8, 10)
+    effective_voxel = [1.0, 1.0, 1.0]
+    axes = "zyx"
+    box_coverage = 1.0
+
+    def __init__(self) -> None:
+        self.read = np.random.default_rng(0).random((6, 8, 10), dtype=np.float32)
+
+    @property
+    def tiles(self):
+        return [((0, 0, 0), (0, 0, 0))]
+
+    def image_handle(self):
+        return None
+
+    def read_image(self, handle, origin):
+        return self.read
+
+
+class _Directional:
+    """Trained on x, y, z: each channel the input minus its neighbour along one of ITS axes."""
+
+    prediction_kind = "affinity"
+    prediction_channels = 6
+    squash_convention = "identity"
+    input_axes = "lcxyz"
+    offsets = ((1, 0, 0), (0, 1, 0), (0, 0, 1), (2, 0, 0), (0, 2, 0), (0, 0, 2))
+
+    def __init__(self) -> None:
+        self.seen: list[torch.Tensor] = []
+
+    def volume_predictor(self):
+        return None
+
+    def logits(self, volumes):
+        self.seen.append(volumes.clone())
+        x = volumes[:, 0]
+        return torch.stack([x - torch.roll(x, -distance, dims=1 + axis)
+                            for distance in (1, 2) for axis in range(3)], dim=1)
+
+    @staticmethod
+    def squash(logits):
+        return logits
+
+
+@pytest.mark.unit
+def test_a_tile_reaches_the_model_in_its_training_order_and_returns_in_the_stores():
+    """A model trained on x, y, z tiles, a store laid out z, y, x: the model must be handed the tile
+    transposed, as miao handed it every training sample, and its channels must come back meaning
+    "along the store's axis i" -- the layout an affinity artifact promises mutex watershed."""
+    from prediction.dense import predict_volume
+
+    grid, algorithm = _StoreZYX(), _Directional()
+    out = predict_volume(algorithm, grid, torch.device("cpu"))
+    assert torch.equal(algorithm.seen[0][0, 0], torch.from_numpy(grid.read.transpose(2, 1, 0)))
+    assert out.shape == (6, 6, 8, 10)
+    for channel, (distance, axis) in enumerate((d, a) for d in (1, 2) for a in range(3)):
+        expected = grid.read - np.roll(grid.read, -distance, axis=axis)
+        assert np.allclose(out[channel], expected, atol=2e-3), f"channel {channel}"
 
 
 @pytest.mark.unit

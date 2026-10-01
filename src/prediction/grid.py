@@ -31,7 +31,9 @@ in the scorer would be a second chance to get it wrong in a way no test compares
 
 Every geometric value taken from miao is in **storage** axis order (`img_spatial_axes`), not the
 config's `output_axes`: miao permutes the config's xyz box into the store's zyx where they differ,
-and mixing the two transposes a volume.
+and mixing the two transposes a volume. The model is the exception: it was trained on samples in
+its run's `output_axes` order, so each tile is transposed into that order on the way in and back on
+the way out (`AxisOrder`).
 
 `tests/unit/test_predict.py` holds the parity test that reads a box both ways -- through miao's own
 sampler and through `VolumeGrid` -- and requires the two to agree to the bit.
@@ -147,6 +149,84 @@ def storage_axes_of(config: Any, volume_name: str) -> str:
             f"{[v.name for v in config.volumes]}"
         )
     return str(VolumeDataset(single)._volumes[0].img_spatial_axes)
+
+
+class AxisOrder:
+    """A model's input axis order against a store's, and the transposes between them.
+
+    miao hands every training sample over in the run's `output_axes` order, permuting each store's
+    own axes by name, while `VolumeGrid` reads tiles in the store's order. So a tile must reach the
+    model transposed into the order it was trained on, and what comes back must be transposed into
+    the store's -- where boxes, masks, ground truth and the artifact all live. Without this a store
+    laid out differently from the training data (LSD's z, y, x hemibrain regions, under a model
+    trained on lmd's x, y, z crops) reaches the model with two axes exchanged: an input it never
+    saw in training -- with `rotate = "inplane"` the sectioning axis never moves -- and output
+    that still looks plausible.
+
+    Axes are matched by name. When the two orders agree every method returns its input untouched,
+    so a store laid out like the training data predicts exactly as it did before.
+    """
+
+    def __init__(self, storage: str, model: str) -> None:
+        if sorted(storage) != sorted(model):
+            raise SystemExit(
+                f"the store's axes {storage!r} and the model's {model!r} are not the same axes"
+            )
+        self.storage, self.model = storage, model
+        self.identity = storage == model
+        self._to_model = [storage.index(axis) for axis in model]
+        self._to_storage = [model.index(axis) for axis in storage]
+
+    @classmethod
+    def of(cls, grid: Any, algorithm: Any) -> AxisOrder:
+        """The order between `grid`'s store and the axes `algorithm` was trained on."""
+        axes = getattr(algorithm, "input_axes", None)
+        if axes is None:
+            raise SystemExit(
+                f"{type(algorithm).__name__} declares no input_axes, so the axis order it was "
+                "trained on -- and so how to hand it a tile -- is unknown"
+            )
+        return cls(str(grid.axes), "".join(axis for axis in axes if axis in "xyz"))
+
+    def _apply(self, array: Any, order: list[int], leading: int) -> Any:
+        if self.identity:
+            return array
+        full = [*range(leading), *(leading + axis for axis in order)]
+        if isinstance(array, torch.Tensor):
+            return array.permute(*full)
+        return np.transpose(array, full)
+
+    def to_model(self, array: Any, leading: int = 0) -> Any:
+        """Store-order spatial axes (after `leading` others) -> the model's order."""
+        return self._apply(array, self._to_model, leading)
+
+    def to_storage(self, array: Any, leading: int = 0) -> Any:
+        """Model-order spatial axes (after `leading` others) -> the store's order."""
+        return self._apply(array, self._to_storage, leading)
+
+    def shape_to_storage(self, shape: Any) -> tuple[int, ...]:
+        """A per-axis tuple in the model's order -> the same values in the store's order."""
+        return tuple(int(shape[axis]) for axis in self._to_storage)
+
+    def channel_order(self, offsets: Any) -> list[int]:
+        """Affinity channels re-indexed for the store: entry j is the model channel whose offset,
+        written along the store's axes, is `offsets[j]`.
+
+        Each affinity channel means "the neighbour this offset away along the input's axes". Once
+        transposed into the store's order, channel j must mean the same along the store's axes --
+        the layout an affinity artifact promises and mutex watershed reads.
+        """
+        stored = [tuple(int(o[self.model.index(axis)]) for axis in self.storage) for o in offsets]
+        where = {offset: channel for channel, offset in enumerate(stored)}
+        wanted = [tuple(int(v) for v in o) for o in offsets]
+        missing = [o for o in wanted if o not in where]
+        if missing:
+            raise SystemExit(
+                f"the affinity offsets {wanted} do not map onto themselves when the model's axes "
+                f"{self.model!r} are written in the store's order {self.storage!r} ({missing} have "
+                "no counterpart), so no channel order makes the artifact's layout hold"
+            )
+        return [where[o] for o in wanted]
 
 
 class VolumeGrid:

@@ -46,7 +46,7 @@ import torch
 
 from layers.common.prompt import FOREGROUND
 from layers.common.rope import voxel_coords
-from prediction.grid import VolumeGrid
+from prediction.grid import AxisOrder, VolumeGrid
 from prediction.types import VolumePrediction
 
 PREFER = ("whole", "part")
@@ -934,6 +934,7 @@ class PromptGridPredictor:
         image_coords: torch.Tensor,
         grid: tuple[int, ...],
         extent: Sequence[int],
+        order: AxisOrder,
     ) -> int:
         """Continue every object already painted in this tile's region, by inference -> count.
 
@@ -962,7 +963,11 @@ class PromptGridPredictor:
         shape = tuple(e // int(s) for e, s in zip(extent, stride.tolist(), strict=True))
         min_cells, max_cells = self._bounds(extent)
         painted = 0
-        for identifier, fragment, logits in canvas.fragments_in(origin, shape):
+        # The canvas is in the store's axis order, the model in its own (`AxisOrder`): fragments
+        # go in transposed, continuations come back transposed.
+        for identifier, fragment, logits in canvas.fragments_in(
+                origin, order.shape_to_storage(shape)):
+            fragment, logits = order.to_model(fragment), order.to_model(logits)
             cell = torch.nonzero(logits == logits.max(), as_tuple=False)[0]
             click = (cell * stride + (stride - 1).float() / 2).unsqueeze(0)
             out, _ = self.algorithm.decode_points(
@@ -977,11 +982,16 @@ class PromptGridPredictor:
             area = int(mask.sum())
             covered = int((mask & fragment).sum()) / max(int(fragment.sum()), 1)
             if covered >= self.propagate_min_coverage and min_cells <= area <= max_cells:
-                painted += canvas.paint(mask, identifier, origin, out)
+                painted += canvas.paint(order.to_storage(mask), identifier, origin,
+                                        order.to_storage(out))
         return painted
 
     def run(self, grid: VolumeGrid, device: torch.device) -> VolumePrediction:
-        stride = tuple(self.algorithm.mask_stride)
+        # The canvas, the tiles' positions and the result are in the store's axis order; the model
+        # sees each tile in the order it was trained on (`AxisOrder`). `mask_stride` is the
+        # model's, per axis, so the canvas uses it rewritten in the store's order.
+        order = AxisOrder.of(grid, self.algorithm)
+        stride = order.shape_to_storage(self.algorithm.mask_stride)
         for name, values in (("output", grid.output_shape), ("patch", grid.patch)):
             if any(v % s for v, s in zip(values, stride, strict=True)):
                 raise ValueError(
@@ -1004,21 +1014,26 @@ class PromptGridPredictor:
               f"{', edge_discard' if self.edge_discard else ''}"
               f"{', skip_claimed_clicks' if self.skip_claimed_clicks else ''}", flush=True)
         for index, (native, out) in enumerate(tiles):
-            volume = torch.from_numpy(grid.read_image(handle, native)[None, None]).to(device)
-            extent = tuple(volume.shape[-3:])
+            tile = np.ascontiguousarray(order.to_model(grid.read_image(handle, native)))
+            volume = torch.from_numpy(tile[None, None]).to(device)
+            extent = tuple(volume.shape[-3:])                    # the model's order
             origin = [o // s for o, s in zip(out, stride, strict=True)]
-            shape = tuple(e // s for e, s in zip(extent, stride, strict=True))
+            shape = tuple(e // s for e, s in zip(order.shape_to_storage(extent), stride,
+                                                   strict=True))
             with torch.autocast(device.type, dtype=torch.bfloat16):
                 image, image_coords, token_grid = self.algorithm.encode(volume)
                 if canvas is not None and self.tile_merge == "propagate":
-                    self._propagate(canvas, origin, image, image_coords, token_grid, extent)
+                    self._propagate(canvas, origin, image, image_coords, token_grid, extent,
+                                    order)
                 skip = (
-                    canvas.claimed(origin, shape)
+                    order.to_model(canvas.claimed(origin, shape))
                     if canvas is not None and self.skip_claimed_clicks else None
                 )
                 masks, scores, logits = self.decode_grid(
                     image, image_coords, token_grid, extent, skip=skip
                 )
+            masks = order.to_storage(masks, leading=1)
+            logits = order.to_storage(logits, leading=1)
             if self.edge_discard and masks.shape[0]:
                 interior = [
                     (o > 0, o + p < full)
@@ -1062,7 +1077,8 @@ class PromptGridPredictor:
             attrs={
                 "background_id": 0,
                 "instances": instances,
-                "mask_stride": list(stride),
+                "mask_stride": list(stride),                     # the store's axis order
+                "model_axes": order.model,
                 "generator": "prompt_grid",
                 **self.settings(),
             },

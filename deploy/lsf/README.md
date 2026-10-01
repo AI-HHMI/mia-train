@@ -226,6 +226,41 @@ The run had trained and validated correctly for every step before it and died at
 storage — so there is no measurable cost. If you add another code path that saves state across
 ranks, route its coordination the same way.
 
+## Predicting a region too large for memory
+
+`src/predict.py` holds a region's whole prediction in RAM (~40 bytes a voxel at 6 channels) until
+it writes. For a larger region pass `--block`: the same tile lattice is cut into blocks of output
+voxels, each written straight into the artifact, and `--worker`/`--workers` share the blocks out,
+one job-array element per GPU (`$LSB_JOBINDEX` is 1-based):
+
+```bash
+# 64 GPUs share one volume's blocks; resubmitting the same command resumes, skipping finished blocks
+PREDICT='export OMP_NUM_THREADS=12 MKL_NUM_THREADS=12 OPENBLAS_NUM_THREADS=12 PYTHONPATH=$MIA_TRAIN/src; \
+  $VENV/bin/python $MIA_TRAIN/src/predict.py <run_dir> --data-config <data.yaml> --volume <name> \
+  --out <dir> --block 1536'
+bsub -P $PROJECT -q gpu_b300 -gpu "num=1" -n 12 -W 12:00 -J "predict[1-64]" \
+  -cwd $JOBS -o $JOBS/predict_%J_%I.log -e $JOBS/predict_%J_%I.err \
+  "$PREDICT --worker \$((LSB_JOBINDEX - 1)) --workers 64"
+# then one finisher, once every element has ended: it predicts whatever is still missing (normally
+# nothing) and completes the artifact
+bsub -P $PROJECT -q gpu_b300 -gpu "num=1" -n 12 -W 12:00 -w 'ended(predict)' -J predict_finish \
+  -cwd $JOBS -o $JOBS/predict_finish_%J.log -e $JOBS/predict_finish_%J.err "$PREDICT"
+```
+
+- The workers write `<name>.zarr.partial`, and whichever finishes the last block renames it to
+  `<name>.zarr`, so nothing can read a half-written prediction as a finished one. A killed worker
+  loses only its unfinished block, and the finisher (or any rerun, at any worker count) redoes it.
+  The finisher is not optional across nodes: NFS clients cache lookups for up to a minute, so when
+  workers on two nodes finish together, the last one can miss the other's final marker and leave
+  the artifact incomplete.
+- The values are bit-identical to the whole-region path's. The cost is compute: a tile straddling
+  a block face runs once for every block it meets, about prod(1 + stride / block), i.e. 1.27x at
+  `--block 1536` with a 256 patch. A block needs ~40 bytes a voxel of RAM at 6 channels, 145 GB
+  at 1536³, within one GPU's 12 slots. Blocks must be multiples of the artifact's 256-voxel chunks.
+- Keep every element on one queue: blocks predicted on two GPU generations are refused at
+  completion, because the same model predicts slightly differently on each.
+- `--block` writes no ground truth.
+
 ## Mapping `ParallelDims` to an allocation
 
 `ParallelDims(dp_replicate, dp_shard, tp)` must multiply to the `torchrun` world size (total GPUs).

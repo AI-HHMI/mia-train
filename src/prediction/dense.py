@@ -5,6 +5,9 @@
 path behind the `VolumePredictor` interface, so that the entrypoint holds every strategy to one
 contract. `select_predictor` is the dispatch: a strategy's own predictor if it declares one, else
 this. `tests/unit/test_predict.py` pins the wrapper as byte-identical to the bare function.
+
+`accumulate` and `blend` are the path's two halves -- sum the weighted tiles over a box, divide --
+exposed so that `prediction.blockwise` runs the very same code one block at a time.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .grid import VolumeGrid
+from .grid import AxisOrder, VolumeGrid
 from .types import VolumePrediction, VolumePredictor
 
 
@@ -44,6 +47,94 @@ def blend_weight(shape: tuple[int, ...]) -> np.ndarray:
     return np.broadcast_to(weight, shape).astype(np.float32)
 
 
+def overlapping(
+    tiles: list[tuple[tuple[int, ...], tuple[int, ...]]],
+    patch: list[int],
+    low: tuple[int, ...],
+    shape: tuple[int, ...],
+) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    """The tiles whose output window meets the box [low, low + shape), in lattice order."""
+    return [
+        (native, out) for native, out in tiles
+        if all(o < lo + s and o + p > lo
+               for o, p, lo, s in zip(out, patch, low, shape, strict=True))
+    ]
+
+
+@torch.no_grad()
+def accumulate(
+    algorithm: Any,
+    grid: VolumeGrid,
+    device: torch.device,
+    low: tuple[int, ...],
+    shape: tuple[int, ...],
+    *,
+    handle: Any = None,
+    progress: bool = True,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Every tile's weighted prediction summed over the output box [low, low + shape).
+
+    Returns (weighted sum, weight sum, tiles run): float32, (channels, *shape) and (1, *shape).
+    Only the tiles that meet the box are run, in lattice order, and each adds only its part inside
+    the box. So every voxel receives the same tiles' values, added in the same order, as it does
+    when the box is the whole lattice: a box's sums equal that part of the whole region's sums bit
+    for bit, which is what lets `prediction.blockwise` cut a region into blocks.
+    """
+    handle = grid.image_handle() if handle is None else handle
+    channels = int(algorithm.prediction_channels)
+    total = np.zeros((channels, *shape), dtype=np.float32)
+    weight = np.zeros((1, *shape), dtype=np.float32)
+    single = blend_weight(tuple(grid.patch))[None]
+    # Tiles reach the model in the axis order it was trained on, and its output returns to the
+    # store's; an affinity channel is re-indexed with its axis. A no-op when the two orders agree.
+    order = AxisOrder.of(grid, algorithm)
+    remap = (
+        order.channel_order(algorithm.offsets[:channels])
+        if algorithm.prediction_kind == "affinity" and not order.identity else None
+    )
+
+    tiles = overlapping(grid.tiles, grid.patch, low, shape)
+    for index, (native, out) in enumerate(tiles):
+        tile = np.ascontiguousarray(order.to_model(grid.read_image(handle, native)))
+        volumes = torch.from_numpy(tile[None, None]).to(device)
+        with torch.autocast(device.type, dtype=torch.bfloat16):
+            logits = algorithm.logits(volumes)
+        stored = order.to_storage(algorithm.squash(logits.float())[0], leading=1)
+        if remap is not None:
+            stored = stored[remap]
+        stored = stored.cpu().numpy()
+
+        inside = tuple(
+            slice(max(o, lo) - o, min(o + p, lo + s) - o)
+            for o, p, lo, s in zip(out, grid.patch, low, shape, strict=True)
+        )
+        window = tuple(
+            slice(max(o, lo) - lo, min(o + p, lo + s) - lo)
+            for o, p, lo, s in zip(out, grid.patch, low, shape, strict=True)
+        )
+        part = (slice(None), *inside)
+        total[(slice(None), *window)] += stored[part] * single[part]
+        weight[(slice(None), *window)] += single[part]
+        if progress and ((index + 1) % 25 == 0 or index + 1 == len(tiles)):
+            print(f"  {index + 1}/{len(tiles)}", flush=True)
+    return total, weight, len(tiles)
+
+
+def blend(total: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    """The weighted mean of `accumulate`'s sums, as float16.
+
+    Divided a slab at a time. `(total / weight).astype(f16)` materialises a full float32 quotient
+    before downcasting, which at 7 gigavoxels over 6 channels is an extra 170 GB on top of the
+    accumulator. Slabbing costs nothing numerically and bounds the temporary at one slab.
+    """
+    blended = np.empty(total.shape, dtype=np.float16)
+    slab = max(1, total.shape[1] // 16)
+    for start in range(0, total.shape[1], slab):
+        stop = start + slab
+        blended[:, start:stop] = total[:, start:stop] / np.maximum(weight[:, start:stop], 1e-8)
+    return blended
+
+
 @torch.no_grad()
 def predict_volume(algorithm: Any, grid: VolumeGrid, device: torch.device) -> np.ndarray:
     """Blended predictions over the aligned region -> (channels, *output) float16.
@@ -55,42 +146,21 @@ def predict_volume(algorithm: Any, grid: VolumeGrid, device: torch.device) -> np
     representation. A weighted mean of logits is not the logit of a weighted mean of probabilities,
     so the order is part of the convention and is recorded with the data.
     """
-    handle = grid.image_handle()
-    channels = int(algorithm.prediction_channels)
-    total = np.zeros((channels, *grid.output_shape), dtype=np.float32)
-    weight = np.zeros((1, *grid.output_shape), dtype=np.float32)
-    single = blend_weight(tuple(grid.patch))[None]
-
-    tiles = grid.tiles
-    print(f"{len(tiles)} tiles of {grid.patch} -> output {grid.output_shape} at "
+    print(f"{len(grid.tiles)} tiles of {grid.patch} -> output {grid.output_shape} at "
           f"{[round(v, 3) for v in grid.effective_voxel]} nm/voxel ({grid.axes}); "
-          f"{channels} channels of {algorithm.prediction_kind}; "
+          f"{int(algorithm.prediction_channels)} channels of {algorithm.prediction_kind}; "
           f"lattice covers {100 * grid.box_coverage:.1f}% of the annotated box, centred",
           flush=True)
-    for index, (native, out) in enumerate(tiles):
-        volumes = torch.from_numpy(grid.read_image(handle, native)[None, None]).to(device)
-        with torch.autocast(device.type, dtype=torch.bfloat16):
-            logits = algorithm.logits(volumes)
-        stored = algorithm.squash(logits.float())[0].cpu().numpy()
-
-        window = tuple(slice(o, o + p) for o, p in zip(out, grid.patch, strict=True))
-        total[(slice(None), *window)] += stored * single
-        weight[(slice(None), *window)] += single
-        if (index + 1) % 25 == 0 or index + 1 == len(tiles):
-            print(f"  {index + 1}/{len(tiles)}", flush=True)
-
-    # Divided a slab at a time. `(total / weight).astype(f16)` materialises a full float32 quotient
-    # before downcasting, which at 7 gigavoxels over 6 channels is an extra 170 GB on top of the
-    # accumulator. Slabbing costs nothing numerically and bounds the temporary at one slab.
-    blended = np.empty(total.shape, dtype=np.float16)
-    slab = max(1, grid.output_shape[0] // 16)
-    for start in range(0, total.shape[1], slab):
-        stop = start + slab
-        blended[:, start:stop] = total[:, start:stop] / np.maximum(weight[:, start:stop], 1e-8)
-    return blended
+    total, weight, _ = accumulate(
+        algorithm, grid, device, (0,) * len(grid.output_shape), tuple(grid.output_shape)
+    )
+    return blend(total, weight)
 
 
-DENSE_PROTOCOL = ("logits", "squash", "squash_convention", "prediction_kind", "prediction_channels")
+#: What a dense strategy declares. `input_axes` is the axis order it was trained on (tiles are
+#: handed over in that order, `AxisOrder`); an affinity strategy also has `offsets`, one a channel.
+DENSE_PROTOCOL = ("logits", "squash", "squash_convention", "prediction_kind", "prediction_channels",
+                  "input_axes")
 
 
 class DensePredictor:
@@ -105,6 +175,9 @@ class DensePredictor:
 
     def __init__(self, algorithm: Any) -> None:
         missing = [name for name in DENSE_PROTOCOL if not hasattr(algorithm, name)]
+        if getattr(algorithm, "prediction_kind", None) == "affinity" and not hasattr(
+                algorithm, "offsets"):
+            missing.append("offsets")
         if missing:
             raise SystemExit(
                 f"{type(algorithm).__name__} lacks {missing}. Prediction over a whole volume needs "
@@ -114,14 +187,31 @@ class DensePredictor:
             )
         self.algorithm = algorithm
 
+    @property
+    def kind(self) -> str:
+        return str(self.algorithm.prediction_kind)
+
+    @property
+    def attrs(self) -> dict[str, Any]:
+        """What a reader needs beside the data to interpret it, whichever path wrote the data.
+
+        `model_axes` is the axis order the model was handed its tiles in; the artifact itself is
+        in the store's. An affinity artifact also states its `offsets`, one per channel along the
+        store's axes, so a consumer can check the layout it assumes rather than trust it.
+        """
+        channels = int(self.algorithm.prediction_channels)
+        attrs: dict[str, Any] = {
+            "convention": f"{self.algorithm.squash_convention}, blended in that space",
+            "channels": channels,
+            "model_axes": "".join(a for a in self.algorithm.input_axes if a in "xyz"),
+        }
+        if self.algorithm.prediction_kind == "affinity":
+            attrs["offsets"] = [[int(v) for v in o] for o in self.algorithm.offsets[:channels]]
+        return attrs
+
     def run(self, grid: VolumeGrid, device: torch.device) -> VolumePrediction:
         return VolumePrediction(
-            array=predict_volume(self.algorithm, grid, device),
-            kind=str(self.algorithm.prediction_kind),
-            attrs={
-                "convention": f"{self.algorithm.squash_convention}, blended in that space",
-                "channels": int(self.algorithm.prediction_channels),
-            },
+            array=predict_volume(self.algorithm, grid, device), kind=self.kind, attrs=self.attrs
         )
 
 
