@@ -81,9 +81,26 @@ class _Algorithm:
         return torch.sigmoid(0.2 * logits)
 
 
-def _predict(tmp_path, block=BLOCK, worker=0, workers=1, attrs=ATTRS, algorithm=None):
+class _FlushGrid(_Grid):
+    """A box the half-window strides do not fill, at the store's own resolution: the last tile on
+    each axis sits flush with the far face (`aligned_tiling` with read == patch and `cover`)."""
+
+    output_shape = (26, 21, 17)
+
+    def __init__(self) -> None:
+        from prediction.grid import aligned_tiling
+
+        generator = np.random.default_rng(0)
+        starts = [aligned_tiling(s, p, p, cover=True)[1]
+                  for s, p in zip(self.output_shape, self.patch, strict=True)]
+        self._tiles = [(origin, origin) for origin in itertools.product(*starts)]
+        self._reads = {origin: generator.random((8, 8, 8), dtype=np.float32)
+                       for origin, _ in self._tiles}
+
+
+def _predict(tmp_path, block=BLOCK, worker=0, workers=1, attrs=ATTRS, algorithm=None, grid=None):
     return predict_blocks(
-        algorithm or _Algorithm(), _Grid(), torch.device("cpu"), path=tmp_path / "v.zarr",
+        algorithm or _Algorithm(), grid or _Grid(), torch.device("cpu"), path=tmp_path / "v.zarr",
         attrs=attrs, geometry=GEOMETRY, block=block, worker=worker, workers=workers,
         chunks=CHUNKS,
     )
@@ -111,6 +128,17 @@ def test_blocks_reproduce_the_whole_region_path_bit_for_bit(tmp_path, block):
     blocked = zarr.open_array(str(path / "s0"), mode="r")[:]
     assert blocked.dtype == np.float16
     assert np.array_equal(_bits(blocked), _bits(_whole()))
+
+
+@pytest.mark.parametrize("block", [(4, 4, 4), (8, 12, 16), (99, 99, 99)])
+def test_a_flush_last_tile_leaves_no_seam_either(tmp_path, block):
+    """It overlaps the tile before it by more than half a window; the cut must still not show."""
+    grid = _FlushGrid()
+    assert {origin[0] for origin, _ in grid.tiles} == {0, 4, 8, 12, 16, 18}
+    path = _predict(tmp_path, block, grid=grid)
+    whole = predict_volume(_Algorithm(), _FlushGrid(), torch.device("cpu"))
+    assert whole.shape[1:] == _FlushGrid.output_shape
+    assert np.array_equal(_bits(zarr.open_array(str(path / "s0"), mode="r")[:]), _bits(whole))
 
 
 def test_workers_share_the_blocks_and_the_last_one_completes_the_artifact(tmp_path):

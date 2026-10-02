@@ -44,8 +44,32 @@ def test_tiling_lands_on_the_output_lattice():
     assert {b - a for a, b in zip(output, output[1:], strict=False)} == {128}
 
 
+def test_cover_reaches_the_box_at_the_stores_own_resolution():
+    """read == patch with `cover`: a last tile flush with the far face covers the box, real data.
+
+    The NISB case: 1350 z slices at a 256 patch stop at 1280 on half-window strides, and a 1024 x
+    1024 x 512 window covers 2560 of 3000 -- so two patch sizes were scored on different regions.
+    """
+    native, output, extent = aligned_tiling(1000, 256, 256, cover=True)
+    assert native == output == [0, 128, 256, 384, 512, 640, 744]
+    assert extent == 1000
+    assert aligned_tiling(1350, 256, 256, cover=True)[0][-1] + 256 == 1350
+    assert aligned_tiling(3000, 1024, 1024, cover=True) == (
+        [0, 512, 1024, 1536, 1976], [0, 512, 1024, 1536, 1976], 3000)
+    # A box the strides already fill gains no tile.
+    assert aligned_tiling(896, 256, 256, cover=True) == ([0, 128, 256, 384, 512, 640],) * 2 + (896,)
+    # Off by default: the lattice every existing table was scored on.
+    assert aligned_tiling(1000, 256, 256) == ([0, 128, 256, 384, 512, 640],) * 2 + (896,)
+    # And on a resampled axis it changes nothing either way.
+    assert aligned_tiling(480, 206, 256, cover=True) == aligned_tiling(480, 206, 256)
+
+
 def test_tiling_shrinks_rather_than_pads():
-    """The tail that does not complete a stride is dropped: no voxel comes from invented data."""
+    """Resampled: the tail that does not complete a stride is dropped, no voxel from invented data.
+
+    A tile flush with the far face would start at native 274, which maps to output 340.3 -- off the
+    lattice the other tiles share.
+    """
     native, _, _ = aligned_tiling(480, 206, 256)
     covered = 206 + (len(native) - 1) * 103
     assert covered == 412 <= 480
@@ -184,6 +208,55 @@ def test_aligned_tiling_with_a_quarter_window_step():
     assert aligned_tiling(480, 206, 256) == aligned_tiling(480, 206, 256, steps_per_patch=2)
     with pytest.raises(ValueError, match="divide by 4"):
         aligned_tiling(480, 206, 256, steps_per_patch=4)
+
+
+@pytest.mark.parametrize("cover_box", [False, True])
+def test_volume_grid_covers_the_box_where_the_model_sees_native_voxels(cover_box):
+    """8 nm store, 8 nm model, a box the strides do not fill.
+
+    With `cover_box` the grid is the box, nothing centred; without, the centred sub-box -- the
+    gary_comparison case, a 1000^3 test box scored on its central 896^3 (71.9%).
+    """
+    class FakeInfo:
+        img_spatial_axes = "zyx"
+        lbl_spatial_axes = "zyx"
+        lbl_axes = "zyx"
+        bounding_box = np.array([[0, 300], [0, 1000], [0, 1000]])
+        img_level_voxels = {0: [8.0, 8.0, 8.0]}
+        lbl_level_voxels = {0: [8.0, 8.0, 8.0]}
+
+        class scales:
+            chosen_levels = [0]
+            label_chosen_levels = [0]
+            read_shapes = [np.array([128, 256, 256])]
+
+    from prediction.grid import VolumeGrid
+
+    grid = VolumeGrid.__new__(VolumeGrid)
+    grid.volume = None
+    grid.patch = [128, 256, 256]
+    grid.info = FakeInfo()
+    grid.axes = "zyx"
+    grid.rank = 3
+    grid.image_level = 0
+    grid.label_level = 0
+    grid.image_voxel = FakeInfo.img_level_voxels[0]
+    grid.steps_per_patch = 2
+    grid.cover_box = cover_box
+    VolumeGrid._resolve_geometry(grid, None, "fake")
+
+    if cover_box:
+        assert grid.covers_full_box and grid.box_coverage == 1.0
+        assert grid.native_box() == [[0, 300], [0, 1000], [0, 1000]]
+        assert tuple(grid.output_shape) == (300, 1000, 1000)
+        assert grid.native_origins[0] == [0, 64, 128, 172]   # 172 = 300 - 128, flush with the face
+    else:
+        assert not grid.covers_full_box
+        assert grid.native_box() == [[22, 278], [52, 948], [52, 948]]     # centred, 256 and 896
+        assert tuple(grid.output_shape) == (256, 896, 896)
+    for axis in range(3):
+        starts = [native[axis] for native, _ in grid.tiles]
+        assert [min(starts), max(starts) + grid.read[axis]] == grid.native_box()[axis]
 
 
 def test_volume_grid_quarter_step_rounds_reads_and_keeps_tiles_on_the_truth_region():

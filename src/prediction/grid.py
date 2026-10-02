@@ -19,9 +19,20 @@ mine", a statement about one specific voxel spacing.
 So the lattice is built the other way round. Per axis, miao's own native read shape `R` is rounded
 up to even; tiles start at native multiples of `R'/2` and therefore land at output multiples of
 `patch/2`. Every tile is the same resampling operation, the output lattice is exactly uniform, and
-one output voxel measures `R' * native / patch`. The scored region is the largest lattice-aligned
-sub-box of `bounding_box`, centred in it: shrinking rather than padding, so nothing is predicted
-from data invented to fill a tile, and the covered fraction is recorded as `box_coverage`.
+one output voxel measures `R' * native / patch`.
+
+By default the scored region is the largest lattice-aligned sub-box of `bounding_box`, centred in
+it: shrinking rather than padding, so nothing is predicted from data invented to fill a tile, and
+the covered fraction is recorded as `box_coverage`.
+
+**With `cover_box`, the lattice covers the box exactly on every axis the model sees at the store's
+own resolution** (`R' == patch`): one last tile is added flush with the box's far face. Its origin
+is still a whole voxel, so it sits on the same lattice as the others, and the blend absorbs its
+larger overlap; every voxel is predicted from real data, and every patch size covers the same
+region. It is opt-in so that tables already scored on the centred sub-box can take new rows on
+that same region (mia-evals refuses a table whose rows score different regions). On a resampled
+axis a flush tile would land between output voxels (a 7.5 nm axis read for an 8 nm model: native
+origin 1838 maps to output 1717.3), so that axis keeps the centred sub-box either way.
 
 **The ground truth is read here too**, on the same lattice. Putting a labelling on this grid needs
 the volume's storage axis order, its image level, its *label* level -- which is not the same rung
@@ -50,16 +61,21 @@ import torch.nn.functional as F
 
 
 def aligned_tiling(
-    extent: int, read: int, patch: int, steps_per_patch: int = 2
+    extent: int, read: int, patch: int, steps_per_patch: int = 2, cover: bool = False
 ) -> tuple[list[int], list[int], int]:
     """Native tile origins, output tile origins, and the output extent, all on one lattice.
 
     The window advances by `patch / steps_per_patch` output voxels: 2 (the default) is the
     half-window overlap every scored run used, 4 a quarter-window step. `read` and `patch` must
     both divide by `steps_per_patch` so a native stride of `read / steps` maps to an output stride
-    of exactly `patch / steps` -- one lattice, no drift between tiles. The covered native extent
-    is `read + (n - 1) * read / steps`, at most `extent`: the tail that does not complete a stride
-    is dropped rather than padded, so no voxel is predicted from data invented to fill a tile.
+    of exactly `patch / steps` -- one lattice, no drift between tiles.
+
+    The covered native extent is `read + (n - 1) * read / steps`, at most `extent`: the tail that
+    does not complete a stride is dropped rather than padded, so no voxel is predicted from data
+    invented to fill a tile. With `cover`, at the store's own resolution (`read == patch`), the
+    tiles cover `extent` exactly instead: when the strides stop short, one last tile is placed flush
+    with the far face, at `extent - read`. On a resampled axis that origin would land between output
+    voxels, so `cover` changes nothing there.
     """
     if steps_per_patch < 1:
         raise ValueError(f"steps_per_patch must be at least 1, got {steps_per_patch}")
@@ -81,11 +97,12 @@ def aligned_tiling(
         )
     stride = read // steps_per_patch
     count = (extent - read) // stride + 1
-    return (
-        [k * stride for k in range(count)],
-        [k * (patch // steps_per_patch) for k in range(count)],
-        patch + (count - 1) * (patch // steps_per_patch),
-    )
+    native = [k * stride for k in range(count)]
+    output = [k * (patch // steps_per_patch) for k in range(count)]
+    if cover and read == patch and native[-1] + read < extent:
+        native.append(extent - read)
+        output.append(extent - patch)
+    return native, output, output[-1] + patch
 
 
 def resample_image(block: np.ndarray, target: tuple[int, ...]) -> np.ndarray:
@@ -236,6 +253,9 @@ class VolumeGrid:
     #: 2 is the half-window overlap every scored run used; a class default so a geometry built
     #: without `__init__` (the tests) has one.
     steps_per_patch: int = 2
+    #: Cover the box exactly where no axis is resampled (`aligned_tiling`'s `cover`); off by
+    #: default, the centred sub-box every table so far was scored on.
+    cover_box: bool = False
 
     def __init__(
         self,
@@ -244,6 +264,7 @@ class VolumeGrid:
         patch: list[int],
         box: list[list[int]] | None = None,
         steps_per_patch: int = 2,
+        cover_box: bool = False,
     ) -> None:
         """`box` restricts the region to a sub-box of the volume's own `bounding_box`.
 
@@ -251,7 +272,7 @@ class VolumeGrid:
         block of a large volume at a time -- pseudo-labelling walks a volume in blocks because a
         whole one does not fit in memory -- and clipped to the annotated box, so a caller cannot
         widen the region past what the data config declares. `steps_per_patch` sets the window
-        step, see `aligned_tiling`.
+        step and `cover_box` whether the tiles reach the box's far faces, see `aligned_tiling`.
         """
         from miao.dataset import VolumeDataset
         from miao.store import create_context
@@ -284,6 +305,7 @@ class VolumeGrid:
         )
         self.image_voxel = [float(v) for v in info.img_level_voxels[self.image_level]]
         self.steps_per_patch = int(steps_per_patch)
+        self.cover_box = bool(cover_box)
 
         self._resolve_geometry(box, volume_name)
 
@@ -344,15 +366,14 @@ class VolumeGrid:
         # voxels (for the default 2 this is the "make it even" rule every scored run used).
         self.read = [r + (-r) % steps for r in read]
         tiled = [
-            aligned_tiling(extent, r, p, steps)
+            aligned_tiling(extent, r, p, steps, cover=self.cover_box)
             for extent, r, p in zip(self.box_extent, self.read, self.patch, strict=True)
         ]
         self.native_origins = [t[0] for t in tiled]
         self.output_origins = [t[1] for t in tiled]
         self.output_shape = tuple(t[2] for t in tiled)
         self.native_extent = [
-            r + (len(o) - 1) * (r // steps)
-            for r, o in zip(self.read, self.native_origins, strict=True)
+            o[-1] + r for r, o in zip(self.read, self.native_origins, strict=True)
         ]
         # Centre the lattice in the bounding box rather than anchoring it at the low corner. The
         # covered extent is fixed by the lattice -- a tile that does not complete a stride is

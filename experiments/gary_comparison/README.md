@@ -103,6 +103,13 @@ must then be cropped away before scoring), which `VolumeGrid` does not do today.
 the three you want before comparing: (a) accept the 896^3 subset and ask him for his number on the
 same sub-box, (b) `steps_per_patch = 4`, (c) extend `VolumeGrid` with a separate score box.
 
+**A fourth way, since 2026-10-02: `predict.py --cover-box`.** At the store's own resolution (8 nm
+here, so every axis) it adds one last tile flush with the box's far face, so a prediction covers the
+whole 1000^3 from data inside the box. It is opt-in: every row scored so far covers the central
+896^3, and mia-evals refuses a row whose scored region differs from the table's. New rows predicted
+the default way join the table as before; switching this table to the full box means re-predicting
+and re-scoring its rows with `--cover-box`.
+
 ## Verification
 
 Measured by `/nrs/scicompsoft/orhane/mia-train-experiments/gary_comparison/probes/verify_splits/verify_splits.py`

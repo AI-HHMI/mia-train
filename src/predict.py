@@ -2,6 +2,7 @@
 
     python src/predict.py <run_dir> --data-config <miao.yaml> --out <dir> [--step N] [--volume <name>]
     python src/predict.py ... --block 1536 [--worker K --workers N]     # a region too large for RAM
+    python src/predict.py ... --cover-box                             # tiles reach the box faces
 
 Runs over every volume in the data config, or over the one named by `--volume`, and writes two
 artifacts per volume, on one shared grid:
@@ -44,6 +45,13 @@ of `--workers` elements, each passing its own index. The values are bit-identica
 whole-region path's, and the artifact appears only when its last block is done
 (`prediction.blockwise`). Dense outputs only, and no ground truth: the regions this is for are
 scored against skeletons, and a labelling that large would not fit in memory either.
+
+**`--cover-box` makes the prediction cover each volume's box exactly** wherever the model runs at
+the store's own resolution, with a last tile flush with the far face; by default the largest
+whole-tile lattice is centred in the box and the faces are left out (`prediction.grid`). A task
+whose box is a whole volume with no raw around it, such as NISB's cubes, needs it; a table already
+scored the default way needs new rows the default way too, since mia-evals refuses a table whose
+rows score different regions.
 """
 
 from __future__ import annotations
@@ -296,6 +304,7 @@ def shared_attrs(
         "effective_voxel_nm": [round(v, 6) for v in grid.effective_voxel],
         "covers_full_box": grid.covers_full_box,
         "box_coverage": round(grid.box_coverage, 6),
+        "cover_box": grid.cover_box,
         "patch": list(grid.patch),
         "stride": [p // 2 for p in grid.patch],
         "run": run_dir.name,
@@ -371,12 +380,14 @@ def run_volume(
     block: str | None = None,
     worker: int = 0,
     workers: int = 1,
+    cover_box: bool = False,
 ) -> None:
     """Predict one volume (unless `predictor` is None) and write its ground truth beside it.
 
     With `block`, this worker's share of the volume's blocks instead, and no ground truth.
     """
-    grid = VolumeGrid(config, name, resolve_patch(config, resolved, name, patch_override))
+    grid = VolumeGrid(config, name, resolve_patch(config, resolved, name, patch_override),
+                      cover_box=cover_box)
     geometry = ome_geometry(grid)
 
     if block is not None:
@@ -463,6 +474,12 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1,
                         help="with --block: how many processes share the blocks, e.g. the size "
                              "of an LSF job array")
+    parser.add_argument("--cover-box", action="store_true",
+                        help="cover each volume's box exactly on every axis predicted at the "
+                             "store's own resolution, with a last tile flush with the far face; "
+                             "the default centres the largest whole-tile lattice in the box. A "
+                             "mia-evals table refuses rows that score different regions, so use "
+                             "it where a task asks for it (NISB) or for a table's first rows")
     args = parser.parse_args()
     if args.block is None and (args.worker != 0 or args.workers != 1):
         raise SystemExit("--worker and --workers share out blocks, so they need --block")
@@ -504,6 +521,7 @@ def main() -> None:
         run_volume(
             config, name, args.out, args.run_dir, args.data_config, step, resolved,
             predictor, device, args.patch, args.block, args.worker, args.workers,
+            args.cover_box,
         )
         # One volume's blend buffers can be hundreds of GB; release them before the next.
         gc.collect()
