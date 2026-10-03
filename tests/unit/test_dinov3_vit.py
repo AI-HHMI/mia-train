@@ -95,6 +95,72 @@ def test_patch_grid_and_counts(cls):
         assert model.num_patches == 8
 
 
+def _largest_scores(model) -> list[float]:
+    """Spy on every block's kernel; returns, after a forward pass, each call's largest |score|."""
+    seen: list[float] = []
+    for block in model.blocks:
+        attn = block.attn
+        original = attn._attend
+
+        def spy(q, k, v, original=original, scale=attn.scale):
+            scores = torch.einsum("bnhd,bmhd->bhnm", q.float(), k.float()) * scale
+            seen.append(float(scores.abs().max()))
+            return original(q, k, v)
+
+        attn._attend = spy
+    return seen
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("attn_window", [None, 1])
+def test_3d_attn_max_score_bounds_every_score_in_every_block(attn_window):
+    """Global and block-windowed attention alike: the cap acts before the kernel is chosen."""
+    plain = _model(DinoVisionTransformer3D, attn_window=attn_window)
+    with torch.no_grad():
+        for block in plain.blocks:
+            block.attn.qkv.weight.mul_(20.0)  # push the scores well past the cap
+    capped = _model(DinoVisionTransformer3D, attn_window=attn_window, attn_max_score=5.0)
+    capped.load_state_dict(plain.state_dict())
+    x = _input(DinoVisionTransformer3D)
+    seen_plain, seen_capped = _largest_scores(plain), _largest_scores(capped)
+    plain(x), capped(x)
+    assert max(seen_plain) > 10.0  # the cap is really acting: uncapped scores pass twice it
+    assert seen_capped and max(seen_capped) <= 5.0 * (1 + 1e-5)
+
+
+@pytest.mark.unit
+def test_3d_attn_max_score_above_the_scores_is_bit_identical_and_adds_no_state():
+    plain = _model(DinoVisionTransformer3D)
+    capped = _model(DinoVisionTransformer3D, attn_max_score=1e6)
+    assert plain.state_dict().keys() == capped.state_dict().keys()
+    capped.load_state_dict(plain.state_dict())
+    x = _input(DinoVisionTransformer3D)
+    out_plain, out_capped = plain(x), capped(x)
+    assert torch.equal(out_plain, out_capped)
+    out_plain.square().sum().backward()
+    out_capped.square().sum().backward()
+    for (name, a), b in zip(plain.named_parameters(), capped.parameters(), strict=True):
+        if a.grad is None:
+            assert b.grad is None, name
+            continue
+        assert torch.equal(a.grad, b.grad), name
+
+
+@pytest.mark.unit
+def test_3d_img_size_is_one_int_for_a_cube_or_one_extent_per_axis():
+    """An int behaves as it always has; a list, as a TOML config writes it, describes a box."""
+    cube = _model(DinoVisionTransformer3D)
+    assert cube.img_size == 16 and isinstance(cube.img_size, int)
+    assert cube.grid_size == (2, 2, 2) and cube.patch_embed.img_size == (16, 16, 16)
+
+    box = _model(DinoVisionTransformer3D, img_size=[32, 32, 16])
+    assert box.img_size == (32, 32, 16)
+    assert box.grid_size == (4, 4, 2) and box.num_patches == 32
+    assert box.patch_embed.patches_resolution == (4, 4, 2)
+    tokens, grid = box.patch_features(torch.randn(2, 1, 32, 32, 16))
+    assert grid == (4, 4, 2) and tokens.shape == (2, 32, box.embed_dim)
+
+
 @pytest.mark.unit
 @BOTH
 def test_forward_features_shapes(cls):

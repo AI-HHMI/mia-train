@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import math
 from collections.abc import Callable, Iterator, Sequence
 
 import torch
@@ -54,6 +55,52 @@ def flash4_status() -> tuple[bool, str]:
         return False, f"compute capability {have} is below {needed} (Hopper)"
 
     return True, ""
+
+
+def score_length_limit(max_score: float | None, scale: float) -> float | None:
+    """The longest a query or key may be for no attention score to exceed `max_score`.
+
+    A score is `scale * q . k`, at most `scale * |q| |k|`, so capping both lengths at
+    `sqrt(max_score / scale)` bounds every score's magnitude by `max_score`. `None` means no cap.
+    Validated here because it arrives straight from a config file (`attn_max_score`).
+    """
+    if max_score is None:
+        return None
+    if isinstance(max_score, bool) or not isinstance(max_score, int | float):
+        raise ValueError(f"attn_max_score must be a number, got {max_score!r}")
+    if not (math.isfinite(max_score) and max_score > 0):
+        raise ValueError(f"attn_max_score must be positive and finite, got {max_score!r}")
+    return math.sqrt(max_score / scale)
+
+
+def cap_lengths(x: torch.Tensor, limit: float) -> torch.Tensor:
+    """Shorten every vector along the last axis to at most `limit`; shorter ones pass unchanged.
+
+    The attention score cap (`attn_max_score`), applied to queries and keys after rotation and
+    before the kernel. Why it exists: fused attention kernels (cuDNN, FlashAttention, the
+    memory-efficient one) do not store the attention weights. Their backward pass rebuilds them
+    from recomputed scores and a stored log-sum-exp, and once scores reach ~1e7 float32 cannot
+    reproduce them closely enough: the gradients come back wrong by orders of magnitude while the
+    forward pass stays correct. Fine-tuning can grow scores that far. In large_inputs_nisb, a
+    DINOv3 ViT-L's first block went from 577 to 3e8 in 200k steps, and the same checkpoint's
+    gradient norm was 4.3e5 through cuDNN but 0.16 through PyTorch's reference attention
+    (`mia-train-experiments/large_inputs_nisb/probes/grad_blowup` on /nrs).
+
+    Lengths rather than scores, because the scores never leave the kernel: capping them needs a
+    kernel that takes a score modifier (FlexAttention), at several times the cost of cuDNN for
+    global attention. This is two vector norms per layer and works with every kernel.
+
+    A vector no longer than `limit` is returned bit for bit, and so is its gradient, so a model
+    whose scores stay below the cap computes exactly what it would without it. A longer one is
+    rescaled to length `limit` and gets no gradient along its own length, so nothing is rewarded
+    for lengthening it further. Lengths are measured in at least float32; the rescaled vector keeps
+    the input's dtype, so under bf16 the bound holds to within bf16 rounding (~0.4%).
+    """
+    precise = x.to(torch.promote_types(x.dtype, torch.float32))
+    length = torch.linalg.vector_norm(precise, dim=-1, keepdim=True)
+    # `clamp_min` rather than `clamp(limit / length, max=1)`: a zero-length vector would make the
+    # latter infinite, and its backward 0 * inf. Below the limit this is limit / limit, exactly 1.
+    return x * (limit / length.clamp_min(limit)).to(x.dtype)
 
 
 @contextlib.contextmanager
@@ -178,6 +225,9 @@ class SelfAttention(_AttentionBase):
     `kv_pool` keeps attention global but over keys and values averaged across `kv_pool`-sided
     boxes. Both need the grid the tokens fill, passed per call, and are described in
     `layers.common.window_attention`. A layer is one or the other, never both.
+
+    `max_score` bounds every attention score by shortening queries and keys longer than allows
+    (`cap_lengths`); `None`, the default, leaves them alone.
     """
 
     def __init__(
@@ -189,8 +239,10 @@ class SelfAttention(_AttentionBase):
         window: tuple[int, ...] | None = None,
         kv_pool: int = 1,
         window_mode: str = "block",
+        max_score: float | None = None,
     ) -> None:
         super().__init__(dim, num_heads, backend)
+        self.max_length = score_length_limit(max_score, self.scale)
         if window is not None and kv_pool > 1:
             raise ValueError(
                 f"a layer attends within windows or globally over pooled keys, not both: got "
@@ -244,6 +296,10 @@ class SelfAttention(_AttentionBase):
             if self.kv_pool > 1 and pooled_rope is None:
                 raise ValueError("a pooled layer needs `pooled_rope` to rotate its pooled keys")
             query, key = rope(query), (pooled_rope if self.kv_pool > 1 else rope)(key)
+        if self.max_length is not None:
+            # After rotation, which preserves length, and before any kernel: the bound has to hold
+            # on exactly what the kernel receives, whichever path below it takes.
+            query, key = cap_lengths(query, self.max_length), cap_lengths(key, self.max_length)
 
         attend = functools.partial(self._attend, on_cuda=x.is_cuda)
         if self.window is not None and self.window_mode == "sliding":

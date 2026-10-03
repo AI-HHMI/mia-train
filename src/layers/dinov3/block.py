@@ -46,6 +46,7 @@ class SelfAttentionBlock(nn.Module):
         window: tuple[int, ...] | None = None,
         kv_pool: int = 1,
         window_mode: str = "block",
+        max_score: float | None = None,
         device=None,
     ) -> None:
         super().__init__()
@@ -62,6 +63,7 @@ class SelfAttentionBlock(nn.Module):
             window=window,
             kv_pool=kv_pool,
             window_mode=window_mode,
+            max_score=max_score,
             device=device,
         )
         self.ls1: nn.Module = (

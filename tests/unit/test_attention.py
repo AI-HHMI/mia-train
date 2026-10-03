@@ -11,7 +11,13 @@ import torch
 import torch.nn as nn
 
 from layers.common import attention as attention_module
-from layers.common.attention import BACKENDS, SelfAttention, flash4_status
+from layers.common.attention import (
+    BACKENDS,
+    SelfAttention,
+    cap_lengths,
+    flash4_status,
+    score_length_limit,
+)
 
 
 def _installed_flash4_stub() -> types.ModuleType:
@@ -213,3 +219,101 @@ def test_no_module_uses_torch_multihead_attention():
     # A regression guard: the point of this module is that the attention call is ours to swap.
     module = SelfAttention(64, 4)
     assert not any(isinstance(m, nn.MultiheadAttention) for m in module.modules())
+
+
+# ------------------------------------------------------------------------------- score cap
+
+
+@pytest.mark.unit
+def test_cap_lengths_shortens_only_what_is_too_long():
+    torch.manual_seed(0)
+    scales = torch.tensor([0.1, 1.0, 10.0]).view(1, 1, 3, 1)
+    x = torch.randn(2, 64, 3, 16) * scales  # lengths ~0.4, ~4 and ~40 per vector
+    limit = 4.0
+    capped = cap_lengths(x, limit)
+    short = x.norm(dim=-1) <= limit
+    assert short.any() and (~short).any()
+    assert torch.equal(capped[short], x[short])  # bit for bit, not merely close
+    assert torch.allclose(capped[~short].norm(dim=-1), torch.full_like(capped[~short][:, 0], limit))
+    cosine = torch.nn.functional.cosine_similarity(capped[~short], x[~short], dim=-1)
+    assert torch.allclose(cosine, torch.ones_like(cosine))
+
+
+@pytest.mark.unit
+def test_cap_lengths_gradient_is_identity_below_the_cap_and_never_lengthens_above_it():
+    torch.manual_seed(1)
+    x = torch.randn(4, 16, dtype=torch.float64)
+    x[0] *= 0.01  # short: untouched
+    x[1] *= 100.0  # long: capped
+    x[2] = 0.0  # zero length: must not produce 0 * inf in the backward
+    x.requires_grad_(True)
+    upstream = torch.randn(4, 16, dtype=torch.float64)
+    (cap_lengths(x, 1.0) * upstream).sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert torch.equal(x.grad[0], upstream[0])
+    assert torch.equal(x.grad[2], upstream[2])
+    along = float(x.grad[1] @ x[1].detach()) / float(x.grad[1].norm() * x[1].detach().norm())
+    assert abs(along) < 1e-12  # no component along the capped vector's own length
+
+
+def _largest_score(module: SelfAttention, x: torch.Tensor) -> float:
+    """The largest |scale * q . k| the kernel is handed, over a forward pass."""
+    seen: list[float] = []
+    original = module._attend
+
+    def spy(query, key, value, on_cuda):
+        scores = torch.einsum("bnhd,bmhd->bhnm", query.float(), key.float()) * module.scale
+        seen.append(float(scores.abs().max()))
+        return original(query, key, value, on_cuda)
+
+    module._attend = spy  # type: ignore[method-assign]
+    try:
+        module(x)
+    finally:
+        del module._attend
+    return max(seen)
+
+
+@pytest.mark.unit
+def test_max_score_bounds_every_score():
+    torch.manual_seed(2)
+    plain = SelfAttention(64, 4, backend="sdpa")
+    with torch.no_grad():
+        plain.qkv.weight.mul_(30.0)  # scores far above the cap
+    capped = SelfAttention(64, 4, backend="sdpa", max_score=20.0)
+    capped.load_state_dict(plain.state_dict())
+    x = torch.randn(2, 9, 64)
+    assert _largest_score(plain, x) > 100.0
+    assert _largest_score(capped, x) <= 20.0 * (1 + 1e-5)
+
+
+@pytest.mark.unit
+def test_a_cap_the_scores_never_reach_changes_nothing():
+    """Forward and backward bit for bit: the cap is safe to leave on."""
+    torch.manual_seed(3)
+    plain = SelfAttention(64, 4, backend="sdpa")
+    capped = SelfAttention(64, 4, backend="sdpa", max_score=1e6)
+    capped.load_state_dict(plain.state_dict())
+    assert plain.state_dict().keys() == capped.state_dict().keys()  # no new state to checkpoint
+    x = torch.randn(2, 9, 64)
+    out_plain, out_capped = plain(x), capped(x)
+    assert torch.equal(out_plain, out_capped)
+    out_plain.square().sum().backward()
+    out_capped.square().sum().backward()
+    for (name, a), b in zip(plain.named_parameters(), capped.parameters(), strict=True):
+        assert torch.equal(a.grad, b.grad), name
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("inf"), float("nan"), True, "1e5"])
+def test_max_score_must_be_positive_and_finite(bad):
+    with pytest.raises(ValueError, match="attn_max_score"):
+        SelfAttention(64, 4, max_score=bad)
+
+
+@pytest.mark.unit
+def test_score_length_limit_is_the_length_that_reaches_the_cap():
+    assert score_length_limit(None, 0.125) is None
+    limit = score_length_limit(1e5, 0.125)
+    assert limit == pytest.approx(math.sqrt(8e5))
+    assert 0.125 * limit * limit == pytest.approx(1e5)

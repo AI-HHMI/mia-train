@@ -10,8 +10,8 @@ the readout width, the encoder's width and depth, and its attention layout (`att
 as well as `dinov3_vit3d`: a per-axis `img_size` / `patch_size`, no `device` argument, no prefix
 tokens. And it builds `convnet3d`, whose patch size is the stride its stages add up to, so the
 slab count is read off the built model rather than the config, and whose record carries its block,
-widths and depths. With `decoder = "unet"`, `--decode-chunks auto` sizes the slabs by that head's
-largest tensor instead of the sub-pixel head's.
+widths and depths. With `decoder = "unet"` or `"unetr"`, `--decode-chunks auto` sizes the slabs by
+that head's largest tensor instead of the sub-pixel head's.
 
 One `torchrun` entry point that measures **one** crop size: it builds the model and algorithm named
 in an ordinary mia-train config, parallelizes them exactly as `engine.trainer` does, and runs a
@@ -256,9 +256,10 @@ def main() -> int:
             kwargs = config.algorithm.kwargs
             # The widest voxel-resolution tensor in a slab, and the planes past the slab it spans.
             # For the sub-pixel head, the readout over the reach of its refinement convolutions.
-            # For the U-Net head, the full-resolution concatenation of the stream and the image
-            # path (2 x its finest width) over the two planes its residual block reads each side.
-            if kwargs.get("decoder") == "unet":
+            # For the UNETR and U-Net heads, the full-resolution concatenation of the stream and
+            # the image path (2 x the finest width) over the two planes their residual block reads
+            # each side.
+            if kwargs.get("decoder") in ("unetr", "unet"):
                 width, reach = 2 * list(kwargs.get("decoder_widths", [16]))[0], 2
             else:
                 width = kwargs.get("decoder_readout_dim", 16)

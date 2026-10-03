@@ -217,6 +217,15 @@ def test_blocks_use_the_configured_attention_backend():
 
 
 @pytest.mark.unit
+def test_attn_max_score_reaches_every_block_and_defaults_to_off():
+    model = _tiny(attn_max_score=1e5)
+    for block in model.blocks:
+        assert block.attn.max_length == pytest.approx((1e5 / block.attn.scale) ** 0.5)
+    assert all(block.attn.max_length is None for block in _tiny().blocks)
+    assert model.state_dict().keys() == _tiny().state_dict().keys()
+
+
+@pytest.mark.unit
 def test_attention_backend_defaults_to_auto():
     assert _tiny().attention_backend == "auto"
     assert all(block.attn.backend == "auto" for block in _tiny().blocks)

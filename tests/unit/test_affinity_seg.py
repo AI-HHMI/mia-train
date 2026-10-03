@@ -506,12 +506,6 @@ def test_unetr_refuses_an_encoder_without_intermediate_layers():
 
 
 @pytest.mark.unit
-def test_unetr_refuses_slab_decoding():
-    with pytest.raises(ValueError, match="decode_chunks"):
-        _unetr(decode_chunks=2)
-
-
-@pytest.mark.unit
 @pytest.mark.parametrize("layers", [(0, 3), (2, 0, 3), (0, 2, 4), (-1, 2, 3)])
 def test_unetr_refuses_skip_layers_that_are_not_one_per_stage_in_order(layers):
     with pytest.raises(ValueError, match="decoder_skip_layers"):

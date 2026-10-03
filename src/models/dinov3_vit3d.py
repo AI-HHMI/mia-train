@@ -23,6 +23,12 @@ averages the global blocks' keys and values over boxes of the grid: ViTDet-style
 with cheap global mixing, for crops too large for global attention to be affordable
 (`layers.common.window_attention`). Neither adds a parameter, so every checkpoint loads under any
 setting of them; the CLS and storage tokens attend globally in every block.
+
+`attn_max_score` bounds every attention score in every block by capping the lengths of queries and
+keys (`layers.common.attention.cap_lengths`). Off by default, it adds no parameters either, and it
+changes nothing while a model's scores stay below it. It exists because fine-tuning grew a
+released ViT-L's first-block scores past what fused attention kernels can differentiate
+accurately (`experiments/large_inputs_nisb`).
 """
 
 from __future__ import annotations
@@ -63,7 +69,7 @@ class DinoVisionTransformer3D(BaseModel):
     def __init__(
         self,
         *,
-        img_size: int = 224,
+        img_size: int | Sequence[int] = 224,
         patch_size: int = 16,
         in_chans: int = 1,  # NOTE: this is different from the 2D case
         pos_embed_rope_type: Literal["vanilla", "superposition"] = "vanilla",
@@ -95,6 +101,7 @@ class DinoVisionTransformer3D(BaseModel):
         attn_global_blocks: Sequence[int] = (),
         attn_global_kv_pool: int = 1,
         attn_window_mode: str = "block",
+        attn_max_score: float | None = None,
         device: Any | None = None,
     ):
         super().__init__()
@@ -129,10 +136,16 @@ class DinoVisionTransformer3D(BaseModel):
         self.num_heads = num_heads
         self.patch_size = patch_size
         self.in_chans = in_chans
-        self.img_size = img_size
+        # One int for a cube, kept as that int, or one extent per axis for a crop that is not one
+        # (a TOML list arrives as a list). The patch grid is read off the input at run time, but
+        # `predict.py` checks its window against this, so it has to be able to say what a run
+        # trained at.
+        self.img_size: int | tuple[int, ...] = (
+            img_size if isinstance(img_size, int) else tuple(img_size)
+        )
 
         self.patch_embed = PatchEmbed3D(
-            img_size=img_size,
+            img_size=self.img_size,
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
@@ -222,6 +235,7 @@ class DinoVisionTransformer3D(BaseModel):
                 window=window,
                 kv_pool=kv_pool,
                 window_mode=attn_window_mode,
+                max_score=attn_max_score,
                 device=device,
             )
             for i, (window, kv_pool) in enumerate(self.attention_layout)
@@ -271,9 +285,11 @@ class DinoVisionTransformer3D(BaseModel):
         named_apply(init_weights_vit, self)
 
     @property
-    def grid_size(self) -> tuple[int, int, int]:
-        side = self.img_size // self.patch_size
-        return (side, side, side)
+    def grid_size(self) -> tuple[int, ...]:
+        extents = (
+            (self.img_size,) * SPATIAL_RANK if isinstance(self.img_size, int) else self.img_size
+        )
+        return tuple(extent // self.patch_size for extent in extents)
 
     @property
     def num_patches(self) -> int:
@@ -601,10 +617,9 @@ class DinoVisionTransformer3D(BaseModel):
         `img_size` the way `ViT3D.flops` does, because unlike `ViT3D` this architecture really does
         run at many crop sizes: it carries no position-embedding table to interpolate, DINOv3 SSL
         pushes global and local crops of different sizes through `forward_features_list` inside a
-        single step, and `patch_features` reads the grid off its input for that reason. It is also
-        the only way an anisotropic crop can be costed at all: `img_size` is typed as a single int
-        here, so `grid_size` can describe nothing but a cube, while EM volumes are routinely
-        sampled with a different extent along z.
+        single step, and `patch_features` reads the grid off its input for that reason. It also
+        costs whatever crop actually runs, cube or not, where `img_size` describes only the
+        configured one.
 
         A ragged extent is rejected rather than floored, because `PatchEmbed3D.forward` asserts
         divisibility on all three axes and says why: volumetric crops are assembled by the caller,

@@ -38,6 +38,7 @@ class TransformerBlock(nn.Module):
         window: tuple[int, ...] | None = None,
         kv_pool: int = 1,
         window_mode: str = "block",
+        max_score: float | None = None,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -48,6 +49,7 @@ class TransformerBlock(nn.Module):
             window=window,
             kv_pool=kv_pool,
             window_mode=window_mode,
+            max_score=max_score,
         )
         self.rotary = AxialRotaryEmbedding(dim // num_heads, spatial_rank, base=rotary_base)
         self.norm2 = nn.LayerNorm(dim)

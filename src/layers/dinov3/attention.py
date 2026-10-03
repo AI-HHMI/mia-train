@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from layers.common.attention import flash4_status
+from layers.common.attention import cap_lengths, flash4_status, score_length_limit
 from layers.common.batched_tokens import cat_keep_shapes, uncat_with_shapes
 from layers.common.window_attention import (
     check_window_mode,
@@ -128,6 +128,7 @@ class SelfAttention(nn.Module):
         window: tuple[int, ...] | None = None,
         kv_pool: int = 1,
         window_mode: str = "block",
+        max_score: float | None = None,
         device=None,
     ) -> None:
         super().__init__()
@@ -161,6 +162,9 @@ class SelfAttention(nn.Module):
         # dimension -- which sets `scale` and which the rotary tables are built for -- does not.
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
+        # Off unless `max_score` is given: queries and keys are then capped in length so that no
+        # score exceeds it (`layers.common.attention.cap_lengths`, which says why).
+        self.max_length = score_length_limit(max_score, self.scale)
 
         linear_class = LinearKMaskedBias if mask_k_bias else nn.Linear
         self.qkv = linear_class(dim, dim * 3, bias=qkv_bias, device=device)
@@ -259,6 +263,11 @@ class SelfAttention(nn.Module):
             else:
                 q, k = self.apply_rope(q, k, rope)
         q, k = (t.transpose(1, 2) for t in [q, k])
+        if self.max_length is not None:
+            # After rotation, which preserves length, and before any kernel: the bound has to hold
+            # on exactly what the kernel receives, whichever path below it takes. The prefix
+            # tokens are capped too; their scores are scores like any other.
+            q, k = cap_lengths(q, self.max_length), cap_lengths(k, self.max_length)
 
         if self.window is not None and self.window_mode == "sliding":
             # FlexAttention whatever `use_fa4` says: a sliding window is a block mask.

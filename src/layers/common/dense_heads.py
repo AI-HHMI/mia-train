@@ -311,6 +311,16 @@ class SubPixelHead(nn.Module):
         return self.out(x).contiguous()
 
 
+def _planes(x: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+    """Planes `lo:hi` of the first spatial axis, and `x` itself when that is all of them.
+
+    Itself rather than a full-range slice, so that a decode without a span runs exactly the ops it
+    always did. The slice would be a no-op going forward but a node going backward, and under bf16
+    autocast that node was enough to change the gradients in their last bits.
+    """
+    return x if (lo, hi) == (0, x.shape[2]) else x[:, :, lo:hi]
+
+
 class _ResidualBlock(nn.Module):
     """Two 3-wide convolutions, each followed by a channel LayerNorm, around a residual connection.
 
@@ -321,6 +331,9 @@ class _ResidualBlock(nn.Module):
     features would depend on which prediction window it happens to sit in, and overlapping windows
     would disagree about it. A 1x1 projection carries the residual when the width changes.
     """
+
+    #: Planes the block reads past its output on each side: two 3-wide convolutions.
+    REACH = 2
 
     def __init__(self, rank: int, in_channels: int, out_channels: int) -> None:
         super().__init__()
@@ -362,10 +375,17 @@ class UNETRHead(nn.Module):
     this head costs 1.41-1.46x the sub-pixel head's step at 16.3 GiB, 64/128/256/512 costs 42 s a
     step, because its last fusion concatenates 2 x 64 channels over the crop -- exactly 2^31
     elements, cuDNN's 32-bit indexing limit. That limit is the real cap on the finest width:
-    `2 * widths[0] * voxels` must stay under 2^31, so a 512^3 crop would need slabs
+    `2 * widths[0] * voxels` must stay under 2^31, so a 512^3 crop needs slabs
     (probes/unetr-feasibility on /nrs has the measurements). Upsampling by transposed convolution
     because that measured faster at kernel == stride == 2 than both a matmul-and-fold (the trick
     `SubPixelHead` needs at kernel 16) and a channels-last layout.
+
+    **Slabs.** `span = (lo, hi)` decodes only voxels `lo:hi` of the first spatial axis, and equals
+    the same voxels of an undivided decode (`tests/unit/test_dense_heads.py`). It works as
+    `UNetHead`'s does: each stride of the stream computes just the planes the next finer one reads,
+    its output plus `REACH` planes each side. Each skip's chain is cut the same way, from the planes
+    its fusion reads back to the token planes those need. A uniform halo would instead be ~30
+    voxels deep at patch 16, paid on the full-resolution tensors.
 
     `zero_init_output` has `SubPixelHead`'s meaning and its caveat: a zeroed output starts every
     prediction at the bias and sends the encoder no gradient until it grows, so turn it off when the
@@ -439,8 +459,16 @@ class UNETRHead(nn.Module):
             )
         return side.bit_length() - 1
 
-    def forward(self, features: Sequence[torch.Tensor], image: torch.Tensor) -> torch.Tensor:
-        """`levels` token grids `(B, in_dim, *grid)`, shallowest first, and `(B, C, *grid*patch)`."""
+    def forward(
+        self,
+        features: Sequence[torch.Tensor],
+        image: torch.Tensor,
+        span: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """`levels` token grids `(B, in_dim, *grid)`, shallowest first, and `(B, C, *grid*patch)`.
+
+        The output covers voxels `span` of the first spatial axis, or all of them without it.
+        """
         if len(features) != self.levels:
             raise ValueError(
                 f"a patch of {self.patch_size} fuses {self.levels} encoder layers (the deepest last), "
@@ -455,16 +483,67 @@ class UNETRHead(nn.Module):
                 f"a patch grid of {grid} at patch size {self.patch_size} covers {expected}, but the "
                 f"image is {tuple(image.shape[2:])}; use a crop divisible by the patch size"
             )
-        skips = [branch(f) for branch, f in zip(self.skips, features[:-1], strict=True)]
-        x = features[-1]
+        lo, hi = span if span is not None else (0, expected[0])
+        reach = _ResidualBlock.REACH
+
+        # Top-down: the planes each stride must produce (`keep`) and read (`read`), finest first.
+        # Without a span every range is whole, every cut below hands its tensor through, and the
+        # decode is the undivided one.
+        plan = []
+        keep = (lo, hi)
+        for k in range(self.levels):
+            planes = expected[0] >> k
+            read = (max(keep[0] - reach, 0), min(keep[1] + reach, planes))
+            plan.append((keep, read))
+            keep = (read[0] // 2, -(-read[1] // 2))
+
+        # Bottom-up, cutting every tensor to its plan. `start` is the first plane `x` holds.
+        x = _planes(features[-1], keep[0], keep[1])
+        start = keep[0]
         for index, k in enumerate(reversed(range(self.levels))):
+            (keep_lo, keep_hi), (read_lo, read_hi) = plan[k]
             x = self.ups[index](x)
+            start *= 2
+            parts = [_planes(x, read_lo - start, read_hi - start)]
             if k >= 1:
-                x = torch.cat([x, skips[k - 1]], dim=1)
+                parts.append(self._skip(self.skips[k - 1], features[k - 1], (read_lo, read_hi)))
             elif self.image is not None:
-                x = torch.cat([x, self.image(image)], dim=1)
-            x = self.fuse[index](x)
+                image_lo = max(read_lo - reach, 0)
+                image_hi = min(read_hi + reach, expected[0])
+                skip = self.image(_planes(image, image_lo, image_hi))
+                parts.append(_planes(skip, read_lo - image_lo, read_hi - image_lo))
+            x = self.fuse[index](torch.cat(parts, dim=1) if len(parts) > 1 else parts[0])
+            x = _planes(x, keep_lo - read_lo, keep_hi - read_lo)
+            start = keep_lo
         return self.out(x)
+
+    @staticmethod
+    def _skip(chain: nn.Sequential, tokens: torch.Tensor, need: tuple[int, int]) -> torch.Tensor:
+        """Planes `need` of a skip at its stride: `chain` run on just the token planes they read.
+
+        A chain is x2 transposed convolutions, which read only the plane each output plane comes
+        from, and residual blocks, which read `REACH` more each side. Planned backwards from
+        `need`, then run forwards, cutting each output to the planes the next module reads.
+        """
+        planes, counts = tokens.shape[2], []
+        for module in chain:
+            planes *= 1 if isinstance(module, _ResidualBlock) else 2
+            counts.append(planes)
+        wants: list[tuple[int, int]] = []
+        for module, count in zip(reversed(chain), reversed(counts), strict=True):
+            wants.append(need)
+            if isinstance(module, _ResidualBlock):
+                reach = _ResidualBlock.REACH
+                need = (max(need[0] - reach, 0), min(need[1] + reach, count))
+            else:
+                need = (need[0] // 2, -(-need[1] // 2))
+        x, start = _planes(tokens, *need), need[0]
+        for module, (want_lo, want_hi) in zip(chain, reversed(wants), strict=True):
+            x = module(x)
+            start *= 1 if isinstance(module, _ResidualBlock) else 2
+            x = _planes(x, want_lo - start, want_hi - start)
+            start = want_lo
+        return x
 
 
 class UNetHead(nn.Module):
@@ -490,7 +569,7 @@ class UNetHead(nn.Module):
     """
 
     #: Planes a `_ResidualBlock` reads past its output on each side: two 3-wide convolutions.
-    REACH = 2
+    REACH = _ResidualBlock.REACH
 
     def __init__(
         self,

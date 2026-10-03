@@ -43,6 +43,10 @@ class ViT3D(BaseModel):
     `layers.common.window_attention`. Both need the whole grid in row-major order, which the dense
     path (`patch_features`) has and masked encoding does not, so a model configured with either
     serves the dense path only.
+
+    `attn_max_score` bounds every attention score in every block by capping the lengths of queries
+    and keys (`layers.common.attention.cap_lengths`). Off by default; it adds no parameters, so
+    every checkpoint loads either way, and it changes nothing while the scores stay below it.
     """
 
     def __init__(
@@ -60,6 +64,7 @@ class ViT3D(BaseModel):
         attn_global_blocks: Sequence[int] = (),
         attn_global_kv_pool: int = 1,
         attn_window_mode: str = "block",
+        attn_max_score: float | None = None,
     ) -> None:
         super().__init__()
         img_size = tuple(img_size)  # type: ignore[assignment]
@@ -101,6 +106,7 @@ class ViT3D(BaseModel):
                 embed_dim, num_heads, mlp_ratio, attention_backend,
                 spatial_rank=SPATIAL_RANK, rotary_base=rotary_base,
                 window=window, kv_pool=kv_pool, window_mode=attn_window_mode,
+                max_score=attn_max_score,
             )
             for window, kv_pool in self.attention_layout
         )

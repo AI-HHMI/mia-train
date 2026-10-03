@@ -23,6 +23,7 @@ import torch
 
 from algorithms.affinity_seg import AffinitySegmentation
 from models.convnet3d import ConvNet3D
+from models.dinov3_vit3d import DinoVisionTransformer3D
 from models.vit import ViT3D
 
 CROP = 48
@@ -171,6 +172,71 @@ def test_unet_chunked_gradients_match_the_undivided_decode():
             assert float((parameter.grad - expected).abs().max()) / scale < 1e-12, name
     finally:
         torch.set_default_dtype(torch.float32)
+
+
+def _unetr_algorithm(seed: int = 0, **overrides: Any) -> AffinitySegmentation:
+    """A DINOv3 ViT with the UNETR head: skips from three blocks, the image at full resolution."""
+    torch.manual_seed(seed)
+    encoder = DinoVisionTransformer3D(
+        img_size=CROP, patch_size=PATCH, in_chans=1, embed_dim=32, depth=3, num_heads=4,
+        n_storage_tokens=2, pos_embed_rope_dtype="fp32",
+    )
+    kwargs: dict[str, Any] = dict(
+        input_axes="lcxyz", decoder="unetr", long_range=4, decoder_widths=(3, 4, 6),
+        decoder_zero_init_output=False, split_disconnected=False,
+    )
+    kwargs.update(overrides)
+    return AffinitySegmentation(encoder, **kwargs)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("chunks", [2, 3, 6])
+def test_unetr_chunked_metrics_match_the_undivided_decode(chunks):
+    batch = _batch()
+    whole = _unetr_algorithm().training_step(batch)
+    split = _unetr_algorithm(decode_chunks=chunks).training_step(batch)
+    assert set(whole) == set(split)
+    for name, expected in whole.items():
+        assert float(split[name]) == pytest.approx(float(expected), rel=1e-5, abs=1e-6), (
+            f"{name} differs at decode_chunks={chunks}"
+        )
+
+
+@pytest.mark.unit
+def test_unetr_chunked_gradients_match_the_undivided_decode():
+    """In float64, for the reason `test_chunked_gradients_match_the_undivided_decode` gives."""
+    torch.set_default_dtype(torch.float64)
+    try:
+        batch = {
+            name: value.double() if value.is_floating_point() else value
+            for name, value in _batch().items()
+        }
+        whole, split = _unetr_algorithm(), _unetr_algorithm(decode_chunks=3)
+        whole.training_step(batch)["loss"].backward()
+        split.training_step(batch)["loss"].backward()
+        reference = dict(whole.named_parameters())
+        for name, parameter in split.named_parameters():
+            assert parameter.grad is not None, f"{name} received no gradient when chunked"
+            expected = reference[name].grad
+            scale = max(float(expected.abs().max()), 1e-30)
+            assert float((parameter.grad - expected).abs().max()) / scale < 1e-12, name
+    finally:
+        torch.set_default_dtype(torch.float32)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "build", [_algorithm, _unetr_algorithm, _unet_algorithm], ids=["subpixel", "unetr", "unet"]
+)
+def test_chunked_logits_match_the_undivided_decode(build):
+    """Prediction calls `logits()`, which decodes in the training step's slabs when it chunks."""
+    torch.manual_seed(2)
+    volumes = torch.rand(2, 1, CROP, CROP, CROP)
+    whole, split = build().eval(), build(decode_chunks=4).eval()
+    with torch.no_grad():
+        expected = whole.logits(volumes)
+        assert expected.shape == (2, len(whole.offsets), CROP, CROP, CROP)
+        torch.testing.assert_close(split.logits(volumes), expected, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.unit

@@ -412,6 +412,43 @@ def test_unetr_zero_initialised_output_starts_constant() -> None:
     assert torch.equal(out, torch.zeros_like(out))
 
 
+UNETR_GRID = (5, 2, 3)  # the first axis long enough for several slabs
+
+
+def _unetr_double(patch: int, rank: int = 3, **overrides: Any):
+    """A float64 head with narrow widths, its token grids and an image, for exact comparisons."""
+    levels = UNETRHead.levels_for((patch,) * rank)
+    head = _unetr(patch, rank=rank, widths=tuple(2 + k for k in range(levels)), **overrides)
+    torch.manual_seed(1)
+    grid = UNETR_GRID[:rank]
+    features = [torch.randn(2, IN_DIM, *grid, dtype=torch.float64) for _ in range(levels)]
+    image = torch.randn(2, 1, *(g * patch for g in grid), dtype=torch.float64)
+    return head.double(), features, image
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("patch", [8, 16])
+@pytest.mark.parametrize("image_skip", [True, False])
+def test_unetr_slab_equals_the_same_voxels_of_an_undivided_decode(patch, image_skip) -> None:
+    """Every stride and every skip's chain is cut to what the slab reads; a shortfall is a seam."""
+    head, features, image = _unetr_double(patch, image_skip=image_skip)
+    whole = head(features, image)
+    extent = UNETR_GRID[0] * patch
+    spans = [(0, extent), (0, patch), (patch, 2 * patch), (patch + 5, 3 * patch + 3),
+             (extent - patch, extent), (extent - 1, extent)]
+    for lo, hi in spans:
+        sliced = head(features, image, span=(lo, hi))
+        torch.testing.assert_close(sliced, whole[:, :, lo:hi], rtol=0, atol=1e-12)
+
+
+@pytest.mark.unit
+def test_unetr_slabs_serve_two_dimensional_data() -> None:
+    head, features, image = _unetr_double(4, rank=2)
+    torch.testing.assert_close(
+        head(features, image, span=(3, 14)), head(features, image)[:, :, 3:14], rtol=0, atol=1e-12
+    )
+
+
 # ---------------------------------------------------------------- U-Net
 
 

@@ -137,13 +137,13 @@ class AffinitySegmentation(BaseAlgorithm):
     the limit up to ~2590^3 at readout 16 (it was ~1670^3 while the halo was cropped only after the
     convolutions, which then ran on whole 16-voxel halo planes).
 
-    The sub-pixel and U-Net heads can be chunked. The interpolating one resizes the whole patch grid
-    in a single `F.interpolate`, whose scale factor comes from the sizes it is handed -- a slab plus
-    halo would sample at a different rate, and the seams would be wrong with no shape to catch it.
-    The UNETR head could be, but its convolutions at four resolutions reach ~30 voxels across a slab
-    face at patch 16 against the sub-pixel head's 2, and that halo is not built; a 256^3 crop
-    decodes in one piece anyway (16 GiB per rank, measured). The U-Net head cuts each of its
-    strides to what a slab reads itself (`UNetHead`), so it takes the span rather than a halo.
+    The sub-pixel, UNETR and U-Net heads can be chunked. The interpolating one resizes the whole
+    patch grid in a single `F.interpolate`, whose scale factor comes from the sizes it is handed --
+    a slab plus halo would sample at a different rate, and the seams would be wrong with no shape
+    to catch it. The UNETR and U-Net heads cut each of their strides to what a slab reads
+    themselves (`UNETRHead`, `UNetHead`), so they take the span rather than a halo: through four
+    resolutions at patch 16, a uniform halo would be ~30 voxels against the sub-pixel head's 2.
+    `logits()` decodes in the same slabs, so prediction stays under the same limit.
 
     `decoder = "unetr"` is UNETR's decoder (Hatamizadeh et al., 2022; `layers.common.dense_heads.
     UNETRHead`): tokens from `decoder_skip_layers` -- one encoder block per x2 stage, `log2(patch)`
@@ -197,17 +197,15 @@ class AffinitySegmentation(BaseAlgorithm):
             raise ValueError(f"decoder must be one of {DECODERS}, got {decoder!r}")
         if decode_chunks < 1:
             raise ValueError(f"decode_chunks must be at least 1, got {decode_chunks}")
-        if decode_chunks > 1 and decoder not in ("subpixel", "unet"):
+        if decode_chunks > 1 and decoder not in ("subpixel", "unetr", "unet"):
             # The interpolating head resizes the *whole* patch grid in one `F.interpolate`, and a
             # chunk of that resize is not a resize of the chunk: the scale factor is derived from
             # the sizes it is given, so a slab plus halo would sample at a different rate and the
             # seams would be wrong in a way no shape check catches. The sub-pixel head decodes each
-            # token into its own disjoint block, which is what makes slabs exact, and the U-Net
-            # head cuts every stride to exactly what a slab reads. The UNETR head's halo (~30
-            # voxels at patch 16, through four resolutions) is not built, and too little halo is
-            # exactly the silent seam this refuses.
+            # token into its own disjoint block, which is what makes slabs exact, and the UNETR and
+            # U-Net heads cut every stride to exactly what a slab reads.
             raise ValueError(
-                f"decode_chunks > 1 needs decoder = 'subpixel' or 'unet', got {decoder!r}"
+                f"decode_chunks > 1 needs decoder = 'subpixel', 'unetr' or 'unet', got {decoder!r}"
             )
 
         self.lsd_sigma: tuple[float, ...] | None = None
@@ -509,6 +507,9 @@ class AffinitySegmentation(BaseAlgorithm):
         the model directly and needs scores for a window rather than a loss. Previously a caller had
         to reach for `encoder.patch_features` and the private `_decode` and reproduce their pairing,
         which is a copy of `_step`'s middle that could drift from it.
+
+        With `decode_chunks > 1` the head runs in `_step`'s slabs and the slabs are concatenated:
+        the same logits, from tensors that stay under cuDNN's 2^31-element limit.
         """
         tokens, grid = self._encode(volumes)
         # The last SPATIAL_RANK axes are the spatial ones under both encoder layouts --
@@ -516,7 +517,18 @@ class AffinitySegmentation(BaseAlgorithm):
         # one -- so index from the end, exactly as `_step` does. The affinity block only: the
         # descriptor channels, when the head has them, are not part of a prediction.
         size = volumes.shape[-SPATIAL_RANK:]
-        return self._decode(tokens, grid, size, volumes)[:, : len(self.offsets)]
+        n_affinity = len(self.offsets)
+        if self.decode_chunks == 1:
+            return self._decode(tokens, grid, size, volumes)[:, :n_affinity]
+        patch = size[0] // grid[0]
+        halo = -(-self._refine_reach() // patch)  # ceil, in whole tokens
+        return torch.cat(
+            [
+                self._slab_logits(tokens, grid, span, halo, patch, volumes)[:, :n_affinity]
+                for span in self._chunk_spans(grid[0])
+            ],
+            dim=2,
+        )
 
     def _encode(
         self, volumes: torch.Tensor
@@ -753,6 +765,28 @@ class AffinitySegmentation(BaseAlgorithm):
         keep_lo, keep_hi = lo * patch - start, hi * patch - start
         return logits[:, :, keep_lo:keep_hi]
 
+    def _slab_logits(
+        self,
+        tokens: torch.Tensor | list[torch.Tensor],
+        grid: tuple[int, ...],
+        span: tuple[int, int],
+        halo: int,
+        patch: int,
+        volumes: torch.Tensor,
+    ) -> torch.Tensor:
+        """All output channels for voxels `span * patch` of the first axis, from any slab head."""
+        lo, hi = span
+        if self.decoder_kind == "unet":
+            # The head cuts each of its strides to what these voxels read (`UNetHead`), from maps
+            # and an image it is handed whole, so there is no halo to build here.
+            return self.decoder_out(tokens, volumes, span=(lo * patch, hi * patch))
+        if self.decoder_kind == "unetr":
+            # Likewise from token grids, each skip's chain cut to what its fusion reads.
+            folded = [self._fold(t, grid) for t in tokens]
+            return self.decoder_out(folded, volumes, span=(lo * patch, hi * patch))
+        assert isinstance(tokens, torch.Tensor)
+        return self._subpixel_slab(tokens, grid, span, halo, patch)
+
     def _chunk_terms(
         self,
         tokens: torch.Tensor | list[torch.Tensor],
@@ -783,12 +817,7 @@ class AffinitySegmentation(BaseAlgorithm):
         """
         lo, hi = span
         width = (hi - lo) * patch
-        if self.decoder_kind == "unet":
-            # The head cuts each of its strides to what these voxels read (`UNetHead`), from maps
-            # and an image it is handed whole, so there is no halo to build here.
-            logits = self.decoder_out(tokens, volumes, span=(lo * patch, hi * patch))
-        else:
-            logits = self._subpixel_slab(tokens, grid, span, halo, patch)
+        logits = self._slab_logits(tokens, grid, span, halo, patch, volumes)
         n_affinity = len(self.offsets)
 
         # Past the volume's end there is nothing to reach for, and `affinities_from_labels` masks
