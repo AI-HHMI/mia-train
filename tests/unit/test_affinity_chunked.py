@@ -314,7 +314,7 @@ def test_refinement_runs_on_the_slab_plus_its_reach():
     """
     grid = CROP // PATCH
     algorithm = _algorithm(decode_chunks=grid)  # one patch plane per slab
-    reach = algorithm._refine_reach()
+    reach = algorithm.decoder_out.reach
     depths: list[int] = []
     algorithm.decoder_out.refine.register_forward_pre_hook(
         lambda _module, args: depths.append(args[0].shape[2])

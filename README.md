@@ -75,7 +75,7 @@ for single-node, multi-node and resume recipes.
 | `simmim` | Masked image modelling by mask-token substitution. Works with DINOv3 encoders, which MAE cannot use because they cannot consume a scattered token subset. |
 | `dinov3` | The DINOv3 self-supervised objective: teacher/student EMA, DINO + iBOT losses, Sinkhorn centring, KoLeo. Rank-agnostic. |
 | `affinity_seg` | Supervised instance segmentation by binary affinity prediction. With `lsd_sigma` set, the head also predicts local shape descriptors (MTLSD). |
-| `semantic_seg` | Supervised per-voxel classification (serves both 2D and 3D). |
+| `semantic_seg` | Supervised per-voxel classification (serves both 2D and 3D), with `affinity_seg`'s heads (`interpolate`, `linear`, `subpixel`, `unetr`, `unet`) and its slab decoding (`decode_chunks`). |
 | `promptable_seg` | Supervised promptable instance segmentation, Segment Anything-style, supporting point, box, mask, or class token prompts. |
 
 Adding a new component simply involves writing it and adding one line to `src/components.py`. The engine and the

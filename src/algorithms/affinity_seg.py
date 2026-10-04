@@ -18,7 +18,7 @@ own -- it exists to serve one objective and is not what you keep afterwards.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -27,7 +27,6 @@ from miao.labels import erode_labels
 from torch.utils.checkpoint import checkpoint
 
 from data.base import BaseDataset
-from layers.common.dense_heads import SubPixelHead, UNetHead, UNETRHead, VoxelHead
 from models.base import BaseModel
 
 from .affinity.lsd import (
@@ -45,20 +44,12 @@ from .affinity.targets import (
     relabel_connected,
 )
 from .base import BaseAlgorithm
+from .dense.decoding import DenseDecoding
 from .registry import AlgorithmRegistry
 
 SPATIAL_RANK = 3
 DECODERS = ("interpolate", "subpixel", "unetr", "unet")
 
-
-def default_skip_layers(depth: int, levels: int) -> tuple[int, ...]:
-    """`levels` 0-based block indices evenly spaced through a `depth`-block encoder, ending at the last.
-
-    UNETR's own choice scaled to the encoder: blocks 3/6/9/12 (1-based) of its 12-block ViT-B are
-    the ends of the stack's quarters, and on a 24-block ViT-L at patch 16 the same rule gives blocks
-    6/12/18/24 -- (5, 11, 17, 23) here.
-    """
-    return tuple(round(depth * (k + 1) / levels) - 1 for k in range(levels))
 
 #: Label dtypes `_prepare_labels` passes through untouched. Signed, because `ignore_index` is
 #: negative; integer, because a float label cannot be trusted to have kept its ids distinct.
@@ -66,7 +57,7 @@ SIGNED_INTEGER = (torch.int8, torch.int16, torch.int32, torch.int64)
 
 
 @AlgorithmRegistry.register("affinity_seg")
-class AffinitySegmentation(BaseAlgorithm):
+class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
     """Predict short- and long-range affinities from an encoder's patch features.
 
     `long_range` sets the second offset block. The benchmark uses 10 voxels, far enough that
@@ -243,7 +234,6 @@ class AffinitySegmentation(BaseAlgorithm):
         self.split_disconnected = split_disconnected
         self.label_erosion = label_erosion
         self.offsets = affinity_offsets(SPATIAL_RANK, long_range)
-        self.decoder_kind = decoder
         self.decode_chunks = decode_chunks
         self.long_range = long_range
         self.encoder = model
@@ -253,7 +243,7 @@ class AffinitySegmentation(BaseAlgorithm):
         # produces split targets rather than silently unsplit ones.
         self._split_delegated = False
 
-        # Patch tokens -> voxel-resolution affinity logits, by one of two routes.
+        # Patch tokens -> voxel-resolution affinity logits (`algorithms.dense.decoding`).
         #
         # `"interpolate"` upsamples to whatever spatial size the input had and then convolves at
         # that resolution, so the same head serves encoders whose patch sizes differ (and
@@ -268,88 +258,14 @@ class AffinitySegmentation(BaseAlgorithm):
         # a quarter of the activation memory. It needs the encoder's patch size, and crops
         # divisible by it.
         #
-        # `embed_dim` is an int attribute, but reading it off an nn.Module widens its static
-        # type, so it is narrowed once here rather than at each use.
-        embed_dim: int = model.embed_dim  # type: ignore[assignment]
         # Affinities first, descriptors after. One wider output convolution rather than two heads:
         # the two are the same function, and the reference network is built the same way.
-        head_channels = len(self.offsets) + self.lsd_channels
-        #: 0-based encoder blocks the UNETR head reads, deepest last; None for the other heads.
-        self.skip_layers: tuple[int, ...] | None = None
-        if decoder in ("subpixel", "unetr"):
-            # Scalar on the DINOv3 models, a tuple on `ViT3D`; normalised as `simmim` does it.
-            patch = cast(Any, model).patch_size
-            patch_size: tuple[int, ...] = (
-                (patch,) * SPATIAL_RANK if isinstance(patch, int) else tuple(patch)
-            )
-        if decoder == "subpixel":
-            # `_decode` is unchanged by the choice: `SubPixelHead` takes its own projection, so the
-            # patch-grid stage is a no-op and both heads share the `(x, size)` call.
-            self.decoder: nn.Module = nn.Identity()
-            self.decoder_out: nn.Module = SubPixelHead(
-                embed_dim, patch_size, head_channels,
-                hidden=decoder_hidden_dim, readout=decoder_readout_dim,
-                refine_depth=decoder_refine_depth,
-                zero_init_output=decoder_zero_init_output,
-            )
-        elif decoder == "unetr":
-            if type(model).layer_patch_features is BaseModel.layer_patch_features:
-                raise ValueError(
-                    f"decoder = 'unetr' reads intermediate encoder layers, which "
-                    f"{type(model).__name__} does not provide (it does not implement "
-                    "layer_patch_features); use decoder = 'subpixel' or 'interpolate'"
-                )
-            levels = UNETRHead.levels_for(patch_size)
-            depth = len(cast(Any, model).blocks)
-            layers = (
-                tuple(int(layer) for layer in decoder_skip_layers)
-                if decoder_skip_layers is not None else default_skip_layers(depth, levels)
-            )
-            if (
-                len(layers) != levels
-                or any(b <= a for a, b in zip(layers, layers[1:]))
-                or layers[0] < 0 or layers[-1] >= depth
-            ):
-                raise ValueError(
-                    f"decoder_skip_layers must be {levels} strictly increasing 0-based block "
-                    f"indices below the encoder's depth {depth} (one per x2 stage of patch "
-                    f"{patch_size}, deepest last), got {layers}"
-                )
-            self.skip_layers = layers
-            # Every token grid goes straight to the head, which projects each itself.
-            self.decoder = nn.Identity()
-            self.decoder_out = UNETRHead(
-                embed_dim, patch_size, head_channels,
-                in_channels=cast(Any, model).in_chans,
-                widths=decoder_widths, image_skip=decoder_image_skip,
-                zero_init_output=decoder_zero_init_output,
-            )
-        elif decoder == "unet":
-            if type(model).pyramid_features is BaseModel.pyramid_features:
-                raise ValueError(
-                    f"decoder = 'unet' reads the encoder's feature map at every stride, which "
-                    f"{type(model).__name__} does not provide (it does not implement "
-                    "pyramid_features); a ViT has one grid, which is what decoder = 'unetr' is for"
-                )
-            # The maps go straight to the head, which fuses each at its own stride.
-            self.decoder = nn.Identity()
-            self.decoder_out = UNetHead(
-                cast(Any, model).pyramid_dims, cast(Any, model).pyramid_strides, head_channels,
-                in_channels=cast(Any, model).in_chans,
-                widths=decoder_widths, image_skip=decoder_image_skip,
-                zero_init_output=decoder_zero_init_output,
-            )
-        else:
-            self.decoder = nn.Sequential(
-                nn.Conv3d(embed_dim, decoder_hidden_dim, kernel_size=1),
-                nn.GELU(),
-            )
-            self.decoder_out = VoxelHead(
-                nn.Conv3d(decoder_hidden_dim, decoder_hidden_dim, kernel_size=3, padding=1),
-                nn.GELU(),
-                nn.Conv3d(decoder_hidden_dim, head_channels, kernel_size=1),
-                mode="trilinear",
-            )
+        self._build_head(
+            model, decoder, len(self.offsets) + self.lsd_channels, SPATIAL_RANK,
+            hidden_dim=decoder_hidden_dim, readout_dim=decoder_readout_dim,
+            refine_depth=decoder_refine_depth, zero_init_output=decoder_zero_init_output,
+            widths=decoder_widths, skip_layers=decoder_skip_layers, image_skip=decoder_image_skip,
+        )
 
     def sample_transform(self) -> SplitDisconnectedLabels | None:
         """Hand the connected-components pass to the dataloader's workers, when there is one to do.
@@ -521,73 +437,15 @@ class AffinitySegmentation(BaseAlgorithm):
         if self.decode_chunks == 1:
             return self._decode(tokens, grid, size, volumes)[:, :n_affinity]
         patch = size[0] // grid[0]
-        halo = -(-self._refine_reach() // patch)  # ceil, in whole tokens
         return torch.cat(
             [
-                self._slab_logits(tokens, grid, span, halo, patch, volumes)[:, :n_affinity]
-                for span in self._chunk_spans(grid[0])
+                self._decode(tokens, grid, size, volumes, span=(lo * patch, hi * patch))[
+                    :, :n_affinity
+                ]
+                for lo, hi in self._chunk_spans(grid[0])
             ],
             dim=2,
         )
-
-    def _encode(
-        self, volumes: torch.Tensor
-    ) -> tuple[torch.Tensor | list[torch.Tensor], tuple[int, ...]]:
-        """What the head reads: the final layer's patch tokens, or the UNETR head's skip layers.
-
-        One `(B, N, C)` tensor, or for `decoder = "unetr"` one per entry of `skip_layers`, deepest
-        last, all on the same grid. For `decoder = "unet"`, the encoder's map at each stride,
-        finest first, with the deepest map's grid.
-        """
-        if self.decoder_kind == "unet":
-            return self.encoder.pyramid_features(volumes)
-        if self.skip_layers is not None:
-            return self.encoder.layer_patch_features(volumes, self.skip_layers)
-        return self.encoder.patch_features(volumes)
-
-    def _decode(
-        self,
-        tokens: torch.Tensor | list[torch.Tensor],
-        grid: tuple[int, ...],
-        size: torch.Size,
-        volumes: torch.Tensor | None = None,
-        crop: tuple[int, int] | None = None,
-    ) -> torch.Tensor:
-        """`_encode`'s tokens on `grid` -> (B, n_offsets, *size) affinity logits.
-
-        `volumes` is the encoder's own input, which only the UNETR head reads (its full-resolution
-        skip); the other heads decode from the tokens alone. `crop` is the sub-pixel head's (see
-        `SubPixelHead.forward`); the output then spans `crop` along the first spatial axis.
-        """
-        if self.decoder_kind == "unet":
-            assert volumes is not None, "the U-Net head reads the raw image as well as the maps"
-            return self.decoder_out(tokens, volumes)
-        if self.skip_layers is not None:
-            assert volumes is not None, "the UNETR head reads the raw image as well as the tokens"
-            return self.decoder_out([self._fold(t, grid) for t in tokens], volumes)
-        assert isinstance(tokens, torch.Tensor)
-        x = self.decoder(self._fold(tokens, grid))
-        if crop is None:
-            return self.decoder_out(x, tuple(size))
-        return self.decoder_out(x, tuple(size), crop=crop)
-
-    @staticmethod
-    def _fold(tokens: torch.Tensor, grid: tuple[int, ...]) -> torch.Tensor:
-        """(B, N, C) patch tokens -> (B, C, *grid), refusing a sequence that does not fill `grid`."""
-        batch, num_tokens, channels = tokens.shape
-        expected = 1
-        for extent in grid:
-            expected *= extent
-        if num_tokens != expected:
-            raise ValueError(
-                f"encoder returned {num_tokens} tokens but its grid {grid} holds "
-                f"{expected}; a dense head cannot fold a token sequence back into a volume "
-                "it does not fill"
-            )
-
-        # (B, N, C) -> (B, C, *grid). Tokens are in row-major grid order, which is what the
-        # encoders' patch embeddings produce and what `patch_features` promises.
-        return tokens.transpose(1, 2).reshape(batch, channels, *grid)
 
     def _split_labels(self, labels: torch.Tensor) -> torch.Tensor:
         """The connected-components split, unless the dataloader's workers already did it."""
@@ -705,95 +563,12 @@ class AffinitySegmentation(BaseAlgorithm):
             **lsd,
         }
 
-    def _refine_reach(self) -> int:
-        """Voxels of context the head's full-resolution convolutions read on each side.
-
-        `SubPixelHead.refine` is `refine_depth` convolutions of width 3, so each one reaches one
-        voxel; `project`, the expansion and `out` are all per-token or 1x1 and reach none. A slab
-        decoded with this much halo, then cropped, is elementwise identical to the same slab of an
-        undivided decode -- which is what `tests/unit/test_affinity_chunked.py` pins.
-        """
-        return sum(
-            1
-            for module in self.decoder_out.modules()
-            if isinstance(module, nn.Conv3d) and max(module.kernel_size) > 1
-        )
-
-    def _chunk_spans(self, extent: int) -> list[tuple[int, int]]:
-        """`decode_chunks` contiguous spans of the patch grid's first axis, near-equal in size.
-
-        The first axis and not another, because patch tokens arrive in row-major grid order: a
-        contiguous *range of tokens* is exactly a slab along that axis, so a chunk is a slice
-        rather than a gather. Remainders go to the earliest chunks.
-        """
-        chunks = min(self.decode_chunks, extent)
-        base, extra = divmod(extent, chunks)
-        spans, start = [], 0
-        for index in range(chunks):
-            stop = start + base + (1 if index < extra else 0)
-            spans.append((start, stop))
-            start = stop
-        return spans
-
-    def _subpixel_slab(
-        self,
-        tokens: torch.Tensor,
-        grid: tuple[int, ...],
-        span: tuple[int, int],
-        halo: int,
-        patch: int,
-    ) -> torch.Tensor:
-        """The sub-pixel head's logits for voxels `span * patch` of the first axis, via halos."""
-        lo, hi = span
-        # Halo tokens on each side feed the refine convolutions the context they would have had
-        # in an undivided decode; the volume's own faces have none, which is also what an
-        # undivided decode sees there. The head decodes whole tokens, so the halo is whole tokens
-        # when expanded -- but only `reach` voxels of it are what the convolutions read, so the
-        # expansion is cropped to the slab plus `reach` on each side *before* them (`crop`). At one
-        # patch plane per slab that is 16 + 2 x 2 voxels of convolution against 16 + 2 x 16 when the
-        # crop came after, and it is the convolution input that has to fit under cuDNN's 2^31.
-        token_lo, token_hi = max(lo - halo, 0), min(hi + halo, grid[0])
-        plane = grid[1] * grid[2]
-        slab = tokens[:, token_lo * plane : token_hi * plane, :]
-        slab_grid = (token_hi - token_lo, grid[1], grid[2])
-        reach = self._refine_reach()
-        start = max(lo * patch - reach, 0)  # the first voxel the cropped decode covers, globally
-        crop = (start - token_lo * patch, min(hi * patch + reach, grid[0] * patch) - token_lo * patch)
-
-        logits = self._decode(slab, slab_grid, torch.Size(s * patch for s in slab_grid), crop=crop)
-        # Back to the slab's own voxels, dropping the reach the convolutions have now consumed.
-        keep_lo, keep_hi = lo * patch - start, hi * patch - start
-        return logits[:, :, keep_lo:keep_hi]
-
-    def _slab_logits(
-        self,
-        tokens: torch.Tensor | list[torch.Tensor],
-        grid: tuple[int, ...],
-        span: tuple[int, int],
-        halo: int,
-        patch: int,
-        volumes: torch.Tensor,
-    ) -> torch.Tensor:
-        """All output channels for voxels `span * patch` of the first axis, from any slab head."""
-        lo, hi = span
-        if self.decoder_kind == "unet":
-            # The head cuts each of its strides to what these voxels read (`UNetHead`), from maps
-            # and an image it is handed whole, so there is no halo to build here.
-            return self.decoder_out(tokens, volumes, span=(lo * patch, hi * patch))
-        if self.decoder_kind == "unetr":
-            # Likewise from token grids, each skip's chain cut to what its fusion reads.
-            folded = [self._fold(t, grid) for t in tokens]
-            return self.decoder_out(folded, volumes, span=(lo * patch, hi * patch))
-        assert isinstance(tokens, torch.Tensor)
-        return self._subpixel_slab(tokens, grid, span, halo, patch)
-
     def _chunk_terms(
         self,
         tokens: torch.Tensor | list[torch.Tensor],
         grid: tuple[int, ...],
         labels: torch.Tensor,
         span: tuple[int, int],
-        halo: int,
         patch: int,
         sigma: torch.Tensor | None,
         lsd_halo: int,
@@ -817,7 +592,9 @@ class AffinitySegmentation(BaseAlgorithm):
         """
         lo, hi = span
         width = (hi - lo) * patch
-        logits = self._slab_logits(tokens, grid, span, halo, patch, volumes)
+        logits = self._decode(
+            tokens, grid, volumes.shape[-SPATIAL_RANK:], volumes, span=(lo * patch, hi * patch)
+        )
         n_affinity = len(self.offsets)
 
         # Past the volume's end there is nothing to reach for, and `affinities_from_labels` masks
@@ -935,7 +712,6 @@ class AffinitySegmentation(BaseAlgorithm):
         # than the sum of their parts: a slab's tensors drop back under cuDNN's 2^31 element limit,
         # where its convolutions stop falling back to the int64 direct kernels.
         patch = spatial[0] // grid[0]
-        halo = -(-self._refine_reach() // patch)  # ceil, in whole tokens
         lsd_halo = 0
         if sigma is not None:
             if patch % self.lsd_downsample:
@@ -959,7 +735,6 @@ class AffinitySegmentation(BaseAlgorithm):
                     grid,
                     labels,
                     span,
-                    halo,
                     patch,
                     sigma,
                     lsd_halo,

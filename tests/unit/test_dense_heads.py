@@ -162,6 +162,75 @@ def test_subpixel_head_serves_two_dimensional_data():
 
 
 @pytest.mark.unit
+def test_heads_report_how_far_their_convolutions_reach():
+    """What a span is decoded with beyond its faces: one voxel per 3-wide convolution."""
+    assert VoxelHead(mode="trilinear").reach == 0
+    two = VoxelHead(
+        torch.nn.Conv3d(IN_DIM, OUT, kernel_size=3, padding=1), torch.nn.GELU(),
+        torch.nn.Conv3d(OUT, OUT, kernel_size=3, padding=1),
+        torch.nn.Conv3d(OUT, OUT, kernel_size=1),
+        mode="trilinear",
+    )
+    assert two.reach == 2
+    assert _head(refine_depth=3).reach == 3
+
+
+@pytest.mark.unit
+def test_voxel_head_slab_equals_the_same_voxels_of_an_undivided_decode():
+    """Only the tokens a span interpolates from are upsampled, and only its rows of that.
+
+    In float32, which the upsampling always runs in: the cut is exact, and what is left is the
+    rounding of matrix products of different shapes.
+    """
+    torch.manual_seed(0)
+    head = VoxelHead(
+        torch.nn.Conv3d(IN_DIM, OUT, kernel_size=3, padding=1), torch.nn.GELU(),
+        torch.nn.Conv3d(OUT, OUT, kernel_size=3, padding=1),
+        mode="trilinear",
+    )
+    x = torch.randn(2, IN_DIM, 5, 2, 3)
+    size = (40, 16, 24)  # patch 8 on every axis; the first long enough for several slabs
+    with torch.no_grad():
+        whole = head(x, size)
+        for lo, hi in [(0, 40), (0, 8), (8, 16), (9, 27), (3, 5), (32, 40), (39, 40)]:
+            sliced = head(x, size, span=(lo, hi))
+            torch.testing.assert_close(sliced, whole[:, :, lo:hi], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.unit
+def test_voxel_head_refuses_a_span_of_an_axis_that_is_not_whole_patches():
+    """The upsampling scale is then not the patch size, so a span would interpolate at another rate.
+
+    Reachable in 2D: the 3D models refuse such a crop at their patch embedding already, but the 2D
+    DINOv3 model crops a partial patch away, and its grid then covers less than the crop.
+    """
+    head = VoxelHead(torch.nn.Conv3d(IN_DIM, OUT, kernel_size=1), mode="trilinear")
+    x = torch.randn(1, IN_DIM, *GRID)
+    with pytest.raises(ValueError, match="whole number of patches"):
+        head(x, (13, 8, 20), span=(0, 4))
+
+
+@pytest.mark.unit
+def test_subpixel_slab_equals_the_same_voxels_of_an_undivided_decode():
+    """Only the tokens a span reads are expanded, and the expansion is cut before the refinement."""
+    torch.set_default_dtype(torch.float64)
+    try:
+        # Not zero-initialised: a zeroed output would make every voxel equal and any cut agree.
+        head = _head(zero_init_output=False)
+        x = torch.randn(2, IN_DIM, *GRID)
+        size = _size()
+        whole = head(x, size)
+        extent, patch = size[0], PATCH[0]
+        spans = [(0, extent), (0, patch), (patch, 2 * patch), (patch + 1, 2 * patch + 3),
+                 (extent - patch, extent), (extent - 1, extent)]
+        for lo, hi in spans:
+            sliced = head(x, size, span=(lo, hi))
+            torch.testing.assert_close(sliced, whole[:, :, lo:hi], rtol=0, atol=1e-12)
+    finally:
+        torch.set_default_dtype(torch.float32)
+
+
+@pytest.mark.unit
 def test_voxel_head_uses_the_mode_it_was_built_with():
     head = VoxelHead(torch.nn.Conv2d(IN_DIM, OUT, kernel_size=1), mode="bilinear")
     assert head(torch.randn(1, IN_DIM, 3, 5), (12, 20)).shape == (1, OUT, 12, 20)

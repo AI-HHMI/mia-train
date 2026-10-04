@@ -2,11 +2,12 @@
 
 Any dense task on a transformer has to undo the patch embedding: tokens sit on a grid `patch_size`
 times coarser than the input on every axis, and the head has to produce a value per voxel. The
-first two heads here are alternative answers from the final layer's tokens alone, and they share a
-signature -- `forward(x, size)` -- so an algorithm can offer the choice as configuration without
-branching at the call site. The third, `UNETRHead`, also reads intermediate layers and the raw
-image, so it takes those instead (see its docstring). The fourth, `UNetHead`, is the same kind of
-decoder for a hierarchical encoder, whose stages are already the skips UNETR has to build.
+first two heads here are alternative answers from the final layer's tokens alone, and they share
+a signature -- `forward(x, size, span=None)` -- so an algorithm can offer the choice as
+configuration without branching at the call site. The third, `UNETRHead`, also reads intermediate
+layers and the raw image, so it takes those instead (see its docstring). The fourth, `UNetHead`,
+is the same kind of decoder for a hierarchical encoder, whose stages are already the skips UNETR
+has to build.
 
 `VoxelHead` interpolates and then convolves at full resolution. Every sub-token detail is therefore
 the responsibility of the convolutions that follow, which act on an already-smooth field and see
@@ -25,6 +26,14 @@ deliberate and is what makes activation checkpointing worth anything here: a che
 stores its own inputs, so an upsampling performed outside would leave its full-resolution result
 held for the whole backward pass. Inside, the stored boundary is the patch grid, thousands of times
 smaller.
+
+Every head also decodes a *span*: given `span = (lo, hi)` it returns only voxels `lo:hi` of the
+first spatial axis, equal to the same voxels of an undivided decode, and computes only what those
+voxels depend on. How far that reaches past the span's faces is a property of the head -- the
+interpolation and convolutions of `VoxelHead`, the refinement of `SubPixelHead`, the residual blocks
+of `UNETRHead` and `UNetHead` -- so each head works its own out. That is what lets a strategy decode
+a large crop slab by slab, with one slab's voxel-resolution tensors alive at a time
+(`decode_chunks`, `algorithms.dense.decoding`).
 """
 
 from __future__ import annotations
@@ -91,7 +100,28 @@ class VoxelHead(nn.Sequential):
             self._resample[key] = cached
         return cached
 
-    def forward(self, x: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:  # type: ignore[override]
+    @property
+    def reach(self) -> int:
+        """Voxels the layers after the upsampling read past their output on each side."""
+        return _conv_reach(self)
+
+    def forward(  # type: ignore[override]
+        self, x: torch.Tensor, size: tuple[int, ...], span: tuple[int, int] | None = None
+    ) -> torch.Tensor:
+        """`(B, C, *grid)` -> `(B, out, *size)`, or only voxels `span = (lo, hi)` of the first axis.
+
+        A span is decoded from what its voxels depend on and nothing else: the tokens the
+        interpolation reads for them and for the `reach` voxels the layers read beyond them, and of
+        the upsampling only those voxels, by keeping just their rows of the first axis's resampling
+        matrix. Each is the same weighted sum of the same tokens as in an undivided decode, so the
+        span equals the same voxels of it. That holds only when the first axis is a whole number of
+        patches -- the upsampling scale is then exactly the patch size, for a span's tokens as for
+        the whole grid -- so a span of any other axis is refused rather than decoded with seams.
+        """
+        rows: tuple[int, int] | None = None
+        keep: tuple[int, int] | None = None
+        if span is not None:
+            x, size, rows, keep = self._span_plan(x, tuple(size), span)
         # Upsampling as a matmul per axis, not `F.interpolate`. Multi-linear interpolation is
         # separable -- each axis is resampled independently -- so this computes exactly the same
         # function, and `tests/unit/test_dense_heads.py` pins that against `F.interpolate` to
@@ -114,6 +144,10 @@ class VoxelHead(nn.Sequential):
             x = x.float()
             for axis in reversed(range(len(size))):
                 matrix = self._axis_matrix(x.shape[-1], size[axis], x.device, x.dtype)
+                if axis == 0 and rows is not None:
+                    # The first axis is resampled last, so this is the final, largest product, and
+                    # only the planes the span needs are ever computed.
+                    matrix = matrix[rows[0] : rows[1]]
                 # Resample the trailing axis, then rotate it to the front of the spatial block so
                 # the next pass sees a fresh one. After `rank` passes the axes are back in order,
                 # and the volume has grown one axis at a time rather than all at once -- which
@@ -121,7 +155,35 @@ class VoxelHead(nn.Sequential):
                 x = (x @ matrix.T).movedim(-1, 2)
         for layer in self:
             x = layer(x)
-        return x
+        return x if keep is None else x[:, :, keep[0] : keep[1]]
+
+    def _span_plan(
+        self, x: torch.Tensor, size: tuple[int, ...], span: tuple[int, int]
+    ) -> tuple[torch.Tensor, tuple[int, ...], tuple[int, int], tuple[int, int]]:
+        """What a span of the first axis is decoded from: the tokens it reads, the size those
+        upsample to, the rows of that upsampling the layers read, and the planes they return."""
+        grid = x.shape[2]
+        if size[0] % grid:
+            raise ValueError(
+                f"a span of a {size[0]}-voxel axis over {grid} tokens cannot be decoded exactly: "
+                "the axis is not a whole number of patches, so the upsampling scale is not the "
+                "patch size and a span would interpolate at a different rate from the whole axis"
+            )
+        patch = size[0] // grid
+        lo, hi = span
+        start, stop = max(lo - self.reach, 0), min(hi + self.reach, size[0])
+        # Voxel v is interpolated from the two tokens around c = (v + 0.5) / patch - 0.5, in
+        # integers floor((2v + 1 - patch) / 2patch); the clamping at the axis's own ends is then
+        # the whole axis's too, since a span that reaches an end keeps that token.
+        first = max((2 * start + 1 - patch) // (2 * patch), 0)
+        last = min((2 * stop - 1 - patch) // (2 * patch) + 1, grid - 1)
+        offset = first * patch
+        return (
+            x[:, :, first : last + 1],
+            ((last + 1 - first) * patch, *size[1:]),
+            (start - offset, stop - offset),
+            (lo - start, hi - start),
+        )
 
 
 class SubPixelHead(nn.Module):
@@ -278,16 +340,23 @@ class SubPixelHead(nn.Module):
             expanded = expanded + bias.reshape(readout, *(1,) * rank)
         return expanded
 
-    def forward(
-        self, x: torch.Tensor, size: tuple[int, ...], crop: tuple[int, int] | None = None
-    ) -> torch.Tensor:
-        """`crop = (lo, hi)` keeps only voxels `lo:hi` of the first spatial axis after the expansion.
+    @property
+    def reach(self) -> int:
+        """Voxels the refinement reads past its output on each side: one per 3-wide convolution."""
+        return _conv_reach(self.refine)
 
-        For decoding a slab of a larger volume (`AffinitySegmentation`'s `decode_chunks`): the
-        caller expands whole halo tokens but keeps only the few voxels of them that the refinement
-        convolutions reach into, so those convolutions -- the head's only full-resolution work with
-        a spatial footprint -- run on the slab plus that reach rather than on whole halo patches.
-        The output then covers `lo:hi` along that axis.
+    def forward(
+        self, x: torch.Tensor, size: tuple[int, ...], span: tuple[int, int] | None = None
+    ) -> torch.Tensor:
+        """`(B, in_dim, *grid)` -> `(B, out, *size)`, or only voxels `span = (lo, hi)` of axis 0.
+
+        A span is decoded from the tokens that its voxels, and the refinement's `reach` beyond
+        them, come from; and the expansion is cut to exactly those voxels *before* the refinement
+        convolutions run. Those convolutions are the head's only full-resolution work with a
+        spatial footprint, so they then work on the span plus its reach rather than on whole token
+        blocks -- 16 + 2 x 2 planes against 16 + 2 x 16 at one patch plane per slab -- and their
+        input is what has to fit under cuDNN's 2^31 elements. The span equals the same voxels of an
+        undivided decode.
         """
         # `size` is checked rather than interpolated to. With kernel == stride the output is
         # exactly `grid * patch_size`, and an encoder reaches its grid by floor division, so a crop
@@ -301,14 +370,19 @@ class SubPixelHead(nn.Module):
                 f"{expected}, but the crop is {tuple(size)}. A sub-pixel head can only produce a "
                 "whole number of patches; use a crop divisible by the patch size."
             )
-        x = self.project(x)
+        # Without a span every range below is whole and `_planes` hands each tensor through, so the
+        # undivided decode runs exactly the ops it always did.
+        lo, hi = span if span is not None else (0, expected[0])
+        patch = self.patch_size[0]
+        start, stop = max(lo - self.reach, 0), min(hi + self.reach, expected[0])
+        first, last = start // patch, -(-stop // patch)  # the tokens those voxels come from
+        x = self.project(_planes(x, first, last))
         x = self._expand_tokens(x)  # channels-last; the convolutions below keep it
-        if crop is not None:
-            x = x[:, :, crop[0] : crop[1]]
-        x = self.refine(x)
+        offset = first * patch
+        x = self.refine(_planes(x, start - offset, stop - offset))
         # Back to the layout every consumer of the logits has always received: a copy of the
         # `out_channels` logits, far smaller than the `readout`-wide volume the layout served.
-        return self.out(x).contiguous()
+        return _planes(self.out(x), lo - start, hi - start).contiguous()
 
 
 def _planes(x: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
@@ -319,6 +393,20 @@ def _planes(x: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
     autocast that node was enough to change the gradients in their last bits.
     """
     return x if (lo, hi) == (0, x.shape[2]) else x[:, :, lo:hi]
+
+
+def _conv_reach(module: nn.Module) -> int:
+    """Voxels the convolutions in `module` read past their output on each side of the first axis.
+
+    Each 'same'-padded convolution of width k reads (k - 1) / 2 voxels beyond its output, and a
+    stack of them adds up. A span is decoded with that much context on either side and then cut
+    back, which is what keeps its edge voxels equal to an undivided decode's.
+    """
+    return sum(
+        (layer.kernel_size[0] - 1) // 2
+        for layer in module.modules()
+        if isinstance(layer, nn.Conv2d | nn.Conv3d)
+    )
 
 
 class _ResidualBlock(nn.Module):
@@ -351,6 +439,16 @@ class _ResidualBlock(nn.Module):
         y = F.gelu(self.norm1(self.conv1(x)))
         y = self.norm2(self.conv2(y))
         return F.gelu(y + self.project(x))
+
+
+def default_skip_layers(depth: int, levels: int) -> tuple[int, ...]:
+    """`levels` 0-based block indices spread evenly over a `depth`-block encoder, the last included.
+
+    UNETR's own choice scaled to the encoder: blocks 3/6/9/12 (1-based) of its 12-block ViT-B are
+    the ends of the stack's quarters, and on a 24-block ViT-L at patch 16 the same rule gives blocks
+    6/12/18/24 -- (5, 11, 17, 23) here.
+    """
+    return tuple(round(depth * (k + 1) / levels) - 1 for k in range(levels))
 
 
 class UNETRHead(nn.Module):

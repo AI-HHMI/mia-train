@@ -7,9 +7,9 @@ from typing import Any
 import pytest
 import torch
 
-from algorithms.affinity_seg import AffinitySegmentation, default_skip_layers
+from algorithms.affinity_seg import AffinitySegmentation
 from algorithms.registry import AlgorithmRegistry
-from layers.common.dense_heads import VoxelHead
+from layers.common.dense_heads import VoxelHead, default_skip_layers
 from models.dinov3_vit3d import DinoVisionTransformer3D
 from models.muvit import MuViT3D
 from models.vit import ViT3D
