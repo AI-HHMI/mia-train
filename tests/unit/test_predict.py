@@ -29,6 +29,7 @@ DATA_CONFIG = (
     Path(__file__).resolve().parents[2]
     / "experiments/lmd_ssl_v1/lmd_val_singlescale.yaml"
 )
+NISB_CONFIG = Path(__file__).resolve().parents[2] / "configs/data/nisb_base.yaml"
 
 
 # ----------------------------------------------------------------- the lattice
@@ -121,28 +122,41 @@ def test_normalisation_follows_the_volume_not_the_dtype():
 
 @pytest.mark.slow
 @pytest.mark.parametrize(
-    "volume", ["liconn_mouse_hippocampus", "kasthuri15_ac4", "liconn_expid82"]
+    ("config", "volume", "box"),
+    [
+        (DATA_CONFIG, "liconn_mouse_hippocampus", None),
+        (DATA_CONFIG, "kasthuri15_ac4", None),
+        (DATA_CONFIG, "liconn_expid82", None),
+        # The training config leaves NISB's cubes unboxed, and the grid needs a box.
+        (NISB_CONFIG, "NISB base seed0", [[0, 3000], [0, 3000], [0, 1350]]),
+    ],
 )
-def test_reader_matches_miao_exactly(volume: str) -> None:
+def test_reader_matches_miao_exactly(config: Path, volume: str, box: list[list[int]] | None) -> None:
     """Same patch, read both ways: what the model is handed must be miao's sample, to the bit.
 
-    Covers the three shapes of the problem present in this eval set: a uint16 volume with an
+    Covers the four shapes of the problem present in these configs: a uint16 volume with an
     intensity window, an anisotropic uint8 volume whose axes are up-sampled in z and down-sampled in
-    x and y at once, and a volume whose storage axis order differs from the config's. The last is
-    why the comparison goes through `AxisOrder`, the transform inference applies: this test once
-    transposed predict.py's read by hand before comparing, so the values agreed while the model,
-    which never got that transpose, was handed every such tile with z and x exchanged.
+    x and y at once, a volume whose storage axis order differs from the config's, and a store with
+    a channel axis (NISB's `raw` is c, x, y, z), which the reader once indexed as if it had none.
+    The third is why the comparison goes through `AxisOrder`, the transform inference applies: this
+    test once transposed predict.py's read by hand before comparing, so the values agreed while the
+    model, which never got that transpose, was handed every such tile with z and x exchanged.
     """
     pytest.importorskip("miao")
-    if not DATA_CONFIG.is_file():
-        pytest.skip(f"{DATA_CONFIG} not present")
+    if not config.is_file():
+        pytest.skip(f"{config} not present")
     from miao.config import load_config
     from miao.dataset import VolumeDataset
 
     from predict import resolve_patch
     from prediction.grid import AxisOrder, VolumeGrid
 
-    base = load_config(DATA_CONFIG)
+    base = load_config(config)
+    if box is not None:
+        base = base.model_copy(update={"volumes": [
+            v.model_copy(update={"bounding_box": box}) if v.name == volume else v
+            for v in base.volumes
+        ]})
     out_axes = "".join(axis for axis in base.output_axes if axis in "xyz")
     grid = VolumeGrid(base, volume, resolve_patch(base, {}, volume, None))
     read = [int(r) for r in grid.info.scales.read_shapes[0]]

@@ -441,9 +441,16 @@ class VolumeGrid:
         return self._open(self.volume.image_key, self.image_level)
 
     def read_image(self, handle: Any, origin: tuple[int, ...]) -> np.ndarray:
-        """One tile: read, resample to the patch, normalise. Storage order throughout."""
-        window = tuple(slice(o, o + r) for o, r in zip(origin, self.read, strict=True))
-        block = np.asarray(handle[window])
+        """One tile: read, resample to the patch, normalise. Storage order throughout.
+
+        The tile is spatial: a store with a channel axis (NISB's `raw` is c, x, y, z, one channel)
+        has its channel taken, as `read_ground_truth` does for labels, and the predictor adds the
+        model's input channel itself.
+        """
+        window: list[Any] = [slice(o, o + r) for o, r in zip(origin, self.read, strict=True)]
+        if "c" in self.info.img_axes:
+            window.insert(self.info.img_axes.index("c"), 0)
+        block = np.asarray(handle[tuple(window)])
         resampled = resample_image(block, tuple(self.patch))
         return normalize(
             resampled, np.dtype(block.dtype),

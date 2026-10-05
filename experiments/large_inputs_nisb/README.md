@@ -97,6 +97,8 @@ under `*/smoke/`).
 
 Scoring uses mia-evals' `nisb_base_neurite_tracing` task (test `seed101`, route `mws_blockwise`),
 and runs only on request. Every arm predicts with `predict.py --cover-box`, which covers the whole
-cube at either window, so all six rows share one region. The 512³ arms predict at their own window
-(`--patch 512`; `predict.py` refuses a window other than the model's `img_size`), and `logits()`
-decodes in the run's 4 slabs.
+cube at either window, so all six rows share one region. Every arm predicts at its own window:
+`score.sh` writes the task's data configs with `patch_size` set to it, and `predict.py` checks that
+against the model's `img_size`. `--patch 512` would be wrong: it keeps the task config's 256-voxel
+read and resamples it up to 512, a 2x lattice that the scorer then refuses. `logits()` decodes in
+the run's 4 slabs.
