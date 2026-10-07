@@ -292,6 +292,9 @@ def shared_attrs(
         "source_path": str(grid.volume.path),
         "source_image_key": grid.volume.image_key,
         "source_label_key": grid.volume.label_key,
+        # Every frame of a time series shares `source_path`, so the frame is what tells a scorer
+        # which ground truth this prediction belongs to. Absent for an ordinary volume.
+        **({"source_fixed_axes": grid.fixed_axes} if grid.fixed_axes else {}),
         "image_level": grid.image_level,
         "label_level": grid.label_level,
         "native_box": grid.native_box(),

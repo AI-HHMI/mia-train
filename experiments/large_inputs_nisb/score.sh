@@ -21,6 +21,8 @@
 #   mws_blockwise        512 x 512 x 256 blocks: one CPU job with 32 slots segments them 8 at a time and scores.
 #   mws_blockwise_1024   1024 x 1024 x 1350 blocks, ~425 GB each: a 9-element array (36 slots each; every element
 #                        segments one block of each cube) first, then the scorer stitches, relabels and scores.
+#   cc_threshold         the earlier (BANIS) pipeline: the short-range channels thresholded over logits 3-11, no size
+#                        filter, fitted on val; one CPU job with 32 slots labels each cube in memory.
 #
 # Where things land (layout of 2026-09-16):
 #   predictions   $EXP/eval/<arm>/step<N>/{fit,test}/<volume>.zarr, their data configs in .../data/{fit,test}.yaml
@@ -63,7 +65,8 @@ STEP=${ARGS[1]:?$USAGE}
 case $ROUTE in
   mws_blockwise) SEGMENTERS=0 ;;
   mws_blockwise_1024) SEGMENTERS=9 ;;   # 3 x 3 x 1 blocks per cube, one per element
-  *) echo "unknown route $ROUTE (mws_blockwise | mws_blockwise_1024)" >&2; exit 2 ;;
+  cc_threshold) SEGMENTERS=0 ;;
+  *) echo "unknown route $ROUTE (mws_blockwise | mws_blockwise_1024 | cc_threshold)" >&2; exit 2 ;;
 esac
 WINDOW=${ARM%%_*}; WINDOW=${WINDOW#w}
 [[ $WINDOW =~ ^[0-9]+$ ]] || { echo "cannot read the window from arm $ARM (expected w<size>_<n>cube)" >&2; exit 2; }
@@ -109,10 +112,13 @@ fi
 # 2. the route: for large blocks, the per-block watershed on an array first; then the scorer, a CPU job chained on
 #    everything before it. Scratch and scored labellings are filed under the record's name.
 rec="${RUN_NAME}.step${STEP}.${ROUTE}"
-tag="${ARM}_${STEP}${ROUTE#mws_blockwise}"
+tag="${ARM}_${STEP}"; [[ $ROUTE != mws_blockwise ]] && tag+="_${ROUTE#mws_blockwise_}"   # _1024, _cc_threshold
 scratch=$TASK_DIR/scorescratch/$rec
 if (( SEGMENTERS )); then
-  cmd="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; cd '$EVALS' && '$VENV/bin/python' '$NUMA_LOCAL' '$VENV/bin/python' -m postprocess.mws_blockwise configs/$TASK/$ROUTE.toml \
+  # Imported, then main() called -- not `python -m postprocess.mws_blockwise` as mia-evals documents: run as
+  # __main__ the module registers "mws_blockwise", and main()'s `import components` imports it again under its own
+  # name and registers it a second time, which the registry refuses (every element of 154532421 failed so).
+  cmd="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4; cd '$EVALS' && '$VENV/bin/python' '$NUMA_LOCAL' '$VENV/bin/python' -c 'from postprocess.mws_blockwise import main; main()' configs/$TASK/$ROUTE.toml \
 --test '$ART/test' --val '$ART/fit' --scratch '$scratch' --processes 1 --worker \$((LSB_JOBINDEX - 1)) --workers $SEGMENTERS"
   args=(-q local -n 36 -W 8:00)
   [[ ${#deps[@]} -gt 0 && ${deps[0]} != DRYRUN ]] && args+=(-w "$(waits "${deps[@]}")")

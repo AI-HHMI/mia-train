@@ -195,6 +195,13 @@ class AugmentConfig:
     mul_intensity: float = 0.1
     add_intensity: float = 0.1
     noise_scale: float = 0.0
+    # Elastic warp (`data.augment.elastic`): with probability `elastic_prob` a sample is warped by
+    # offsets drawn N(0, elastic_sigma^2) voxels on control points elastic_spacing voxels apart and
+    # interpolated between them; image and labels move together. Geometric, so for a dataset that
+    # defers its images it runs on the training device, and otherwise in the dataloader workers.
+    elastic_prob: float = 0.0
+    elastic_spacing: int = 64
+    elastic_sigma: float = 4.0
 
     def __post_init__(self) -> None:
         if self.rotate not in ROTATIONS:
@@ -207,6 +214,7 @@ class AugmentConfig:
             or (self.shift_slice_prob > 0.0 and self.shift_magnitude > 0)
             or self.intensity
             or self.noise_scale > 0.0
+            or (self.elastic_prob > 0.0 and self.elastic_sigma > 0.0)
         )
 
 

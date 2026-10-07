@@ -157,6 +157,63 @@ def test_class_weights_normalise_as_cross_entropy_does_and_survive_chunking():
     assert _value(split.training_step(batch)["loss"]) == pytest.approx(whole_loss, rel=1e-5)
 
 
+def _reference_dice_loss(scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """muvit2-experiments' batch-pooled soft Dice (`MaskedCCEDiceLoss`, `dice_batch`), spelt out."""
+    probs = scores.double().softmax(dim=1)
+    valid = labels != IGNORE
+    per_class = []
+    for c in range(1, CLASSES):
+        member = labels == c
+        overlap = (probs[:, c] * member).sum()
+        mass = (probs[:, c] * valid).sum()
+        per_class.append(1 - (2 * overlap + 1e-6) / (mass + member.sum() + 1e-6))
+    return torch.stack(per_class).mean()
+
+
+@pytest.mark.unit
+def test_without_a_dice_weight_the_loss_is_cross_entropy_alone():
+    reported = _algorithm("linear").training_step(_batch())
+    assert "dice_loss" not in reported and "cross_entropy" not in reported
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("weight", [1.0, 0.5])
+def test_the_dice_term_is_soft_dice_over_the_foreground_pooled_over_the_batch(weight):
+    """Two crops in one batch, so the pooling across samples is part of what is checked."""
+    algorithm = _algorithm("subpixel", dice_weight=weight)
+    batch = _batch()
+    reported = algorithm.training_step(batch)
+
+    labels = algorithm._prepare_labels(batch["label"])
+    scores = algorithm.logits(algorithm.encoder.prepare_input(batch["img"], "lcxyz"))
+    cross_entropy = _value(F.cross_entropy(scores, labels, ignore_index=IGNORE))
+    dice = float(_reference_dice_loss(scores, labels))
+    assert _value(reported["cross_entropy"]) == pytest.approx(cross_entropy, rel=1e-5)
+    assert _value(reported["dice_loss"]) == pytest.approx(dice, rel=1e-5)
+    assert _value(reported["loss"]) == pytest.approx(cross_entropy + weight * dice, rel=1e-5)
+
+
+@pytest.mark.unit
+def test_a_batch_with_nothing_supervised_has_a_zero_dice_term():
+    """No class labelled and none predicted on a supervised voxel: every ratio is a perfect 1."""
+    algorithm = _algorithm("subpixel", dice_weight=1.0)
+    batch = _batch()
+    batch["label"][:] = IGNORE
+    reported = algorithm.training_step(batch)
+
+    assert _value(reported["dice_loss"]) == 0.0 and _value(reported["loss"]) == 0.0
+    reported["loss"].backward()
+    for name, parameter in algorithm.named_parameters():
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all(), name
+
+
+@pytest.mark.unit
+def test_dice_weight_must_not_be_negative():
+    with pytest.raises(ValueError, match="dice_weight"):
+        _algorithm("linear", dice_weight=-1.0)
+
+
 @pytest.mark.unit
 def test_checkpointing_the_head_changes_nothing_but_memory():
     batch = _batch()
@@ -196,7 +253,18 @@ def test_chunked_logits_match_the_undivided_decode(decoder):
         torch.testing.assert_close(split.logits(volumes), expected, rtol=1e-5, atol=1e-6)
 
 
-def _gradient_disagreement(decoder: str, dtype: torch.dtype) -> float:
+@pytest.mark.unit
+@pytest.mark.parametrize("decoder", DECODERS)
+def test_chunked_dice_matches_the_undivided_decode(decoder):
+    """The Dice sums are accumulated over slabs before the ratio, like every other term."""
+    batch = _batch()
+    whole = _algorithm(decoder, dice_weight=1.0).training_step(batch)
+    split = _algorithm(decoder, dice_weight=1.0, decode_chunks=3).training_step(batch)
+    for name in ("loss", "cross_entropy", "dice_loss"):
+        assert _value(split[name]) == pytest.approx(_value(whole[name]), rel=1e-5, abs=1e-6), name
+
+
+def _gradient_disagreement(decoder: str, dtype: torch.dtype, **overrides: Any) -> float:
     """Largest gradient difference, relative to the undivided decode's, over every parameter."""
     torch.set_default_dtype(dtype)
     try:
@@ -204,7 +272,8 @@ def _gradient_disagreement(decoder: str, dtype: torch.dtype) -> float:
             name: value.to(dtype) if value.is_floating_point() else value
             for name, value in _batch().items()
         }
-        whole, split = _algorithm(decoder), _algorithm(decoder, decode_chunks=3)
+        whole = _algorithm(decoder, **overrides)
+        split = _algorithm(decoder, decode_chunks=3, **overrides)
         whole.training_step(batch)["loss"].backward()
         split.training_step(batch)["loss"].backward()
         reference = dict(whole.named_parameters())
@@ -229,6 +298,13 @@ def test_chunked_gradients_match_the_undivided_decode(decoder):
     cannot tell a rounding difference from a small halo error.
     """
     assert _gradient_disagreement(decoder, torch.float64) < 1e-12
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("decoder", ["subpixel", "unetr"])
+def test_chunked_dice_gradients_match_the_undivided_decode(decoder):
+    """The ratio of slab-summed terms has to backpropagate into every slab, not only the last."""
+    assert _gradient_disagreement(decoder, torch.float64, dice_weight=1.0) < 1e-12
 
 
 @pytest.mark.unit

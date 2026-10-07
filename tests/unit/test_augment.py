@@ -24,6 +24,7 @@ from data.augment import (
     VolumeAugmentation,
     additive_noise,
     drop_sections,
+    elastic,
     intensity_jitter,
     rot90,
     shift_sections,
@@ -396,3 +397,108 @@ def test_every_config_field_reaches_the_recipe() -> None:
     config_fields = {f.name for f in dataclasses.fields(AugmentConfig)}
     accepted = set(inspect.signature(VolumeAugmentation.__init__).parameters) - {"self"}
     assert not config_fields - accepted, f"{sorted(config_fields - accepted)} never reaches it"
+
+
+# ---------------------------------------------------------------- elastic
+
+
+def _one_hot_blocks(axes: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Labels in blocks of 4 voxels, each block its own id, and an image holding their one-hot.
+
+    Built with the spatial axes in the order `axes` lists them, then laid out as `axes` says, so
+    channel-last and level-last layouts are exercised as well as the usual one.
+    """
+    spatial = [a for a in axes if a in "xyz"]
+    blocks = torch.meshgrid(*[torch.arange(16) // 4 for _ in spatial], indexing="ij")
+    ids = sum(block * 4**k for k, block in enumerate(blocks))
+    classes = 4 ** len(spatial)
+    one_hot = (ids[None] == torch.arange(classes).view(-1, *[1] * len(spatial))).float()
+    canonical_image, canonical_label = "lc" + "".join(spatial), "l" + "".join(spatial)
+    image = one_hot[None].permute([canonical_image.index(a) for a in axes])
+    label_axes = axes.replace("c", "")
+    label = ids[None].permute([canonical_label.index(a) for a in label_axes])
+    return image, label
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("axes", ["lcxyz", "lzyxc", "lcxy", "lxyc"])
+def test_elastic_moves_image_and_labels_together(axes):
+    """Where an image channel is exactly 1, every voxel the warp interpolated from was that class,
+    so the label read from the nearest one must be that class too."""
+    torch.manual_seed(0)
+    image, label = _one_hot_blocks(axes)
+    channel = axes.index("c")
+    warped_image, warped_label = elastic(
+        [image, label], [spatial_dims(axes), spatial_dims(axes.replace("c", ""))],
+        continuous=[True, False], spacing=8, sigma=1.5,
+    )
+    assert warped_image.shape == image.shape and warped_label.shape == label.shape
+    assert not torch.equal(warped_label, label), "a warp of sigma 1.5 should move something"
+    checked = 0
+    for k in range(image.shape[channel]):
+        whole = warped_image.select(channel, k) > 1 - 1e-5
+        assert (warped_label[whole] == k).all(), f"class {k}"
+        checked += int(whole.sum())
+    assert checked > 0.5 * label.numel()
+
+
+@pytest.mark.unit
+def test_elastic_keeps_label_ids_exact_beyond_float_precision():
+    """Ids are read, never resampled: 2**40 + k would not survive a float32 round trip."""
+    torch.manual_seed(0)
+    _, blocks = _one_hot_blocks("lcxyz")
+    label = blocks.long() + 2**40
+    (warped,) = elastic([label], [spatial_dims("lxyz")], continuous=[False], spacing=8, sigma=1.5)
+    assert warped.dtype == torch.long
+    assert set(warped.unique().tolist()) <= set(label.unique().tolist())
+
+
+@pytest.mark.unit
+def test_elastic_with_zero_sigma_changes_nothing():
+    image, label = _one_hot_blocks("lcxyz")
+    warped_image, warped_label = elastic(
+        [image, label], [spatial_dims("lcxyz"), spatial_dims("lxyz")],
+        continuous=[True, False], spacing=8, sigma=0.0,
+    )
+    # Not bit-exact: `grid_sample` takes positions normalised to [-1, 1], and the float32 round trip
+    # leaves them ~1e-6 voxels off, which blends that much of a neighbour into a one-hot jump.
+    torch.testing.assert_close(warped_image, image, rtol=0, atol=1e-5)
+    assert torch.equal(warped_label, label)
+
+
+@pytest.mark.unit
+def test_the_recipe_applies_the_elastic_warp_to_image_and_labels():
+    sample = _sample()
+    out = VolumeAugmentation(
+        sample_axes=AXES, elastic_prob=1.0, elastic_sigma=2.0, elastic_spacing=4
+    )(dict(sample))
+    assert out["img"].shape == sample["img"].shape and out["label"].shape == sample["label"].shape
+    assert not torch.equal(out["img"], sample["img"])
+    assert not torch.equal(out["label"], sample["label"])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"elastic_prob": 1.5}, "elastic_prob"),
+        ({"elastic_prob": 0.5, "elastic_spacing": 0}, "elastic_spacing"),
+        ({"elastic_prob": 0.5, "elastic_sigma": -1.0}, "elastic_sigma"),
+    ],
+)
+def test_elastic_settings_are_validated(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        VolumeAugmentation(sample_axes=AXES, **kwargs)
+
+
+@pytest.mark.unit
+def test_elastic_needs_the_axis_order():
+    with pytest.raises(ValueError, match="declares no sample_axes"):
+        VolumeAugmentation(elastic_prob=0.5)
+
+
+@pytest.mark.unit
+def test_the_config_counts_the_elastic_warp_as_augmentation():
+    assert AugmentConfig(elastic_prob=0.5).enabled()
+    assert not AugmentConfig(elastic_prob=0.5, elastic_sigma=0.0).enabled()
+

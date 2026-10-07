@@ -14,7 +14,10 @@ k + n, ... -- and each is written straight into its own chunks of one artifact: 
 chunks on every axis it does not end on, so no two workers ever write the same chunk. A marker,
 `<name>.zarr.blocks/<index>.json`, then records the block done. A rerun, after a crash or a
 TERM_RUNLIMIT and with any worker count, skips marked blocks; an unmarked block is recomputed
-whole, so a worker killed mid-write costs only the time.
+whole, so a worker killed mid-write costs only the time. What the workers share is made once,
+whichever starts first: the plan is created and never replaced (`_write_json_once`), and the
+empty artifact, attributes and all, is built under a name of the worker's own and renamed into
+place, where exactly one rename succeeds (`_publish`).
 
 **The artifact appears only when complete.** Workers write into `<name>.zarr.partial`, and
 whichever finishes the last block renames it to `<name>.zarr` -- one atomic rename -- so a scorer
@@ -33,6 +36,7 @@ that do not agree. Every marker records its device, and completion is refused if
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import itertools
 import json
@@ -40,14 +44,14 @@ import os
 import shutil
 import socket
 import time
-from collections.abc import Sequence
+import uuid
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import zarr
-from zarr.errors import ContainsArrayError
 
 from .artifact import LEVEL, create_ome_artifact, default_chunks
 from .dense import accumulate, blend
@@ -122,7 +126,7 @@ def predict_blocks(
             "block": list(block), "blocks": len(boxes)}
     markers.mkdir(parents=True, exist_ok=True)
     if not (markers / "plan.json").exists():
-        _write_json(markers / "plan.json", plan)
+        _write_json_once(markers / "plan.json", plan)
     found = json.loads((markers / "plan.json").read_text())
     if found != plan:
         raise SystemExit(
@@ -130,22 +134,25 @@ def predict_blocks(
             f"run's is {plan}): another checkpoint, data config, lattice or block shape. Rerun "
             f"with the settings that made it, or delete {partial} and {markers} to start over."
         )
-    try:
-        level = create_ome_artifact(partial, shape, np.float16, chunks=chunks, attrs=attrs,
-                                    name=path.name, **geometry)
-        stale = sorted(p.name for p in markers.glob("[0-9]*.json"))
-        if stale:
-            # Markers without the partial they describe: completing now would leave those blocks'
-            # chunks unwritten, i.e. zero, in an artifact that looks finished.
-            shutil.rmtree(partial)
-            if path.exists():                  # completed while this worker was starting up
-                return path
-            raise SystemExit(
-                f"{markers} marks {len(stale)} block(s) done, but {partial} was missing and has "
-                f"just been made empty. Delete {markers} too, then rerun."
-            )
-    except ContainsArrayError:                        # made by another worker, or an earlier run
-        level = zarr.open_array(str(partial / LEVEL), mode="r+")
+    # Every worker tries to publish, even when the partial is there already. Asking first
+    # (`partial.exists()`) is what NFS remembers: a worker told "missing" that then loses the race
+    # still cannot open the partial the rename found -- every worker on one node failed that way in
+    # mia-evals' copy of this code under a stress test (2026-10-05). Seen before publishing, these
+    # markers cannot be for a partial this worker makes.
+    stale = sorted(p.name for p in markers.glob("[0-9]*.json"))
+    made = _publish(partial, lambda where: create_ome_artifact(
+        where, shape, np.float16, chunks=chunks, attrs=attrs, name=path.name, **geometry))
+    if made and stale:
+        # Markers without the partial they describe: completing now would leave those blocks'
+        # chunks unwritten, i.e. zero, in an artifact that looks finished.
+        shutil.rmtree(partial)
+        if path.exists():                      # completed while this worker was starting up
+            return path
+        raise SystemExit(
+            f"{markers} marks {len(stale)} block(s) done, but {partial} was missing and has "
+            f"just been made empty. Delete {markers} too, then rerun."
+        )
+    level = zarr.open_array(str(partial / LEVEL), mode="r+")   # this worker's, another's, a rerun's
 
     todo = [i for i in range(worker, len(boxes), workers)
             if not (markers / f"{i}.json").exists()]
@@ -180,6 +187,32 @@ def predict_blocks(
         if path.exists():
             return path
         raise
+
+
+def _publish(final: Path, build: Callable[[Path], Any]) -> bool:
+    """Build directory `final` under a name of this call's own and rename it into place, unless
+    another worker has published it first. True if this call did.
+
+    Workers started together all find no partial, and making it in place would race: zarr's
+    open-or-create looks, then creates, so a worker between the two raises ContainsGroupError (one
+    of nine did in mia-evals' copy of this pattern, 2026-10-05), and two that both looked first
+    both create -- the slower overwriting the attributes the faster one had already written. A
+    rename onto a directory that exists and is not empty fails, so exactly one worker's copy lands,
+    whole, and every other worker discards its own and uses that one.
+    """
+    temporary = final.with_name(f".{final.name}.{socket.gethostname()}.{os.getpid()}."
+                                f"{uuid.uuid4().hex[:8]}")
+    try:
+        build(temporary)
+        try:
+            os.rename(temporary, final)
+        except OSError as error:
+            if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                raise
+            return False
+        return True
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
 
 
 def _complete(partial: Path, path: Path, markers: Path, plan: dict[str, Any]) -> Path | None:
@@ -222,3 +255,22 @@ def _write_json(path: Path, record: dict[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.{socket.gethostname()}.{os.getpid()}")
     temporary.write_text(json.dumps(record, indent=1))
     os.replace(temporary, path)
+
+
+def _write_json_once(path: Path, record: dict[str, Any]) -> None:
+    """Create `path` holding `record` unless it exists; a file already there is never replaced.
+
+    A hard link to a finished file either creates `path` or fails because it is there. Replacing
+    it instead, as `_write_json` does, would swap the file under a worker on another node that is
+    reading it, and NFS answers that read with ESTALE -- which workers started together, all
+    writing the plan, did (2026-10-05).
+    """
+    temporary = path.with_name(f".{path.name}.{socket.gethostname()}.{os.getpid()}."
+                               f"{uuid.uuid4().hex[:8]}")
+    temporary.write_text(json.dumps(record, indent=1))
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        pass
+    finally:
+        temporary.unlink()

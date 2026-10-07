@@ -15,6 +15,7 @@ plus the `VolumePredictor` dispatch in `prediction.dense` and the `--override` p
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -30,6 +31,13 @@ DATA_CONFIG = (
     / "experiments/lmd_ssl_v1/lmd_val_singlescale.yaml"
 )
 NISB_CONFIG = Path(__file__).resolve().parents[2] / "configs/data/nisb_base.yaml"
+# A light-sheet time series stored t, c, z, y, x (48 frames, one channel); each label array
+# annotates a single frame, so it is predicted one frame at a time via `fixed_axes`.
+TIMESERIES = Path(
+    "/groups/miaai/miaai/lmd-v0.0.1/data/lm-zebrafish-Betzig-mosaic-example_annotations_Thayer"
+    "/crop-001_dsr_timeseries_48t_1c.zarr"
+)
+TIMESERIES_LABEL = "labels/manual_gt-cell-t10_postproofread"
 
 
 # ----------------------------------------------------------------- the lattice
@@ -146,10 +154,6 @@ def test_reader_matches_miao_exactly(config: Path, volume: str, box: list[list[i
     if not config.is_file():
         pytest.skip(f"{config} not present")
     from miao.config import load_config
-    from miao.dataset import VolumeDataset
-
-    from predict import resolve_patch
-    from prediction.grid import AxisOrder, VolumeGrid
 
     base = load_config(config)
     if box is not None:
@@ -157,6 +161,16 @@ def test_reader_matches_miao_exactly(config: Path, volume: str, box: list[list[i
             v.model_copy(update={"bounding_box": box}) if v.name == volume else v
             for v in base.volumes
         ]})
+    _assert_reader_matches_miao(base, volume)
+
+
+def _assert_reader_matches_miao(base: Any, volume: str) -> None:
+    """One patch of `volume`, read by predict.py's reader and by miao, must agree to the bit."""
+    from miao.dataset import VolumeDataset
+
+    from predict import resolve_patch
+    from prediction.grid import AxisOrder, VolumeGrid
+
     out_axes = "".join(axis for axis in base.output_axes if axis in "xyz")
     grid = VolumeGrid(base, volume, resolve_patch(base, {}, volume, None))
     read = [int(r) for r in grid.info.scales.read_shapes[0]]
@@ -187,6 +201,59 @@ def test_reader_matches_miao_exactly(config: Path, volume: str, box: list[list[i
     )
     assert mine.shape == theirs.shape
     assert np.abs(mine - theirs).max() == 0.0
+
+
+def _timeseries_config(fixed_axes: dict[str, Any]) -> Any:
+    """The time series as one entry pinned by `fixed_axes`, or a skip without it or its miao."""
+    miao_config = pytest.importorskip("miao.config")
+    if "fixed_axes" not in miao_config.VolumeConfig.model_fields:
+        pytest.skip("the installed miao predates fixed_axes")
+    if not TIMESERIES.is_dir():
+        pytest.skip(f"{TIMESERIES} not present")
+    return miao_config.MiaoConfig(
+        volumes=[{
+            "name": "timeseries", "path": str(TIMESERIES), "image_key": "raw",
+            "label_key": TIMESERIES_LABEL, "zarr_version": "zarr3", "fixed_axes": fixed_axes,
+            "bounding_box": [[0, 152], [0, 508], [0, 1466]],
+        }],
+        resolutions=[[200, 108, 108]], output_axes="lczyx", patch_size=[64, 128, 128],
+    )
+
+
+@pytest.mark.slow
+def test_a_pinned_frame_is_read_as_miao_reads_it() -> None:
+    """A time series pinned to one frame: its tiles, ground truth and provenance are that frame's.
+
+    miao describes such a volume with the pinned axis removed, so a reader that opened the arrays
+    without the pin would index t, c and z with the z, y, x window. The tiles must equal miao's
+    sample to the bit, the ground truth must be frame 10 of the label array, and the attrs must
+    name the frame: every frame shares the store path, so nothing else tells them apart.
+    """
+    base = _timeseries_config({"t": 10})
+    _assert_reader_matches_miao(base, "timeseries")
+
+    import zarr
+
+    from predict import resolve_patch, shared_attrs
+    from prediction.grid import VolumeGrid
+
+    grid = VolumeGrid(base, "timeseries", resolve_patch(base, {}, "timeseries", None))
+    window = tuple(slice(low, high) for low, high in grid.native_box())
+    labels = zarr.open_array(str(TIMESERIES / TIMESERIES_LABEL / "s0"), mode="r")
+    assert np.array_equal(grid.read_ground_truth(), np.asarray(labels[(10, 0, *window)]))
+    assert shared_attrs(grid, Path("run"), 0, Path("data.yaml"))["source_fixed_axes"] == {"t": 10}
+
+
+@pytest.mark.slow
+def test_an_entry_pinning_several_frames_is_refused() -> None:
+    """miao expands `fixed_axes: {t: [1, 10]}` into two volumes, and a prediction is one."""
+    base = _timeseries_config({"t": [1, 10]})
+
+    from predict import resolve_patch
+    from prediction.grid import VolumeGrid
+
+    with pytest.raises(SystemExit, match="give each frame its own entry"):
+        VolumeGrid(base, "timeseries", resolve_patch(base, {}, "timeseries", None))
 
 
 def test_blend_weight_generalises_the_cubic_closed_form():

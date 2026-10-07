@@ -170,6 +170,70 @@ def shift_sections(
     return tuple(out)
 
 
+def elastic(
+    tensors: Sequence[torch.Tensor],
+    dims: Sequence[Sequence[int]],
+    continuous: Sequence[bool],
+    spacing: int,
+    sigma: float,
+) -> tuple[torch.Tensor, ...]:
+    """Warp every tensor by one smooth random displacement field, drawn once.
+
+    Offsets are drawn on a lattice of control points `spacing` voxels apart, `N(0, sigma**2)` voxels
+    along each spatial axis, and interpolated linearly to every voxel, so neighbouring voxels move
+    almost together and structures bend rather than tear. Each output voxel takes the value at its
+    displaced position: interpolated for a `continuous` tensor (an image), read from the nearest
+    voxel otherwise (labels), whose ids must not be averaged and need not fit in a float -- an id
+    past 2**24 would not survive a float32 resampling. A position outside the volume takes the
+    nearest edge voxel's value, the same voxel for image and labels.
+
+    Rank 2 or 3. The offsets are in voxels on every axis, so on anisotropic data they are not
+    isotropic in physical units.
+    """
+    first = tensors[0]
+    rank = len(dims[0])
+    shape = [first.shape[a] for a in _resolve(first, dims[0])]
+    lattice = [-(-extent // spacing) + 1 for extent in shape]
+    # Drawn on the CPU and moved, as `drop_sections` explains: the draw must not depend on where
+    # the sample happens to be.
+    offsets = (torch.randn(1, rank, *lattice) * sigma).to(first.device)
+    mode = "bilinear" if rank == 2 else "trilinear"
+    field = torch.nn.functional.interpolate(offsets, size=shape, mode=mode, align_corners=True)[0]
+    grids = torch.meshgrid(
+        *(torch.arange(n, device=field.device, dtype=field.dtype) for n in shape), indexing="ij"
+    )
+    source = torch.stack(grids) + field  # (rank, *shape): where each output voxel reads from
+    trailing = list(range(-rank, 0))
+
+    out = []
+    for tensor, tensor_dims, smooth in zip(tensors, dims, continuous, strict=True):
+        absolute = _resolve(tensor, tensor_dims)
+        if [tensor.shape[a] for a in absolute] != shape:
+            raise ValueError(
+                f"elastic warps every tensor with one field, so they must share the spatial "
+                f"extent {shape}; got {[tensor.shape[a] for a in absolute]} in a "
+                f"{tuple(tensor.shape)} tensor"
+            )
+        moved = tensor.movedim(absolute, trailing)
+        flat = moved.reshape(-1, *shape)
+        if smooth:
+            # `grid_sample` takes positions in [-1, 1], the fastest-varying axis first.
+            scale = torch.tensor([2.0 / max(n - 1, 1) for n in shape], device=source.device)
+            grid = (source * scale.view(rank, *[1] * rank) - 1).flip(0).movedim(0, -1)
+            warped = torch.nn.functional.grid_sample(
+                flat[None].to(grid.dtype), grid[None], mode="bilinear", padding_mode="border",
+                align_corners=True,
+            )[0].to(tensor.dtype)
+        else:
+            index = torch.zeros(shape, dtype=torch.long, device=source.device)
+            for slot in range(rank):
+                nearest = source[slot].round().clamp(0, shape[slot] - 1).long()
+                index = index * shape[slot] + nearest
+            warped = flat.reshape(flat.shape[0], -1)[:, index.reshape(-1)].reshape(flat.shape)
+        out.append(warped.reshape(moved.shape).movedim(trailing, absolute))
+    return tuple(out)
+
+
 def drop_sections(image: torch.Tensor, dims: Sequence[int], prob: float) -> torch.Tensor:
     """Blank whole sections of an image, each drawn independently with probability `prob`.
 
@@ -224,7 +288,10 @@ class VolumeAugmentation:
 
     Order is geometric first, receiving image and labels together so they stay registered, then
     photometric, receiving only the image. Section drops sit with the photometric group because
-    they are image-only, though they model an artefact rather than a photometric effect.
+    they are image-only, though they model an artefact rather than a photometric effect. The
+    elastic warp is geometric and comes after the rotation: with probability `elastic_prob` a
+    sample is warped by offsets of `elastic_sigma` voxels on control points `elastic_spacing`
+    voxels apart (`elastic`).
     """
 
     def __init__(
@@ -240,12 +307,16 @@ class VolumeAugmentation:
         sample_axes: str | None = None,
         image_keys: tuple[str, ...] = ("img",),
         label_keys: tuple[str, ...] = ("label",),
+        elastic_prob: float = 0.0,
+        elastic_spacing: int = 64,
+        elastic_sigma: float = 4.0,
     ) -> None:
         if rotate not in ROTATIONS:
             raise ValueError(f"rotate must be one of {ROTATIONS}, got {rotate!r}")
         for name, value in (
             ("drop_slice_prob", drop_slice_prob),
             ("shift_slice_prob", shift_slice_prob),
+            ("elastic_prob", elastic_prob),
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be a probability in [0, 1], got {value}")
@@ -253,16 +324,24 @@ class VolumeAugmentation:
             raise ValueError(f"shift_magnitude must be >= 0 voxels, got {shift_magnitude}")
         if noise_scale < 0.0:
             raise ValueError(f"noise_scale must be >= 0, got {noise_scale}")
+        if elastic_spacing < 1:
+            raise ValueError(f"elastic_spacing must be >= 1 voxel, got {elastic_spacing}")
+        if elastic_sigma < 0.0:
+            raise ValueError(f"elastic_sigma must be >= 0 voxels, got {elastic_sigma}")
         if not image_keys:
             raise ValueError("image_keys is empty, so no augmentation could ever apply")
 
-        needs_axes = rotate != "none" or (shift_slice_prob > 0 and shift_magnitude > 0)
+        needs_axes = (
+            rotate != "none"
+            or (shift_slice_prob > 0 and shift_magnitude > 0)
+            or (elastic_prob > 0 and elastic_sigma > 0)
+        )
         if needs_axes and sample_axes is None:
             raise ValueError(
-                "rotation and section shifting move the spatial axes, so they need the dataset's "
-                "axis order to know where those axes are, but this dataset declares no "
-                "sample_axes. Use a dataset that declares its layout, or configure only the "
-                "photometric operations (intensity, noise), which do not depend on it."
+                "rotation, section shifting and elastic warping move the spatial axes, so they "
+                "need the dataset's axis order to know where those axes are, but this dataset "
+                "declares no sample_axes. Use a dataset that declares its layout, or configure "
+                "only the photometric operations (intensity, noise), which do not depend on it."
             )
         if rotate == "inplane" and sample_axes is not None:
             if SECTION_AXIS not in sample_axes:
@@ -283,6 +362,9 @@ class VolumeAugmentation:
         self.sample_axes = sample_axes
         self.image_keys = tuple(image_keys)
         self.label_keys = tuple(label_keys)
+        self.elastic_prob = elastic_prob
+        self.elastic_spacing = elastic_spacing
+        self.elastic_sigma = elastic_sigma
 
     def _dims_for(self, key: str) -> tuple[int, ...]:
         """Where the spatial axes sit in the tensor under `key`.
@@ -358,6 +440,16 @@ class VolumeAugmentation:
                 fixed_slot=None if self.rotate == "full" else self._section_slot(),
             )
             sample.update(zip(geometric, rotated, strict=True))
+
+        if self.elastic_prob > 0 and self.elastic_sigma > 0 and self._coin(self.elastic_prob):
+            warped = elastic(
+                [sample[key] for key in geometric],
+                [self._dims_for(key) for key in geometric],
+                continuous=[key in images for key in geometric],
+                spacing=self.elastic_spacing,
+                sigma=self.elastic_sigma,
+            )
+            sample.update(zip(geometric, warped, strict=True))
 
         if self.shift_slice_prob > 0 and self.shift_magnitude > 0 and self._coin():
             shifted = shift_sections(
@@ -488,6 +580,9 @@ def split_augmentation(
     mul_intensity: float = 0.1,
     add_intensity: float = 0.1,
     noise_scale: float = 0.0,
+    elastic_prob: float = 0.0,
+    elastic_spacing: int = 64,
+    elastic_sigma: float = 4.0,
     on_device: bool = False,
 ) -> tuple[VolumeAugmentation | None, BatchPhotometric | DeviceAugmentation]:
     """One `[augment]` section as the two callables its operations belong on.
@@ -514,6 +609,9 @@ def split_augmentation(
         shift_magnitude=shift_magnitude,
         intensity=False,
         noise_scale=0.0,
+        elastic_prob=elastic_prob,
+        elastic_spacing=elastic_spacing,
+        elastic_sigma=elastic_sigma,
     )
     photometric = BatchPhotometric(
         intensity=intensity,
@@ -536,6 +634,9 @@ def split_augmentation(
         shift_magnitude=shift_magnitude,
         intensity=False,
         noise_scale=0.0,
+        elastic_prob=elastic_prob,
+        elastic_spacing=elastic_spacing,
+        elastic_sigma=elastic_sigma,
     )
     return None, DeviceAugmentation(full, photometric)
 
@@ -570,6 +671,7 @@ class DeviceAugmentation:
             self.geometric.rotate != "none"
             or self.geometric.shift_slice_prob > 0
             or self.geometric.drop_slice_prob > 0
+            or (self.geometric.elastic_prob > 0 and self.geometric.elastic_sigma > 0)
         )
 
     def enabled(self) -> bool:

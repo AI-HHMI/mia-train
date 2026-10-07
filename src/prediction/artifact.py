@@ -129,8 +129,9 @@ def create_ome_artifact(
     """An empty artifact, laid out as `write_ome_artifact` lays one out, to be filled region by
     region -> its `s0` array.
 
-    Never overwrites: an existing `s0` raises `zarr.errors.ContainsArrayError`, which is how
-    concurrent writers find that another has already made it. `name` is the OME name, by default
+    Never overwrites: an existing `s0` raises `zarr.errors.ContainsArrayError`. Not safe to call
+    on one path from concurrent writers -- blockwise prediction builds it under a temporary name
+    and renames it into place (`blockwise._publish`). `name` is the OME name, by default
     the directory's own; a group written under a temporary name and renamed into place passes its
     final one.
     """

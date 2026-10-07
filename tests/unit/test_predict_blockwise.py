@@ -159,6 +159,64 @@ def test_workers_share_the_blocks_and_the_last_one_completes_the_artifact(tmp_pa
     assert dict(group["s0"].attrs)["blockwise"] == attrs["blockwise"]
 
 
+def test_a_worker_that_loses_the_race_to_make_the_partial_uses_the_winners(tmp_path, monkeypatch):
+    """Workers started together all find no partial, and each makes one (mia-evals' copy of this
+    pattern, 2026-10-05: one of nine lost zarr's look-then-create race and crashed). Replays the
+    worst order: another worker publishes its partial, and predicts its share into it, while this
+    one is still building its own. This one's copy must be discarded and the other's used,
+    attributes and all, and the artifact must still be the whole-region prediction bit for bit."""
+    import prediction.blockwise as blockwise
+
+    real = blockwise.create_ome_artifact
+    built = []
+
+    def create(where, *args, **kwargs):
+        level = real(where, *args, **kwargs)
+        built.append(where)
+        if len(built) == 1:                     # the worker started alongside gets there first
+            assert _predict(tmp_path, worker=1, workers=2) is None
+        return level
+
+    monkeypatch.setattr(blockwise, "create_ome_artifact", create)
+    assert _predict(tmp_path, worker=0, workers=2) == tmp_path / "v.zarr"
+    assert len(built) == 2 and not any(where.exists() for where in built)
+    assert not list(tmp_path.glob(".v.zarr.partial.*"))
+    group = zarr.open_group(str(tmp_path / "v.zarr"), mode="r")
+    assert np.array_equal(_bits(group["s0"][:]), _bits(_whole()))
+    attrs = dict(group.attrs)
+    assert attrs["kind"] == "affinity" and attrs["ome"]["multiscales"][0]["name"] == "v.zarr"
+    assert attrs["blockwise"]["blocks"] == 3 * 3 * 2
+
+
+def test_the_plan_is_written_once_and_never_replaced(tmp_path):
+    """Every worker that finds no plan writes one. Replacing a plan that is there would swap the
+    file under a worker on another node reading it, which NFS answers with ESTALE (seen in a
+    stress test, 2026-10-05): the first plan stays, the same file, and no temporary is left."""
+    from prediction.blockwise import _write_json_once
+
+    path = tmp_path / "plan.json"
+    _write_json_once(path, {"plan": 1})
+    inode = path.stat().st_ino
+    _write_json_once(path, {"plan": 2})
+    assert json.loads(path.read_text()) == {"plan": 1} and path.stat().st_ino == inode
+    assert [p.name for p in tmp_path.iterdir()] == ["plan.json"]
+
+
+def test_a_failed_publish_raises_and_leaves_no_copy_behind(tmp_path, monkeypatch):
+    """Only "another worker's partial is there" is a lost race; any other failure of the rename is
+    an error, and the copy built for it must not be left in the output directory."""
+    import prediction.blockwise as blockwise
+
+    def refuse(source, target):
+        raise PermissionError(13, "Permission denied", str(target))
+
+    monkeypatch.setattr(blockwise.os, "rename", refuse)
+    with pytest.raises(PermissionError):
+        _predict(tmp_path)
+    assert not (tmp_path / "v.zarr.partial").exists()
+    assert not list(tmp_path.glob(".v.zarr.partial.*"))
+
+
 def test_a_rerun_runs_only_the_blocks_not_marked_done(tmp_path):
     boxes = block_boxes(_Grid.output_shape, BLOCK, CHUNKS[1:])
     first = _Algorithm()

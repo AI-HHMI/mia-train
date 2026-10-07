@@ -291,8 +291,21 @@ class VolumeGrid:
         # reimplementation would be a second transform chain to keep in step with the one that
         # produced the training data.
         single = config.model_copy(update={"volumes": [volume]})
-        info = VolumeDataset(single)._volumes[0]
+        resolved = VolumeDataset(single)._volumes
+        if len(resolved) != 1:
+            # A `fixed_axes` value listing several indices makes miao expand the entry into one
+            # volume per frame; taking the first would predict one frame under the entry's name.
+            raise SystemExit(
+                f"volume {volume_name!r} pins several indices with fixed_axes "
+                f"{volume.fixed_axes}, which miao expands into {len(resolved)} volumes; a "
+                "prediction is one volume, so give each frame its own entry"
+            )
+        info = resolved[0]
         self.info = info
+        # The frame a time series is read at, {axis: index}; empty for an ordinary volume. Read
+        # from the resolved entry, where miao has normalised a range like "10:11" to 10. The
+        # installed miao may predate `fixed_axes`, in which case nothing can be pinned.
+        self.fixed_axes: dict[str, int] = dict(getattr(info.config, "fixed_axes", None) or {})
         self.axes: str = info.img_spatial_axes
         self.patch = list(patch)
         self.rank = len(self.axes)
@@ -430,11 +443,20 @@ class VolumeGrid:
         produced the training data. It is also the only thing that works on every store in the
         corpus: `em-drosophila-flyem-hemibrain` carries an illegal top-level `_source` key in its
         group metadata, which zarr-python refuses and tensorstore ignores.
+
+        A volume pinned with `fixed_axes` is described by miao's metadata with the pinned axes
+        already removed, so the handle has to drop them the same way: `fixed_index` says where each
+        sits in this array and which index it takes at this level.
         """
         from miao.store import open_store
 
+        path = Path(self.volume.path) / key / f"s{level}"
+        if not self.fixed_axes:
+            # The call the installed miao accepts whether or not it knows `fixed_axes`.
+            return open_store(path, self.volume.zarr_version, self.context)
+        meta = self.info.image_meta if key == self.volume.image_key else self.info.label_meta
         return open_store(
-            Path(self.volume.path) / key / f"s{level}", self.volume.zarr_version, self.context
+            path, self.volume.zarr_version, self.context, meta.scales[level].fixed_index
         )
 
     def image_handle(self) -> Any:

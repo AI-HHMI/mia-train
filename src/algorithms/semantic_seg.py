@@ -20,8 +20,10 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.nn.functional import all_reduce
 from torch.utils.checkpoint import checkpoint
 
 from data.base import BaseDataset
@@ -31,6 +33,22 @@ from models.base import BaseModel
 from .base import BaseAlgorithm
 from .dense.decoding import DenseDecoding
 from .registry import AlgorithmRegistry
+
+#: muvit2-experiments' `MulticlassDiceLoss` default. It matters only for a class with nothing
+#: labelled and nothing predicted, whose ratio it makes a perfect 1 rather than 0/0.
+DICE_SMOOTH = 1e-6
+
+
+def _sum_over_ranks(tensor: torch.Tensor) -> torch.Tensor:
+    """Sum across every process, carrying the gradient back to each; unchanged on one process.
+
+    With data parallelism that is the global batch. Ranks that hold the same sample under tensor
+    parallelism add identical sums, which scales a class's overlap and both its masses alike and
+    leaves the Dice ratio unchanged.
+    """
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        return all_reduce(tensor)
+    return tensor
 
 
 @AlgorithmRegistry.register("semantic_seg")
@@ -85,6 +103,15 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
 
     `checkpoint_decoder` recomputes the head in the backward pass when the volume is decoded whole;
     with `decode_chunks > 1` every slab already is.
+
+    `dice_weight` adds a soft Dice term: `loss = cross-entropy + dice_weight * mean_c (1 - Dice_c)`,
+    over the classes other than 0. Per class, the softmax mass on the class's own voxels, the
+    class's whole softmax mass and its voxel count are summed over the supervised voxels of the
+    *global* batch -- every slab and every rank -- before the ratio is taken. That is the loss
+    muvit2-experiments trains its segmentation with (`MaskedCCEDiceLoss`, `dice_batch`, class 0 as
+    background), and the pooling is the point: scored crop by crop, a class absent from a crop
+    would cost it a full 1.0 however well it was predicted. 0, the default, leaves the loss
+    cross-entropy alone.
     """
 
     def __init__(
@@ -107,12 +134,16 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
         decoder_skip_layers: Sequence[int] | None = None,
         decoder_image_skip: bool = True,
         decode_chunks: int = 1,
+        dice_weight: float = 0.0,
     ) -> None:
         super().__init__(model, dataset)
         if num_classes < 2:
             raise ValueError(f"num_classes must be at least 2, got {num_classes}")
         if decode_chunks < 1:
             raise ValueError(f"decode_chunks must be at least 1, got {decode_chunks}")
+        if dice_weight < 0:
+            raise ValueError(f"dice_weight must be >= 0, got {dice_weight}")
+        self.dice_weight = dice_weight
 
         self.input_axes = self._resolve_input_axes(input_axes, dataset)
         self.input_key = input_key
@@ -233,6 +264,8 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
         cross-entropy and its normaliser (the supervised voxels, or their total class weight when
         `class_weights` is set -- `F.cross_entropy`'s own 'mean'), the correctly classified and the
         supervised voxels, and per class the intersection, the predicted and the labelled count.
+        With `dice_weight > 0`, three more per class from 1 on, with gradients: the softmax mass
+        on the class's voxels, its whole softmax mass, and its voxel count.
         """
         # `register_buffer` widens the attribute's static type to Tensor | Module; it is a
         # tensor or None by construction here.
@@ -251,9 +284,22 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
             intersection = torch.bincount(targets[hit], minlength=self.num_classes)
             predicted_count = torch.bincount(predicted, minlength=self.num_classes)
             labelled_count = torch.bincount(targets, minlength=self.num_classes)
+        dice: tuple[torch.Tensor, ...] = ()
+        if self.dice_weight > 0:
+            # At least float32 whatever the autocast: these are sums over millions of voxels.
+            probs = scores.to(torch.promote_types(scores.dtype, torch.float32)).softmax(dim=1)
+            probs = probs[:, 1:]
+            classes = torch.arange(1, self.num_classes, device=labels.device)
+            member = labels.unsqueeze(1) == classes.view(1, -1, *([1] * (labels.dim() - 1)))
+            dims = (0, *range(2, probs.dim()))
+            dice = (
+                (probs * member).sum(dim=dims),
+                (probs * valid.unsqueeze(1)).sum(dim=dims),
+                member.sum(dim=dims).to(probs.dtype),
+            )
         return (
             loss_sum, normaliser, hit.sum(), valid.sum(),
-            intersection, predicted_count, labelled_count,
+            intersection, predicted_count, labelled_count, *dice,
         )
 
     def _slab_terms(
@@ -308,15 +354,20 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
             totals = sums
         return self._metrics(totals)
 
-    @staticmethod
-    def _metrics(totals: tuple[torch.Tensor, ...]) -> dict[str, torch.Tensor]:
+    def _metrics(self, totals: tuple[torch.Tensor, ...]) -> dict[str, torch.Tensor]:
         """`_terms`' sums over the whole volume -> the loss and the logged metrics."""
-        loss_sum, normaliser, correct, supervised, intersection, predicted, labelled = totals
+        loss_sum, normaliser, correct, supervised, intersection, predicted, labelled, *dice = totals
         # A batch in which every voxel is ignored has nothing to learn from. Dividing its summed
         # cross-entropy -- zero, over no voxels -- by 1 rather than by its zero normaliser keeps the
         # loss at exactly 0 with a defined gradient, where a mean would be 0/0 and turn every
         # parameter it reaches into NaN.
         loss = loss_sum / torch.where(normaliser > 0, normaliser, torch.ones_like(normaliser))
+        parts: dict[str, torch.Tensor] = {}
+        if dice:
+            overlap, mass, count = (_sum_over_ranks(term) for term in dice)
+            dice_loss = (1 - (2 * overlap + DICE_SMOOTH) / (mass + count + DICE_SMOOTH)).mean()
+            parts = {"cross_entropy": loss.detach(), "dice_loss": dice_loss.detach()}
+            loss = loss + self.dice_weight * dice_loss
         with torch.no_grad():
             # NaN when nothing is supervised: there is no voxel to have got right.
             accuracy = correct / supervised
@@ -332,6 +383,7 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
             "pixel_accuracy": accuracy,
             "mean_iou": mean_iou,
             "classes_present": present.sum().float(),
+            **parts,
         }
 
     def training_step(self, batch: Any) -> dict[str, torch.Tensor]:
