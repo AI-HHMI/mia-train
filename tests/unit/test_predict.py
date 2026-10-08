@@ -515,6 +515,144 @@ def test_the_dense_predictor_is_byte_identical_to_the_bare_dense_path():
     }
 
 
+class _ClassScores(_DenseAlgorithm):
+    """Five classes scored from the input, so the winning class changes from voxel to voxel."""
+
+    prediction_kind = "class_scores"
+    prediction_channels = 5
+    squash_convention = "softmax over classes"
+
+    def logits(self, volumes):
+        x = volumes[:, 0]
+        return torch.stack([torch.sin(7 * k * x + k) for k in range(5)], dim=1)
+
+    @staticmethod
+    def squash(logits):
+        return torch.softmax(logits, dim=1)
+
+
+@pytest.mark.unit
+def test_argmax_ranks_the_blended_scores_without_blending_them():
+    """`--argmax` writes the argmax of the float32 blended mean -- the two fake tiles overlap, so
+    the blend matters -- as uint8, kind class_labels."""
+    from prediction.dense import DensePredictor, accumulate, predict_volume
+
+    algorithm, device, grid = _ClassScores(), torch.device("cpu"), _FakeGrid()
+    total, weight, _ = accumulate(algorithm, grid, device, (0, 0, 0), grid.output_shape,
+                                  progress=False)
+    expected = (total / weight).argmax(axis=0)
+
+    labels = predict_volume(algorithm, _FakeGrid(), device, argmax=True)
+    assert labels.dtype == np.uint8 and labels.shape == grid.output_shape
+    assert np.array_equal(labels, expected)
+    assert len(np.unique(labels)) > 1, "a constant labelling would pass for the wrong reason"
+
+    wrapped = DensePredictor(algorithm, argmax=True).run(_FakeGrid(), device)
+    assert np.array_equal(wrapped.array, labels)
+    assert wrapped.kind == "class_labels"
+    assert wrapped.attrs == {
+        "convention": "argmax of the softmax over classes, blended in that space",
+        "classes": 5,
+        "background_id": 0,
+        "model_axes": "zyx",
+    }
+
+
+@pytest.mark.unit
+def test_argmax_classes_matches_numpy_across_slabs_and_widens_past_256_classes():
+    from prediction.dense import argmax_classes
+
+    rng = np.random.default_rng(0)
+    few = rng.random((3, 37, 2, 5), dtype=np.float32)       # slabs of 2 rows, the last of 1
+    assert argmax_classes(few).dtype == np.uint8
+    assert np.array_equal(argmax_classes(few), few.argmax(axis=0))
+    many = rng.random((300, 5, 2, 2), dtype=np.float32)
+    assert argmax_classes(many).dtype == np.uint16
+    assert np.array_equal(argmax_classes(many), many.argmax(axis=0))
+
+
+@pytest.mark.unit
+def test_argmax_is_refused_for_channels_that_are_not_classes():
+    from prediction.dense import DensePredictor
+
+    with pytest.raises(SystemExit, match="ranks class scores.*'affinity'"):
+        DensePredictor(_DenseAlgorithm(), argmax=True)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("flags, message", [
+    (["--no-truth", "--truth-only"], "would write nothing"),
+    (["--argmax", "--truth-only"], "makes none"),
+    (["--argmax", "--block", "64"], "whole-region path"),
+])
+def test_output_flags_that_contradict_each_other_are_refused(tmp_path, monkeypatch, flags, message):
+    import predict
+
+    monkeypatch.setattr("sys.argv", ["predict.py", str(tmp_path), "--data-config",
+                                     str(tmp_path / "unread.yaml"), "--out", str(tmp_path / "out"),
+                                     *flags])
+    with pytest.raises(SystemExit, match=message):
+        predict.main()
+
+
+@pytest.mark.unit
+def test_volumes_without_labels_need_no_truth_and_are_told_before_the_model_loads(
+    tmp_path, monkeypatch
+):
+    import yaml
+
+    import predict
+
+    config = tmp_path / "unlabeled.yaml"
+    config.write_text(yaml.safe_dump({
+        "resolutions": [[8.0, 8.0, 8.0]], "output_axes": "lczyx", "patch_size": [64, 64, 64],
+        "volumes": [{"name": "a", "path": str(tmp_path / "a.zarr"), "image_key": "raw"}],
+    }))
+    argv = ["predict.py", str(tmp_path / "no_run"), "--data-config", str(config),
+            "--out", str(tmp_path / "out")]
+    monkeypatch.setattr("sys.argv", argv)
+    with pytest.raises(SystemExit, match="no label_key.*--no-truth"):
+        predict.main()
+    assert not (tmp_path / "out").exists()
+    # With the flag the run gets past the check, as far as looking for the model.
+    monkeypatch.setattr("sys.argv", [*argv, "--no-truth"])
+    with pytest.raises(FileNotFoundError, match="resolved_config.json"):
+        predict.main()
+
+
+@pytest.mark.unit
+def test_without_truth_only_the_prediction_is_written(tmp_path, monkeypatch):
+    import predict
+    from prediction.types import VolumePrediction
+
+    class _Grid:
+        rank = 3
+        reads = 0
+
+        def read_ground_truth(self):
+            _Grid.reads += 1
+            return np.zeros((4, 4, 4), dtype=np.int64)
+
+    class _Predictor:
+        def run(self, grid, device):
+            return VolumePrediction(np.zeros((4, 4, 4), np.uint8), "class_labels", {})
+
+    written: list[Path] = []
+    monkeypatch.setattr(predict, "resolve_patch", lambda *args: [4, 4, 4])
+    monkeypatch.setattr(predict, "VolumeGrid", lambda *args, **kwargs: _Grid())
+    monkeypatch.setattr(predict, "ome_geometry", lambda grid: {})
+    monkeypatch.setattr(predict, "shared_attrs", lambda *args: {})
+    monkeypatch.setattr(predict, "write_ome_artifact",
+                        lambda path, array, **kwargs: written.append(path) or path)
+    run = (None, "v", tmp_path, tmp_path, tmp_path / "c.yaml", 0, {}, _Predictor(),
+           torch.device("cpu"), None)
+
+    predict.run_volume(*run, write_truth=False)
+    assert written == [tmp_path / "v.zarr"] and _Grid.reads == 0
+    predict.run_volume(*run)
+    assert written[1:] == [tmp_path / "v.zarr", tmp_path / "v.gt.zarr"] and _Grid.reads == 1
+
+
 @pytest.mark.unit
 def test_axes_are_matched_by_name_and_an_affinity_channel_follows_its_axis():
     from prediction.grid import AxisOrder

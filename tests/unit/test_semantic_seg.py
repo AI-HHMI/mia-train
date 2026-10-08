@@ -127,6 +127,24 @@ def test_ignored_voxels_leave_the_loss_and_the_metrics():
 
 
 @pytest.mark.unit
+def test_ignored_labels_leave_the_loss_and_the_metrics_like_the_ignore_index():
+    """As for CellMap's all-organelles crops, where 0 is unannotated and a composite id names no
+    single class: an id in `ignore_labels` counts exactly as a voxel labelled `ignore_index`."""
+    batch = _batch()
+    relabelled = batch["label"].clone()
+    relabelled[(relabelled == 0) | (relabelled == 2)] = IGNORE
+    expected = _algorithm("linear").training_step({**batch, "label": relabelled})
+    algorithm = _algorithm("linear", ignore_labels=(2, 0))
+    reported = algorithm.training_step(batch)
+
+    assert {k: _value(v) for k, v in reported.items()} == {
+        k: _value(v) for k, v in expected.items()
+    }
+    # Configuration, not state: a checkpoint written with or without it loads either way.
+    assert "ignored_ids" not in algorithm.state_dict()
+
+
+@pytest.mark.unit
 def test_a_batch_with_nothing_supervised_has_a_zero_loss_and_finite_gradients():
     """0/0 would be NaN, and a NaN loss would turn every parameter it reaches into NaN."""
     algorithm = _algorithm("subpixel")

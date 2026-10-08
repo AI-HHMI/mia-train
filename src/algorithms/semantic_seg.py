@@ -55,15 +55,20 @@ def _sum_over_ranks(tensor: torch.Tensor) -> torch.Tensor:
 class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
     """Per-voxel class prediction from an encoder's patch tokens.
 
-    `num_classes` is the size of the label vocabulary including background at index 0. CellMap
-    ids are sparse -- a crop uses a dozen of the ~60 -- so this is the id space, not the number of
-    classes present in any one crop.
+    `num_classes` is the size of the label vocabulary including background at index 0, and every
+    label id must be below it. CellMap ids are sparse -- its combined all-organelles labelling uses
+    ids 1 to 74 -- so this is the id space (75 there), not the number of classes present in any one
+    crop.
 
-    `ignore_index` excludes voxels from the loss. It defaults to -1, which never occurs in a uint8
-    label volume, so by default every voxel is supervised and background is a class like any
-    other. That is the right reading for CellMap, where 0 means "annotated, and not one of these
-    organelles" rather than "unannotated". Where a label volume does mark unannotated voxels, set
-    it to their value: they are then left out of the loss and of every metric.
+    `ignore_index` excludes voxels from the loss and from every metric. It defaults to -1, which no
+    uint8 label volume holds, so by default every voxel is supervised and 0 is a class like any
+    other; -1 is also the value miao's `label_fill` conventionally gives the part of a window
+    outside its label crop, which is then left out with no further setting. `ignore_labels` leaves
+    out more ids the same way. What 0 means depends on the label set, not on its source: in CMCT,
+    three CellMap classes on crops annotated for exactly those, 0 is "annotated, and none of the
+    three" and is learned like any class; in CellMap's all-organelles crops every annotated voxel
+    carries a class, so 0 is unannotated, and a composite id (a whole organelle where its parts
+    were not painted) names no single class -- both belong in `ignore_labels` there.
 
     `class_weights` reweights the loss per class. Dense EM segmentation is severely imbalanced --
     background dominates and small organelles are rare -- so a run that optimises plain accuracy
@@ -124,6 +129,7 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
         num_classes: int = 64,
         decoder_hidden_dim: int = 128,
         ignore_index: int = -1,
+        ignore_labels: Sequence[int] = (),
         class_weights: tuple[float, ...] | list[float] | None = None,
         checkpoint_decoder: bool = False,
         decoder: str = "interpolate",
@@ -150,6 +156,12 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
         self.label_key = label_key
         self.num_classes = num_classes
         self.ignore_index = ignore_index
+        # A buffer so it follows the module to the GPU; not persistent, since which ids a run leaves
+        # out is configuration, and a checkpoint written with or without them loads either way.
+        self.register_buffer(
+            "ignored_ids", torch.tensor(sorted({int(i) for i in ignore_labels}), dtype=torch.long),
+            persistent=False,
+        )
         self.checkpoint_decoder = checkpoint_decoder
         self.decode_chunks = decode_chunks
         self.encoder = model
@@ -205,7 +217,7 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
         return axes
 
     def _prepare_labels(self, labels: torch.Tensor) -> torch.Tensor:
-        """(B, *label axes) -> (B, *spatial) int64.
+        """(B, *label axes) -> (B, *spatial) int64, with `ignore_labels` set to `ignore_index`.
 
         Labels carry the level axis but not the channel axis -- there is one class per voxel, not
         one per channel -- so the level axis is located against the axis string with 'c' removed.
@@ -224,7 +236,11 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
                 f"semantic targets are single-scale, but this batch carries {levels} levels on "
                 f"axis 'l' (shape {tuple(labels.shape)})"
             )
-        return labels.squeeze(level_dim).long()
+        labels = labels.squeeze(level_dim).long()
+        ignored: torch.Tensor = self.ignored_ids  # type: ignore[assignment]
+        if ignored.numel():
+            labels = labels.masked_fill(torch.isin(labels, ignored), self.ignore_index)
+        return labels
 
     #: See `affinity_seg.prediction_kind`. Per-voxel class scores, so a predictor writes them as
     #: `class_scores` and an argmax -- not a threshold -- turns them into a labelling.

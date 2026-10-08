@@ -3,12 +3,19 @@
     python src/predict.py <run_dir> --data-config <miao.yaml> --out <dir> [--step N] [--volume <name>]
     python src/predict.py ... --block 1536 [--worker K --workers N]     # a region too large for RAM
     python src/predict.py ... --cover-box                             # tiles reach the box faces
+    python src/predict.py ... --no-truth --argmax                     # class labels alone
 
 Runs over every volume in the data config, or over the one named by `--volume`, and writes two
 artifacts per volume, on one shared grid:
 
     <dir>/<volume>.zarr        the prediction, kind from the algorithm
     <dir>/<volume>.gt.zarr     the co-registered ground truth, kind="instances"
+
+`--no-truth` writes the prediction alone: for a volume with no `label_key`, or one whose scorer
+reads its truth from the store -- mia-evals' semantic tasks, whose label crops are arrays placed by
+their own translation, which the ground-truth reader here does not apply. `--argmax` writes a
+class-score prediction as the class each voxel ranks first (`kind = "class_labels"`), at a fraction
+of the size and without the float16 copy blending would make (`prediction.dense`).
 
 Each is a single-level OME-Zarr 0.5 group -- the array at `s0`, the lattice voxel size and the
 physical position of the first voxel in the group's `multiscales` (`prediction.artifact`) -- so a
@@ -384,8 +391,10 @@ def run_volume(
     worker: int = 0,
     workers: int = 1,
     cover_box: bool = False,
+    write_truth: bool = True,
 ) -> None:
-    """Predict one volume (unless `predictor` is None) and write its ground truth beside it.
+    """Predict one volume (unless `predictor` is None) and write its ground truth beside it
+    (unless `write_truth` is False).
 
     With `block`, this worker's share of the volume's blocks instead, and no ground truth.
     """
@@ -424,6 +433,8 @@ def run_volume(
         print(f"wrote {path}  {array.shape} {array.dtype}", flush=True)
         del prediction, array
 
+    if not write_truth:
+        return
     truth = grid.read_ground_truth()
     instances = int((np.unique(truth) != 0).sum())
     truth = unsigned_labels(truth)
@@ -483,11 +494,25 @@ def main() -> None:
                              "the default centres the largest whole-tile lattice in the box. A "
                              "mia-evals table refuses rows that score different regions, so use "
                              "it where a task asks for it (NISB) or for a table's first rows")
+    parser.add_argument("--no-truth", action="store_true",
+                        help="write the prediction alone, without the ground-truth artifact: for "
+                             "volumes with no label_key, or whose scorer reads the truth from the "
+                             "store itself (mia-evals' semantic tasks)")
+    parser.add_argument("--argmax", action="store_true",
+                        help="for class scores: write the class each voxel ranks first, as a "
+                             "class_labels labelling, instead of every class's score -- a fraction "
+                             "of the size, and of the memory, since no float16 copy is blended")
     args = parser.parse_args()
     if args.block is None and (args.worker != 0 or args.workers != 1):
         raise SystemExit("--worker and --workers share out blocks, so they need --block")
     if args.block is not None and args.truth_only:
         raise SystemExit("--block is for predictions; the ground truth is not written in blocks")
+    if args.no_truth and args.truth_only:
+        raise SystemExit("--no-truth and --truth-only together would write nothing")
+    if args.argmax and args.truth_only:
+        raise SystemExit("--argmax ranks a prediction's class scores, and --truth-only makes none")
+    if args.argmax and args.block is not None:
+        raise SystemExit("--argmax needs the whole-region path; --block writes class scores")
 
     from miao.config import load_config
 
@@ -496,6 +521,17 @@ def main() -> None:
         raise SystemExit(
             f"{args.data_config} sets no `resolutions`, so there is no single target resolution to "
             "predict at. Resolution sampling is a training-time device."
+        )
+    names = volumes_to_predict(config, args.volume)
+    # Checked before the model loads: otherwise the first such volume's prediction is written and
+    # the run stops at its ground truth, with every later volume left unpredicted.
+    unlabeled = [v.name for v in config.volumes if v.name in names and v.label_key is None]
+    if unlabeled and not (args.no_truth or args.truth_only or args.block is not None):
+        raise SystemExit(
+            f"{len(unlabeled)} volume(s) have no label_key, so there is no ground truth to write "
+            f"beside their predictions ({', '.join(unlabeled[:3])}"
+            f"{', ...' if len(unlabeled) > 3 else ''}). Pass --no-truth to write the predictions "
+            "alone."
         )
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -516,15 +552,21 @@ def main() -> None:
                 f"--block needs the dense path, whose tiles are a weighted average; "
                 f"{type(predictor).__name__} reconciles its tiles its own way"
             )
+        if args.argmax:
+            if not isinstance(predictor, DensePredictor):
+                raise SystemExit(
+                    f"--argmax ranks the dense path's blended class scores; "
+                    f"{type(predictor).__name__} reconciles its tiles its own way"
+                )
+            predictor = DensePredictor(algorithm, argmax=True)
 
-    names = volumes_to_predict(config, args.volume)
     for index, name in enumerate(names, 1):
         if len(names) > 1:
             print(f"[{index}/{len(names)}] {name}", flush=True)
         run_volume(
             config, name, args.out, args.run_dir, args.data_config, step, resolved,
             predictor, device, args.patch, args.block, args.worker, args.workers,
-            args.cover_box,
+            args.cover_box, write_truth=not args.no_truth,
         )
         # One volume's blend buffers can be hundreds of GB; release them before the next.
         gc.collect()

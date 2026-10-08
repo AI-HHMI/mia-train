@@ -135,8 +135,25 @@ def blend(total: np.ndarray, weight: np.ndarray) -> np.ndarray:
     return blended
 
 
+def argmax_classes(total: np.ndarray) -> np.ndarray:
+    """The channel each voxel's summed scores rank first, as the narrowest unsigned type.
+
+    The argmax of `accumulate`'s weighted sums is that of their weighted mean -- a voxel's weight is
+    one positive number shared by all its channels -- so the float16 mean `blend` would write is
+    never made, and its rounding cannot move a near-tie. Taken a slab at a time, as `blend` divides,
+    so argmax's int64 indices never span the whole region.
+    """
+    labels = np.empty(total.shape[1:], dtype=np.min_scalar_type(total.shape[0] - 1))
+    slab = max(1, total.shape[1] // 16)
+    for start in range(0, total.shape[1], slab):
+        labels[start:start + slab] = total[:, start:start + slab].argmax(axis=0)
+    return labels
+
+
 @torch.no_grad()
-def predict_volume(algorithm: Any, grid: VolumeGrid, device: torch.device) -> np.ndarray:
+def predict_volume(
+    algorithm: Any, grid: VolumeGrid, device: torch.device, *, argmax: bool = False
+) -> np.ndarray:
     """Blended predictions over the aligned region -> (channels, *output) float16.
 
     Channels, the squashing applied before blending, and the forward pass all come from the
@@ -145,6 +162,9 @@ def predict_volume(algorithm: Any, grid: VolumeGrid, device: torch.device) -> np
     Squashed *before* blending, not after: overlapping tiles are averaged in the stored
     representation. A weighted mean of logits is not the logit of a weighted mean of probabilities,
     so the order is part of the convention and is recorded with the data.
+
+    With `argmax`, the channel each voxel's blended scores rank first instead, (*output) unsigned
+    (`argmax_classes`): for class scores, the labelling they imply, at a fraction of the size.
     """
     print(f"{len(grid.tiles)} tiles of {grid.patch} -> output {grid.output_shape} at "
           f"{[round(v, 3) for v in grid.effective_voxel]} nm/voxel ({grid.axes}); "
@@ -154,7 +174,7 @@ def predict_volume(algorithm: Any, grid: VolumeGrid, device: torch.device) -> np
     total, weight, _ = accumulate(
         algorithm, grid, device, (0,) * len(grid.output_shape), tuple(grid.output_shape)
     )
-    return blend(total, weight)
+    return argmax_classes(total) if argmax else blend(total, weight)
 
 
 #: What a dense strategy declares. `input_axes` is the axis order it was trained on (tiles are
@@ -171,9 +191,12 @@ class DensePredictor:
     itself moving. That path is what every scored run in this repo was produced with, and
     `tests/unit/test_predict.py` pins this wrapper's output as byte-identical to calling it
     directly.
+
+    With `argmax`, a class-score strategy's prediction is written as the labelling it implies,
+    `kind = "class_labels"` (`predict_volume(argmax=True)`).
     """
 
-    def __init__(self, algorithm: Any) -> None:
+    def __init__(self, algorithm: Any, argmax: bool = False) -> None:
         missing = [name for name in DENSE_PROTOCOL if not hasattr(algorithm, name)]
         if getattr(algorithm, "prediction_kind", None) == "affinity" and not hasattr(
                 algorithm, "offsets"):
@@ -185,11 +208,17 @@ class DensePredictor:
                 "`affinity_seg` for the members required, or have the strategy return its own "
                 "`volume_predictor()`."
             )
+        if argmax and algorithm.prediction_kind != "class_scores":
+            raise SystemExit(
+                f"--argmax ranks class scores, but {type(algorithm).__name__} predicts "
+                f"{algorithm.prediction_kind!r}, whose channels are not classes"
+            )
         self.algorithm = algorithm
+        self.argmax = argmax
 
     @property
     def kind(self) -> str:
-        return str(self.algorithm.prediction_kind)
+        return "class_labels" if self.argmax else str(self.algorithm.prediction_kind)
 
     @property
     def attrs(self) -> dict[str, Any]:
@@ -197,13 +226,24 @@ class DensePredictor:
 
         `model_axes` is the axis order the model was handed its tiles in; the artifact itself is
         in the store's. An affinity artifact also states its `offsets`, one per channel along the
-        store's axes, so a consumer can check the layout it assumes rather than trust it.
+        store's axes, so a consumer can check the layout it assumes rather than trust it. A class
+        labelling (`argmax`) states how many `classes` it was ranked from, and `background_id`,
+        class 0, which mia-evals requires of a labelling.
         """
         channels = int(self.algorithm.prediction_channels)
+        model_axes = "".join(a for a in self.algorithm.input_axes if a in "xyz")
+        if self.argmax:
+            return {
+                "convention": f"argmax of the {self.algorithm.squash_convention}, blended in "
+                              "that space",
+                "classes": channels,
+                "background_id": 0,
+                "model_axes": model_axes,
+            }
         attrs: dict[str, Any] = {
             "convention": f"{self.algorithm.squash_convention}, blended in that space",
             "channels": channels,
-            "model_axes": "".join(a for a in self.algorithm.input_axes if a in "xyz"),
+            "model_axes": model_axes,
         }
         if self.algorithm.prediction_kind == "affinity":
             attrs["offsets"] = [[int(v) for v in o] for o in self.algorithm.offsets[:channels]]
@@ -211,7 +251,8 @@ class DensePredictor:
 
     def run(self, grid: VolumeGrid, device: torch.device) -> VolumePrediction:
         return VolumePrediction(
-            array=predict_volume(self.algorithm, grid, device), kind=self.kind, attrs=self.attrs
+            array=predict_volume(self.algorithm, grid, device, argmax=self.argmax),
+            kind=self.kind, attrs=self.attrs,
         )
 
 
