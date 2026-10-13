@@ -69,6 +69,25 @@ def test_build_dataloader_partitions_across_ranks_without_overlap():
 
 
 @pytest.mark.unit
+def test_shuffled_order_follows_the_seed():
+    """The shuffled order follows `seed`, and for one seed the ranks still split it without
+    overlap: every rank draws the same permutation and takes its own share of it."""
+    dataset = _DummyDataset(n=10)
+
+    def order(seed: int, rank: int = 0, world_size: int = 1) -> list[int]:
+        loader = dataset.build_dataloader(
+            batch_size=1, rank=rank, world_size=world_size, drop_last=False, seed=seed
+        )
+        return [int(batch.item()) for batch in loader]
+
+    assert order(0) == order(0)
+    assert order(0) != order(1)
+    rank0, rank1 = order(1, rank=0, world_size=2), order(1, rank=1, world_size=2)
+    assert set(rank0).isdisjoint(rank1)
+    assert set(rank0) | set(rank1) == set(range(10))
+
+
+@pytest.mark.unit
 def test_registry_register_and_build():
     DataRegistry.register("dummy")(_DummyDataset)
 

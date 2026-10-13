@@ -131,6 +131,8 @@ class Trainer:
             num_workers=config.num_workers,
             persistent_workers=config.persistent_workers,
             prefetch_factor=config.prefetch_factor,
+            # The sampler's shuffled order follows the run's seed too, identical on every rank.
+            seed=config.seed,
         )
         self.val_loader = (
             val_dataset.build_dataloader(

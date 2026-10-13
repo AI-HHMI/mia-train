@@ -174,12 +174,16 @@ class BaseDataset(abc.ABC):
         drop_last: bool = True,
         persistent_workers: bool = False,
         prefetch_factor: int = 2,
+        seed: int = 0,
     ) -> data.DataLoader:
         # torch's `DistributedSampler.__init__` stub takes an unparameterized
         # `Dataset` for its `dataset` arg, so mypy can't infer the sampler's type
         # parameter from the call; annotate it explicitly instead.
+        #
+        # `seed` sets the shuffled order, which every rank must draw identically: each takes its
+        # own share of one permutation, so it is the run's seed, never a per-rank one.
         sampler: data.DistributedSampler[Any] = data.DistributedSampler(
-            self.dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
+            self.dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, seed=seed
         )
         return data.DataLoader(
             self.dataset,
