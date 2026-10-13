@@ -141,6 +141,6 @@ done
 echo
 echo "artifacts land in $OUT_ROOT/{test,finetune}/<volume>{,.gt}.zarr"
 echo "then, in mia-evals:"
-echo "  mia-evals score configs/lmd_ssl_v1_neuron_instance/cc_threshold.toml \\"
+echo "  mia-evals score configs/lmd_ssl_v1_neuron_instance/cc_threshold_size_filter.toml \\"
 echo "      --test $OUT_ROOT/test --val $OUT_ROOT/finetune --run-dir $run"
 echo "  (the record is named <run>.step<N>.<route> by mia-evals; there is no --label)"

@@ -65,8 +65,6 @@ class Trainer:
             photometric if photometric is not None and photometric.enabled() else None
         )
 
-        torch.manual_seed(config.seed)
-
         # Tensor parallelism, then activation checkpointing, then sharding — in that order, and
         # each boundary is load-bearing.
         #
@@ -113,6 +111,19 @@ class Trainer:
         self._forward = torch.compile(self.algorithm) if config.compile else self.algorithm
 
         dp_rank = self.dims.dp_rank(mesh) if mesh is not None else 0
+        # Seeded per data-parallel rank, once everything that must be identical on every rank
+        # exists (`build_trainer` initialised the model under `config.seed` alone). Everything
+        # drawn from here on must differ between ranks: the DataLoader takes each epoch's worker
+        # seeds from this generator, and a dataset that samples at random rather than by index
+        # (miao's `sampling: random`) would otherwise draw the same crops on every rank -- one
+        # sample, copied dp_world_size times -- as would the augmentation and masks drawn on the
+        # device. The ranks of one tensor-parallel group share a data-parallel rank, so they still
+        # see one batch. Rank 0 keeps `config.seed` itself, so a single-GPU run draws what it
+        # always did. The stride is the 32-bit golden ratio, not a power of two: torch's CPU
+        # generator keeps only a seed's low 32 bits (seeds 5 and 5 + 2**32 draw identically),
+        # and this odd stride keeps the seeds of distinct (seed, rank) pairs millions apart for
+        # every seed and rank count in use.
+        torch.manual_seed((config.seed + dp_rank * 0x9E3779B9) % 2**32)
         self.train_loader = train_dataset.build_dataloader(
             batch_size=config.batch_size,
             rank=dp_rank,

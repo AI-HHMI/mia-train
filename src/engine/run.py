@@ -242,6 +242,12 @@ def build_trainer(
     layout instead of having it restated in its own config section where the two could drift
     (see `BaseAlgorithm`).
     """
+    # Before anything is built, so the random initialisation of the model and of the algorithm's
+    # own parameters (a decoder, a head) follows `trainer.seed` and is the same on every rank.
+    # Seeded only in `Trainer` -- after all of this -- the initialisation drew from whatever
+    # state the generator was left in, which the seed never reached. `Trainer` reseeds per
+    # data-parallel rank for what must differ between ranks.
+    torch.manual_seed(config.trainer.seed)
     train_dataset = DataRegistry.build(config.data.name, **config.data.kwargs)
     device_augment: BatchPhotometric | DeviceAugmentation = BatchPhotometric()
     if config.augment.enabled():

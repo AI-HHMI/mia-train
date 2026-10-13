@@ -7,7 +7,8 @@
 #   bash experiments/gary_comparison/score.sh 1a_dinov3_axial_subpixel 500000 --routes mws
 #
 # Data configs and scoring configs live in mia-evals under the task's own directory
-# (configs/gary_comparison_neuron_instance/{mws,cc_threshold}.toml and .../data/{fit,test}.yaml), so
+# (configs/gary_comparison_neuron_instance/{mws_size_filter,mws_size_filter_fill,cc_threshold_size_filter}.toml
+# and .../data/{fit,test}.yaml; named mws, mws_fill and cc_threshold before 2026-10-10), so
 # prediction and scoring read the same volume definitions. Predictions run on gpu_b300 like the training: the same code gives different
 # instance counts on a different GPU generation, so every arm is predicted on one architecture.
 #
@@ -78,9 +79,10 @@ dep="done(${deps[0]}) && done(${deps[1]})"
 #    <run>.step<N>.<route>; the scored labellings and scratch are filed under it.
 for route in $ROUTES; do
   case $route in
-    mws) cfg=configs/$TASK/mws.toml;          slots=32; wall=24:00 ;;   # ~4 G edges in memory per volume, ~2 h each
-    mws_fill) cfg=configs/$TASK/mws_fill.toml; slots=32; wall=24:00 ;;  # mws + holes refilled; 4x the fit candidates
-    cc)  cfg=configs/$TASK/cc_threshold.toml; slots=8;  wall=6:00;  route=cc_threshold ;;
+    # The keywords stay as they were; the route, the config's file name, names the record.
+    mws) cfg=configs/$TASK/mws_size_filter.toml; slots=32; wall=24:00; route=mws_size_filter ;;   # ~4 G edges in memory per volume, ~2 h each
+    mws_fill) cfg=configs/$TASK/mws_size_filter_fill.toml; slots=32; wall=24:00; route=mws_size_filter_fill ;;  # mws + holes refilled; 4x the fit candidates
+    cc)  cfg=configs/$TASK/cc_threshold_size_filter.toml; slots=8;  wall=6:00;  route=cc_threshold_size_filter ;;
     *) echo "unknown route $route (mws|mws_fill|cc)" >&2; exit 2 ;;
   esac
   rec="${RUN_NAME}.step${STEP}.${route}"

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -61,10 +63,30 @@ class _SyntheticDataset(BaseDataset):
         return _FixedDataset()
 
 
+class _RandomDraws(data.Dataset):
+    """Ignores the index and draws from numpy's global state, as miao's `sampling: random` does.
+
+    PyTorch reseeds that state in every DataLoader worker from the loader's base seed, so what a
+    rank's workers draw depends on that seed alone, not on the indices its sampler hands out.
+    """
+
+    def __len__(self) -> int:
+        return 32
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        return torch.from_numpy(np.random.standard_normal(8).astype(np.float32))
+
+
+class _RandomDrawsDataset(BaseDataset):
+    def build_dataset(self) -> data.Dataset:
+        return _RandomDraws()
+
+
 def _register_components() -> None:
     ModelRegistry.register("tiny")(_TinyModel)
     AlgorithmRegistry.register("reconstruct")(_ReconstructAlgorithm)
     DataRegistry.register("synthetic")(_SyntheticDataset)
+    DataRegistry.register("random_draws")(_RandomDrawsDataset)
 
 
 def _run_config(world_size: int, max_steps: int = 5) -> RunConfig:
@@ -102,6 +124,32 @@ def _build_from_registries_and_train(
     return before, after
 
 
+def _first_batch_of_random_draws(rank: int, world_size: int, output_dir: str) -> np.ndarray:
+    _register_components()
+    config = _run_config(world_size)
+    # One worker: PyTorch reseeds only worker processes, which is where every real run loads.
+    config = dataclasses.replace(
+        config,
+        data=ComponentConfig(name="random_draws"),
+        val_data=None,
+        trainer=dataclasses.replace(config.trainer, num_workers=1),
+    )
+    trainer = build_trainer(config, Path(output_dir), mesh=config.parallelism.build_mesh("cpu"))
+    return next(iter(trainer.train_loader)).numpy()
+
+
+def _parameters_after_unrelated_draws(
+    rank: int, world_size: int, output_dir: str, draws: int
+) -> list[np.ndarray]:
+    _register_components()
+    # Whatever ran before `build_trainer` -- here a rank- and run-dependent number of draws --
+    # leaves the global generator in its own state. The initialisation must not depend on it.
+    torch.rand(draws + rank)
+    config = _run_config(world_size)
+    trainer = build_trainer(config, Path(output_dir), mesh=config.parallelism.build_mesh("cpu"))
+    return [p.full_tensor().detach().numpy() for p in trainer.algorithm.parameters()]
+
+
 def _unregistered_model_name_raises(rank: int, world_size: int, output_dir: str) -> bool:
     _register_components()
     config = _run_config(world_size)
@@ -132,6 +180,35 @@ def test_build_from_registries_and_train(run_distributed):
         results = run_distributed(_build_from_registries_and_train, world_size=2, args=(tmp,))
     for before, after in results:
         assert after < before
+
+
+@pytest.mark.cpu_dist
+def test_ranks_draw_different_samples(run_distributed):
+    """A dataset that samples at random rather than by index gives each rank its own draws, and
+    the same ones again on a second run. Seeded alike, every rank's workers drew the same samples:
+    one sample per step, copied to every rank, whatever the sampler's indices said."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        first = run_distributed(_first_batch_of_random_draws, world_size=2, args=(tmp,))
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        again = run_distributed(_first_batch_of_random_draws, world_size=2, args=(tmp,))
+    assert not np.array_equal(first[0], first[1]), "both ranks drew the same batch"
+    for rank in range(2):
+        np.testing.assert_array_equal(first[rank], again[rank])
+
+
+@pytest.mark.cpu_dist
+def test_initialisation_follows_the_seed(run_distributed):
+    """The model's random initialisation follows `trainer.seed`, not the generator state left by
+    whatever ran before `build_trainer`: two runs that leave it in different states start from
+    the same parameters."""
+    results = []
+    for draws in (1, 5):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            results.append(run_distributed(
+                _parameters_after_unrelated_draws, world_size=2, args=(tmp, draws)
+            ))
+    for a, b in zip(results[0][0], results[1][0], strict=True):
+        np.testing.assert_array_equal(a, b)
 
 
 @pytest.mark.cpu_dist
