@@ -196,8 +196,13 @@ def fold_input_standardisation(
     return folded.to(weight.dtype), shifted.to(bias.dtype)
 
 
-def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size) -> torch.Tensor:
-    """A 2D patch-embedding kernel (E, C, kh, kw) -> a 3D one (E, C', kd, kh, kw).
+def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size, spatial_axes: str) -> torch.Tensor:
+    """A 2D patch-embedding kernel (E, C, kh, kw) -> a 3D one (E, C', *k), spatial dims ordered as
+    `spatial_axes` names them (DinoVisionTransformer3D: "xyz").
+
+    The axes are bound by name: the 2D kernel's rows go on y and its columns on x, so a z-section
+    is the 2D image I[y, x] -- the binding superposition RoPE makes -- and depth is z. It used to
+    follow position, which under "xyz" spread the kernel along x and laid it on y-z planes.
 
     Two independent adjustments:
 
@@ -223,7 +228,11 @@ def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size) -> torch.Tensor:
             f"{tuple(target)}"
         )
     out_channels, in_channels, height, width = weight.shape
-    target_out, target_in, depth, target_height, target_width = target
+    target_out, target_in, *spatial = target
+    if sorted(spatial_axes) != ["x", "y", "z"]:
+        raise ValueError(f"spatial_axes must order x, y and z, got {spatial_axes!r}")
+    extent = dict(zip(spatial_axes, spatial, strict=True))
+    depth, target_height, target_width = extent["z"], extent["y"], extent["x"]
 
     if out_channels != target_out:
         raise ValueError(
@@ -256,11 +265,13 @@ def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size) -> torch.Tensor:
                 "summing to 1 channel or spreading 1 channel over several is defined"
             )
 
-    # (E, C, kh, kw) -> (E, C, kd, kh, kw), each z-slice carrying 1/kd of the original kernel.
-    # The cube is built at the checkpoint's kernel size (depth * ratio) and only then resized, so
-    # the depth normalisation and the resize compose as two independent, exact steps.
+    # (E, C, kh, kw) -> (E, C, z, y, x), each z-slice carrying 1/kd of the original kernel, then
+    # into the target's own order. The cube is built at the checkpoint's kernel size
+    # (depth * ratio) and only then resized, so the depth normalisation and the resize compose as
+    # two independent, exact steps.
     cube = weight.unsqueeze(2).expand(-1, -1, depth * ratio, -1, -1) / (depth * ratio)
-    return resize_patch_kernel(cube, ratio).contiguous()
+    cube = resize_patch_kernel(cube, ratio)
+    return cube.permute(0, 1, *(2 + "zyx".index(axis) for axis in spatial_axes)).contiguous()
 
 
 def merge_lora_tensors(
@@ -398,7 +409,10 @@ def load_pretrained(
                 destination.copy_(source)
                 report.copied.append(name)
             elif inflate and source.ndim == 4 and destination.ndim == 5:
-                destination.copy_(inflate_2d_to_3d(source, destination.shape).to(destination.dtype))
+                destination.copy_(
+                    inflate_2d_to_3d(source, destination.shape, _spatial_axes_of(model, name))
+                    .to(destination.dtype)
+                )
                 report.inflated.append(name)
             else:
                 report.mismatched.append(
@@ -453,6 +467,24 @@ def load_pretrained(
         )
     _log_load(model, path, report)
     return report
+
+
+def _spatial_axes_of(model: nn.Module, name: str) -> str:
+    """The spatial axis order declared by the nearest module enclosing tensor `name`.
+
+    Inflation needs it to know which kernel dim is depth. DinoVisionTransformer3D declares it, and
+    a load into an algorithm reaches the encoder by a longer name (`model.patch_embed...`).
+    """
+    path = name
+    while path:
+        path = path.rpartition(".")[0]
+        axes = getattr(model.get_submodule(path), "spatial_axes", None)
+        if isinstance(axes, str):
+            return axes
+    raise ValueError(
+        f"cannot inflate {name} into {type(model).__name__}: no module holding it declares "
+        "`spatial_axes`, so which kernel dimension is depth (z) is unknown"
+    )
 
 
 def _fold_release_standardisation(

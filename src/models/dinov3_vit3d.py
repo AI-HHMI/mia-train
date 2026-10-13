@@ -9,12 +9,16 @@ each forward pass readable in terms of the axes it actually has.
 The one genuine choice a 3D model has to make is how depth enters the rotary embedding, which
 `pos_embed_rope_type` selects:
 
-  - `"vanilla"` gives depth its own third of the rotary channels, alongside height and width. The
+  - `"vanilla"` gives each of the three axes its own third of the rotary channels, alike. The
     natural choice when training from scratch on volumes.
   - `"superposition"` keeps the 2D channel layout exactly and adds a gated depth angle on top, so
     a pretrained 2D DINOv3 checkpoint's rotary buffers transfer unchanged and the model starts out
     numerically identical to its 2D self, learning how much depth to mix in. The natural choice
     when adapting 2D pretrained weights.
+
+Depth is the axis named z, and the input's spatial axes come as x, y, z (`spatial_axes`): the
+superposition gate and 2D->3D inflation put depth on z and the 2D model's rows and columns on y
+and x, while tensors, tokens and grids keep the input's order.
 
 Attention is global in every block by default, as upstream. `attn_window` makes blocks attend
 within windows of the patch grid -- blocks of it, or windows sliding tile by tile when
@@ -66,6 +70,14 @@ ROPE_TYPES = ("vanilla", "superposition")
 
 @ModelRegistry.register("dinov3_vit3d")
 class DinoVisionTransformer3D(BaseModel):
+    #: The order of the input's spatial axes, which tensors, tokens, grids and windows all keep.
+    #: Depth is the axis named z: superposition RoPE puts its gated angle there, and 2D->3D
+    #: inflation spreads the 2D kernel along it, with the 2D model's rows on y and columns on x
+    #: (`load_pretrained` reads this attribute). Fixed: every data config produces x, y, z, and
+    #: `prepare_input` refuses axes naming any other order. Depth used to follow position instead,
+    #: which under x, y, z gave it to x.
+    spatial_axes = "xyz"
+
     def __init__(
         self,
         *,
@@ -177,6 +189,7 @@ class DinoVisionTransformer3D(BaseModel):
         else:
             self.rope_embed = RopePositionEmbedding3DSuperposition(
                 embed_dim=embed_dim,
+                spatial_axes=self.spatial_axes,
                 num_heads=num_heads,
                 base=pos_embed_rope_base,
                 # Depth varies far more slowly than the in-plane axes in anisotropic volumes, so
@@ -499,7 +512,7 @@ class DinoVisionTransformer3D(BaseModel):
         return self.head(ret["x_norm_clstoken"])
 
     def patch_features(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
-        """(B, C, D, H, W) -> normalised patch tokens (B, N, embed_dim) and their grid.
+        """(B, C, X, Y, Z) -> normalised patch tokens (B, N, embed_dim) and their grid.
 
         CLS and storage tokens are dropped: they carry no position on the grid, so a dense head
         has nowhere to put them. The grid is read off the patch embedding rather than taken from
@@ -514,7 +527,7 @@ class DinoVisionTransformer3D(BaseModel):
     def layer_patch_features(
         self, x: torch.Tensor, layers: Sequence[int]
     ) -> tuple[list[torch.Tensor], tuple[int, int, int]]:
-        """(B, C, D, H, W) -> normalised patch tokens after each block in `layers`, and their grid.
+        """(B, C, X, Y, Z) -> normalised patch tokens after each block in `layers`, and their grid.
 
         Through `get_intermediate_layers(norm=True)`, DINOv3's own dense-evaluation path: every taken
         block's output passes the final norm, so the last block's tokens are exactly what
@@ -613,10 +626,22 @@ class DinoVisionTransformer3D(BaseModel):
         return ()
 
     def prepare_input(self, batch: torch.Tensor, axes: str) -> torch.Tensor:
-        """(B, *axes) -> (B, C, D, H, W). Single-scale: exactly one level per sample; see
+        """(B, *axes) -> (B, C, X, Y, Z). Single-scale: exactly one level per sample; see
         `models.base.single_scale_volumes`, the contract every single-scale 3D encoder shares.
+
+        The spatial axes must come in the order `spatial_axes` names, because this model binds
+        depth to the axis named z; any other order is refused rather than read positionally.
         """
-        return single_scale_volumes(self, batch, axes)
+        volumes = single_scale_volumes(self, batch, axes)
+        spatial = "".join(axis for axis in axes if axis in "xyz")
+        if spatial != self.spatial_axes:
+            raise ValueError(
+                f"{type(self).__name__} reads its spatial axes as {self.spatial_axes!r} -- z, the "
+                f"section axis, is its depth -- but the batch's axes are {axes!r}. Set the "
+                f"dataset's output_axes so that the spatial axes come as {self.spatial_axes!r} "
+                "(e.g. 'lcxyz')."
+            )
+        return volumes
 
     def extra_forward_methods(self) -> tuple[str, ...]:
         """Both are entry points in their own right: SSL training drives `forward_features`

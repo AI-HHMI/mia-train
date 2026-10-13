@@ -42,23 +42,43 @@ def _released_checkpoint(tmp_path, dataset="lvd1689m", **overrides):
 # ---------------------------------------------------------------- inflation
 
 
+def _section(volume_or_kernel: torch.Tensor) -> torch.Tensor:
+    """(..., x, y) -> (..., y, x): an x, y plane as the 2D image whose rows are y and columns x."""
+    return volume_or_kernel.transpose(-1, -2)
+
+
 @pytest.mark.unit
 def test_inflation_spreads_the_kernel_over_depth_and_normalises():
     weight = torch.randn(4, 1, 8, 8)
-    out = inflate_2d_to_3d(weight, torch.Size((4, 1, 8, 8, 8)))
+    out = inflate_2d_to_3d(weight, torch.Size((4, 1, 8, 8, 8)), "xyz")
 
     assert out.shape == (4, 1, 8, 8, 8)
-    # Every z-slice carries 1/depth of the original, so summing over z returns it exactly.
-    assert torch.allclose(out.sum(dim=2), weight, atol=1e-6)
-    assert torch.allclose(out[:, :, 0], weight / 8, atol=1e-6)
+    # Every z-slice carries 1/depth of the original, so summing over z returns it exactly, with the
+    # 2D rows on y and columns on x.
+    assert torch.allclose(_section(out.sum(dim=-1)), weight, atol=1e-6)
+    assert torch.allclose(_section(out[..., 0]), weight / 8, atol=1e-6)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("spatial_axes", ["xyz", "xzy", "yxz", "yzx", "zxy", "zyx"])
+def test_inflation_binds_depth_rows_and_columns_by_axis_name(spatial_axes):
+    """Depth is z and the 2D kernel's rows and columns are y and x, whatever order the target's
+    dims come in. It used to follow position, which under xyz spread the kernel along x."""
+    torch.manual_seed(0)
+    weight = torch.randn(4, 1, 8, 8)
+    out = inflate_2d_to_3d(weight, torch.Size((4, 1, 8, 8, 8)), spatial_axes)
+    as_zyx = out.permute(0, 1, *(2 + spatial_axes.index(axis) for axis in "zyx"))
+    assert torch.allclose(as_zyx, weight.unsqueeze(2).expand(-1, -1, 8, -1, -1) / 8, atol=1e-7)
 
 
 @pytest.mark.unit
 def test_inflation_sums_rgb_down_to_one_channel():
     """A grey image is an RGB image with equal channels, so its response is the channel sum."""
     weight = torch.randn(4, 3, 8, 8)
-    out = inflate_2d_to_3d(weight, torch.Size((4, 1, 8, 8, 8)))
-    assert torch.allclose(out.sum(dim=2), weight.sum(dim=1, keepdim=True), atol=1e-6)
+    out = inflate_2d_to_3d(weight, torch.Size((4, 1, 8, 8, 8)), "xyz")
+    assert torch.allclose(
+        _section(out.sum(dim=-1)), weight.sum(dim=1, keepdim=True), atol=1e-6
+    )
 
 
 @pytest.mark.unit
@@ -98,13 +118,14 @@ def test_an_rgb_release_sees_a_grey_volume_as_its_standardised_image(tmp_path, d
     rgb = (image.expand(-1, 3, -1, -1) - torch.tensor(mean).view(1, 3, 1, 1)) / torch.tensor(
         std
     ).view(1, 3, 1, 1)
-    volume = image.unsqueeze(2).expand(-1, -1, 32, -1, -1).contiguous()
+    # Constant along z, each z-section the image I[y, x]; the 3D tokens come out (x, y, z).
+    volume = _section(image).unsqueeze(-1).expand(-1, -1, -1, -1, 32).contiguous()
     with torch.no_grad():
         flat = model_2d.eval().patch_embed(rgb)
         solid = model_3d.eval().patch_embed(volume)
 
-    for z in range(solid.shape[1]):
-        assert torch.allclose(solid[0, z], flat[0], atol=1e-5)
+    for z in range(solid.shape[3]):
+        assert torch.allclose(solid[0, :, :, z], flat[0].transpose(0, 1), atol=1e-5)
 
 
 @pytest.mark.unit
@@ -121,9 +142,9 @@ def test_an_rgb_checkpoint_of_unknown_standardisation_is_refused(tmp_path):
 @pytest.mark.unit
 def test_inflation_rejects_a_larger_or_non_integer_in_plane_kernel():
     with pytest.raises(ValueError, match="in-plane kernel must match"):
-        inflate_2d_to_3d(torch.randn(4, 1, 8, 8), torch.Size((4, 1, 16, 16, 16)))   # larger
+        inflate_2d_to_3d(torch.randn(4, 1, 8, 8), torch.Size((4, 1, 16, 16, 16)), "xyz")  # larger
     with pytest.raises(ValueError, match="in-plane kernel must match"):
-        inflate_2d_to_3d(torch.randn(4, 1, 12, 12), torch.Size((4, 1, 8, 8, 8)))    # 1.5x
+        inflate_2d_to_3d(torch.randn(4, 1, 12, 12), torch.Size((4, 1, 8, 8, 8)), "xyz")   # 1.5x
 
 
 @pytest.mark.unit
@@ -133,8 +154,8 @@ def test_inflation_into_a_smaller_patch_sums_the_kernel_over_blocks():
     2x-upsampled (block-constant) patch."""
     torch.manual_seed(0)
     weight = torch.randn(4, 3, 16, 16)
-    small = inflate_2d_to_3d(weight, torch.Size((4, 1, 8, 8, 8)))
-    full = inflate_2d_to_3d(weight, torch.Size((4, 1, 16, 16, 16)))
+    small = inflate_2d_to_3d(weight, torch.Size((4, 1, 8, 8, 8)), "xyz")
+    full = inflate_2d_to_3d(weight, torch.Size((4, 1, 16, 16, 16)), "xyz")
     assert small.shape == (4, 1, 8, 8, 8)
     blocks = full.reshape(4, 1, 8, 2, 8, 2, 8, 2).sum(dim=(3, 5, 7))
     assert torch.allclose(small, blocks, atol=1e-6)
@@ -163,7 +184,43 @@ def test_a_2d_release_transfers_into_a_model_with_half_its_patch(tmp_path):
 @pytest.mark.unit
 def test_inflation_rejects_an_undefined_channel_mapping():
     with pytest.raises(ValueError, match="input channels"):
-        inflate_2d_to_3d(torch.randn(4, 3, 8, 8), torch.Size((4, 2, 8, 8, 8)))
+        inflate_2d_to_3d(torch.randn(4, 3, 8, 8), torch.Size((4, 2, 8, 8, 8)), "xyz")
+
+
+@pytest.mark.unit
+def test_inflating_into_an_algorithm_reads_the_axis_order_off_its_encoder(tmp_path):
+    """`[init] target = "algorithm"` loads into the algorithm, where the kernel is
+    `model.patch_embed.proj.weight`; the order comes from the encoder holding it."""
+    torch.manual_seed(0)
+    source = nn.Module()
+    source.model = DinoVisionTransformer(**{**DINO, "in_chans": 1})
+    path = tmp_path / "simmim_2d_run.pth"
+    torch.save(source.state_dict(), path)
+
+    algorithm = nn.Module()
+    algorithm.model = DinoVisionTransformer3D(in_chans=1, **DINO)
+    report = load_pretrained(algorithm, path, inflate=True, skip=["model.rope_embed."])
+
+    kernel = algorithm.model.patch_embed.proj.weight
+    assert report.inflated == ["model.patch_embed.proj.weight"]
+    assert torch.equal(
+        kernel, inflate_2d_to_3d(source.model.patch_embed.proj.weight, kernel.shape, "xyz")
+    )
+
+
+@pytest.mark.unit
+def test_inflating_into_a_module_that_declares_no_axis_order_is_refused(tmp_path):
+    """Which kernel dim is depth is a property of the model, not of the tensor's shape."""
+    path, _ = _released_checkpoint(tmp_path, in_chans=1)
+
+    class _Bare(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.patch_embed = nn.Module()
+            self.patch_embed.proj = nn.Conv3d(1, 96, kernel_size=8, stride=8)
+
+    with pytest.raises(ValueError, match="spatial_axes"):
+        load_pretrained(_Bare(), path, inflate=True, strict=False)
 
 
 @pytest.mark.unit
@@ -180,13 +237,44 @@ def test_inflated_patch_embedding_reproduces_the_2d_response(tmp_path):
     load_pretrained(model_3d, path, inflate=True, skip=["rope_embed."])
 
     image = torch.rand(1, 1, 32, 32)
-    volume = image.unsqueeze(2).expand(-1, -1, 32, -1, -1).contiguous()
+    # Constant along z, each z-section the image I[y, x]; the 3D tokens come out (x, y, z).
+    volume = _section(image).unsqueeze(-1).expand(-1, -1, -1, -1, 32).contiguous()
     with torch.no_grad():
         flat = model_2d.eval().patch_embed(image)
         solid = model_3d.eval().patch_embed(volume)
 
-    for z in range(solid.shape[1]):
-        assert torch.allclose(solid[0, z], flat[0], atol=1e-5)
+    for z in range(solid.shape[3]):
+        assert torch.allclose(solid[0, :, :, z], flat[0].transpose(0, 1), atol=1e-5)
+
+
+@pytest.mark.unit
+def test_a_2d_release_one_patch_deep_is_the_2d_model(tmp_path):
+    """The whole network, not just the stem: superposition RoPE and inflation bind depth to z and
+    the 2D rows and columns to y and x, so a volume one patch deep whose z-section is the image
+    I[y, x] gives the 2D model's tokens on I. With depth bound by position instead, the kernel was
+    spread along x and the 2D layout laid on y and z.
+
+    One patch deep because only then is the comparison exact: the CLS and storage tokens appear
+    once while a deeper volume repeats every in-plane patch, which reweights attention. No
+    LayerScale, so the block's attention -- where RoPE acts -- contributes in full; and the image
+    is not square, so it also pins which extent the model hands the RoPE as x and which as y.
+    """
+    torch.manual_seed(0)
+    options = dict(in_chans=1, n_storage_tokens=4, mask_k_bias=True)
+    path, model_2d = _released_checkpoint(tmp_path, **options)
+    model_3d = DinoVisionTransformer3D(pos_embed_rope_type="superposition", **options, **DINO)
+    load_pretrained(model_3d, path, inflate=True, skip=["rope_embed."])
+
+    image = torch.rand(1, 1, 24, 40)  # 3 patch rows (y) by 5 patch columns (x)
+    volume = _section(image).unsqueeze(-1).expand(-1, -1, -1, -1, 8).contiguous()
+    with torch.no_grad():
+        flat = model_2d.eval().forward_features(image)
+        solid = model_3d.eval().forward_features(volume)
+
+    tokens_3d = solid["x_norm_patchtokens"].reshape(5, 3, -1)                  # (x, y)
+    tokens_2d = flat["x_norm_patchtokens"].reshape(3, 5, -1).transpose(0, 1)
+    assert torch.allclose(tokens_3d, tokens_2d, atol=1e-5)
+    assert torch.allclose(solid["x_norm_clstoken"], flat["x_norm_clstoken"], atol=1e-5)
 
 
 # ---------------------------------------------------------------- reading

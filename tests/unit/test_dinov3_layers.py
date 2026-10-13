@@ -115,33 +115,61 @@ def test_3d_rope_passes_leftover_channels_through_unchanged():
     assert torch.allclose(rotated[..., positionless[0]], x[..., positionless[0]], atol=1e-6)
 
 
+AXIS_ORDERS = ["xyz", "xzy", "yxz", "yzx", "zxy", "zyx"]
+
+
+def _sections(table: torch.Tensor, spatial_axes: str, extent: dict[str, int]) -> torch.Tensor:
+    """A 3D table, its rows in tensor order -> (z, y * x, D_head): per z-section, in 2D order."""
+    grid = table.reshape(*(extent[axis] for axis in spatial_axes), table.shape[-1])
+    grid = grid.permute(*(spatial_axes.index(axis) for axis in "zyx"), 3)
+    return grid.reshape(extent["z"], extent["y"] * extent["x"], table.shape[-1])
+
+
 @pytest.mark.unit
-def test_superposition_rope_starts_out_identical_to_2d():
-    """`depth_scale` initialises at zero, so a 2D checkpoint transfers with no change in output."""
+@pytest.mark.parametrize("spatial_axes", AXIS_ORDERS)
+def test_superposition_rope_starts_out_identical_to_2d(spatial_axes):
+    """`depth_scale` initialises at zero, so a 2D checkpoint transfers with no change in output:
+    whatever order the axes come in, every z-section is encoded as the 2D image I[y, x]."""
     rope3d = RopePositionEmbedding3DSuperposition(
-        embed_dim=64, num_heads=4, base=100.0, dtype=torch.float32
+        embed_dim=64, spatial_axes=spatial_axes, num_heads=4, base=100.0, dtype=torch.float32
     )
     rope2d = RopePositionEmbedding(embed_dim=64, num_heads=4, base=100.0, dtype=torch.float32)
 
     assert rope3d.depth_scale.detach().item() == 0.0
     assert rope3d.periods.shape == rope2d.periods.shape, "buffer footprint must match 2D exactly"
 
-    sin3, cos3 = rope3d(D=1, H=4, W=4)
-    sin2, cos2 = rope2d(H=4, W=4)
-    assert torch.allclose(sin3, sin2, atol=1e-6)
-    assert torch.allclose(cos3, cos2, atol=1e-6)
+    extent = {"x": 5, "y": 3, "z": 2}
+    D, H, W = (extent[axis] for axis in spatial_axes)
+    for table3, table2 in zip(rope3d(D=D, H=H, W=W), rope2d(H=extent["y"], W=extent["x"])):
+        sections = _sections(table3, spatial_axes, extent)
+        assert torch.allclose(sections, table2.expand_as(sections), atol=1e-6)
 
 
 @pytest.mark.unit
-def test_superposition_rope_depth_gate_actually_engages():
+@pytest.mark.parametrize("spatial_axes", AXIS_ORDERS)
+def test_superposition_rope_depth_gate_engages_along_z(spatial_axes):
+    """A single z-section sits at the centre depth coordinate, whose angle is zero, so the gate
+    changes nothing there; with several sections it does. The gate acts on the axis named z."""
     rope = RopePositionEmbedding3DSuperposition(
-        embed_dim=64, num_heads=4, base=100.0, dtype=torch.float32
+        embed_dim=64, spatial_axes=spatial_axes, num_heads=4, base=100.0, dtype=torch.float32
     )
-    before = rope(D=4, H=2, W=2)
+    grids = [{"x": 4, "y": 3, "z": z} for z in (1, 4)]
+    extents = [tuple(grid[axis] for axis in spatial_axes) for grid in grids]
+    before = [rope(D=D, H=H, W=W) for D, H, W in extents]
     with torch.no_grad():
         rope.depth_scale.fill_(1.0)
-    after = rope(D=4, H=2, W=2)
-    assert not torch.allclose(before[0], after[0])
+    after = [rope(D=D, H=H, W=W) for D, H, W in extents]
+    assert torch.allclose(before[0][0], after[0][0], atol=1e-6)
+    assert not torch.allclose(before[1][0], after[1][0])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("spatial_axes", ["xy", "xyx", "xyzz", "dhw"])
+def test_superposition_rope_refuses_an_order_that_is_not_one_of_x_y_z(spatial_axes):
+    with pytest.raises(ValueError, match="spatial_axes"):
+        RopePositionEmbedding3DSuperposition(
+            embed_dim=64, spatial_axes=spatial_axes, num_heads=4, base=100.0
+        )
 
 
 @pytest.mark.unit
@@ -407,7 +435,8 @@ def test_superposition_rope_survives_train_mode_augmentation(augmentation, value
     shaped augmentation operand. Upstream indexes both the same way and raises on the first
     training step."""
     rope = RopePositionEmbedding3DSuperposition(
-        embed_dim=64, num_heads=4, base=100.0, dtype=torch.float32, **{augmentation: value}
+        embed_dim=64, spatial_axes="xyz", num_heads=4, base=100.0, dtype=torch.float32,
+        **{augmentation: value},
     )
     rope.train()
     sin, cos = rope(D=3, H=4, W=5)
@@ -416,12 +445,15 @@ def test_superposition_rope_survives_train_mode_augmentation(augmentation, value
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "rope_cls", [RopePositionEmbedding3D, RopePositionEmbedding3DSuperposition]
+    ("rope_cls", "axes"),
+    [(RopePositionEmbedding3D, {}), (RopePositionEmbedding3DSuperposition, {"spatial_axes": "xyz"})],
 )
-def test_3d_rope_tables_always_span_the_whole_head(rope_cls):
+def test_3d_rope_tables_always_span_the_whole_head(rope_cls, axes):
     """Anything narrower than the head dimension fails inside `rope_apply`'s multiply."""
     for embed_dim, num_heads in [(96, 4), (256, 4), (512, 4), (64, 4), (128, 8)]:
-        rope = rope_cls(embed_dim=embed_dim, num_heads=num_heads, base=100.0, dtype=torch.float32)
+        rope = rope_cls(
+            embed_dim=embed_dim, num_heads=num_heads, base=100.0, dtype=torch.float32, **axes
+        )
         sin, cos = rope(D=2, H=2, W=2)
         assert sin.shape[-1] == cos.shape[-1] == rope.D_head, f"{embed_dim}/{num_heads}"
         rope_apply(torch.randn(1, 1, 8, rope.D_head), sin, cos)  # must not raise

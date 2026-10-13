@@ -314,6 +314,14 @@ class RopePositionEmbedding3DSuperposition(nn.Module):
     its angle to the existing H/W angles, scaled by `depth_scale`, which initialises at zero --
     so the module starts out numerically identical to the 2D case and learns how much depth to
     mix in.
+
+    The parts are bound to axes by name, through `spatial_axes` -- the input's spatial letters in
+    tensor order: the depth angle goes to z, the section axis, and the 2D layout's rows and
+    columns (the h and w channels of the 2D embedding) to y and x, so that at a closed gate a
+    z-section is encoded as the 2D image I[y, x] -- exactly so under the default "separate"
+    normalisation; "max" and "min" divide by all three extents, z's included. Required, because
+    the positional binding this replaced gave depth to whichever axis came first -- x under the
+    "xyz" every config feeds.
     """
 
     periods: torch.Tensor
@@ -323,6 +331,7 @@ class RopePositionEmbedding3DSuperposition(nn.Module):
         self,
         embed_dim: int,
         *,
+        spatial_axes: str,
         num_heads: int,
         base: float | None = 100.0,
         depth_base: float | None = 10000.0,
@@ -341,8 +350,11 @@ class RopePositionEmbedding3DSuperposition(nn.Module):
         both_periods = min_period is not None and max_period is not None
         if (base is None and not both_periods) or (base is not None and both_periods):
             raise ValueError("Either `base` or `min_period`+`max_period` must be provided.")
+        if sorted(spatial_axes) != ["x", "y", "z"]:
+            raise ValueError(f"spatial_axes must order x, y and z, got {spatial_axes!r}")
 
         D_head = embed_dim // num_heads
+        self.spatial_axes = spatial_axes
         self.base = base
         self.depth_base = depth_base if depth_base is not None else base
         self.min_period = min_period
@@ -368,31 +380,45 @@ class RopePositionEmbedding3DSuperposition(nn.Module):
         self._init_weights()
 
     def forward(self, *, D: int, H: int, W: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Generate the (sin, cos) tables -> 2 * [D*H*W, embed_dim // num_heads]."""
+        """Generate the (sin, cos) tables -> 2 * [D*H*W, embed_dim // num_heads].
+
+        `D`, `H` and `W` are the patch grid's extents along the input's three spatial dims in
+        tensor order, and the table's rows follow its tokens in that order; which dim plays depth
+        and which the 2D rows and columns comes from `spatial_axes`.
+        """
         device = self.periods.device
         dtype = self.dtype
         dd: dict[str, Any] = {"device": device, "dtype": dtype}
+        extent = dict(zip(self.spatial_axes, (D, H, W), strict=True))
+        depth, rows, cols = extent["z"], extent["y"], extent["x"]
 
         # Prepare coords in range [0, 1] before shifting to [-1, +1]
         if self.normalize_coords == "max":
             max_DHW = max(D, H, W)
-            coords_d = torch.arange(0.5, D, **dd) / max_DHW
-            coords_h = torch.arange(0.5, H, **dd) / max_DHW
-            coords_w = torch.arange(0.5, W, **dd) / max_DHW
+            coords_d = torch.arange(0.5, depth, **dd) / max_DHW
+            coords_h = torch.arange(0.5, rows, **dd) / max_DHW
+            coords_w = torch.arange(0.5, cols, **dd) / max_DHW
         elif self.normalize_coords == "min":
             min_DHW = min(D, H, W)
-            coords_d = torch.arange(0.5, D, **dd) / min_DHW
-            coords_h = torch.arange(0.5, H, **dd) / min_DHW
-            coords_w = torch.arange(0.5, W, **dd) / min_DHW
+            coords_d = torch.arange(0.5, depth, **dd) / min_DHW
+            coords_h = torch.arange(0.5, rows, **dd) / min_DHW
+            coords_w = torch.arange(0.5, cols, **dd) / min_DHW
         elif self.normalize_coords == "separate":
-            coords_d = torch.arange(0.5, D, **dd) / D
-            coords_h = torch.arange(0.5, H, **dd) / H
-            coords_w = torch.arange(0.5, W, **dd) / W
+            coords_d = torch.arange(0.5, depth, **dd) / depth
+            coords_h = torch.arange(0.5, rows, **dd) / rows
+            coords_w = torch.arange(0.5, cols, **dd) / cols
         else:
             raise ValueError(f"Unknown normalize_coords: {self.normalize_coords}")
 
-        # Create 3D meshgrids for each axis independently
-        grid_d, grid_h, grid_w = torch.meshgrid(coords_d, coords_h, coords_w, indexing="ij")
+        # Meshgrids in tensor order, so every flattened grid below follows the tokens; each part
+        # then reads the grid of its own axis.
+        per_axis = {"z": coords_d, "y": coords_h, "x": coords_w}
+        grids = dict(zip(
+            self.spatial_axes,
+            torch.meshgrid(*(per_axis[axis] for axis in self.spatial_axes), indexing="ij"),
+            strict=True,
+        ))
+        grid_d, grid_h, grid_w = grids["z"], grids["y"], grids["x"]
 
         # Separate spatial and depth paths to preserve the original 2D math mapping
         coords_spatial = torch.stack([grid_h, grid_w], dim=-1).flatten(0, 2)  # [DHW, 2]

@@ -275,6 +275,8 @@ def test_common_pooled_layer_attends_to_box_means_rotated_at_their_centres():
 
 
 def _dinov3_rope(cls=RopePositionEmbedding3D, **kwargs: Any):
+    if cls is RopePositionEmbedding3DSuperposition:
+        kwargs.setdefault("spatial_axes", "xyz")
     rope = cls(16, num_heads=2, dtype=torch.float64, **kwargs)
     rope._init_weights()
     return rope

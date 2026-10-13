@@ -336,6 +336,22 @@ def test_3d_superposition_rope_is_selectable():
     assert superposed(_input(DinoVisionTransformer3D)).shape == (2, superposed.embed_dim)
 
 
+@pytest.mark.unit
+def test_3d_superposition_depth_gate_acts_along_z():
+    """The gated depth angle goes to z, the section axis. One patch deep, every token sits at the
+    centre depth coordinate, whose angle is zero, so opening the gate changes nothing; two patches
+    deep it does. Depth used to be bound by position -- to x under "xyz" -- and the gate turned
+    tokens by their x."""
+    model = _model(DinoVisionTransformer3D, pos_embed_rope_type="superposition")
+    one_deep, two_deep = torch.randn(1, 1, 16, 16, 8), torch.randn(1, 1, 16, 16, 16)
+    with torch.no_grad():
+        closed = [model.forward_features(v)["x_norm_patchtokens"] for v in (one_deep, two_deep)]
+        model.rope_embed.depth_scale.fill_(1.0)
+        opened = [model.forward_features(v)["x_norm_patchtokens"] for v in (one_deep, two_deep)]
+    assert torch.allclose(opened[0], closed[0], atol=1e-6)
+    assert not torch.allclose(opened[1], closed[1], atol=1e-3)
+
+
 # ---------------------------------------------------------------- BaseModel contract
 
 
@@ -501,17 +517,26 @@ def test_prepare_input_drops_the_level_axis_and_adds_a_channel(cls):
         assert model.prepare_input(torch.randn(2, 1, 3, 32, 32), "lcyx").shape == (2, 3, 32, 32)
     else:
         assert model.prepare_input(
-            torch.randn(2, 1, 16, 16, 16), "lzyx"
+            torch.randn(2, 1, 16, 16, 16), "lxyz"
         ).shape == (2, 1, 16, 16, 16)
         assert model.prepare_input(
-            torch.randn(2, 1, 1, 16, 16, 16), "lczyx"
+            torch.randn(2, 1, 1, 16, 16, 16), "lcxyz"
         ).shape == (2, 1, 16, 16, 16)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("axes", ["lxzy", "lyxz", "lyzx", "lzxy", "lzyx"])
+def test_3d_prepare_input_refuses_any_spatial_order_but_xyz(axes):
+    """The model reads its input's dims as x, y, z: another order would put depth on the wrong
+    axis, or -- "lyxz" -- hand it every z-section transposed."""
+    with pytest.raises(ValueError, match="spatial axes as 'xyz'"):
+        _model(DinoVisionTransformer3D).prepare_input(torch.randn(2, 1, 16, 16, 16), axes)
 
 
 @pytest.mark.unit
 @BOTH
 def test_prepare_input_requires_a_level_axis(cls):
-    axes = "yx" if cls is DinoVisionTransformer else "zyx"
+    axes = "yx" if cls is DinoVisionTransformer else "xyz"
     with pytest.raises(ValueError, match="must contain 'l'"):
         _model(cls).prepare_input(torch.randn(2, 4, 4), axes)
 
@@ -523,7 +548,7 @@ def test_prepare_input_rejects_multiple_scale_levels(cls):
     if cls is DinoVisionTransformer:
         batch, axes = torch.randn(2, 3, 32, 32), "lyx"
     else:
-        batch, axes = torch.randn(2, 3, 16, 16, 16), "lzyx"
+        batch, axes = torch.randn(2, 3, 16, 16, 16), "lxyz"
     with pytest.raises(ValueError, match="single-scale"):
         model.prepare_input(batch, axes)
 
@@ -533,7 +558,7 @@ def test_prepare_input_rejects_multiple_scale_levels(cls):
 def test_prepare_input_rejects_the_wrong_spatial_rank(cls):
     model = _model(cls)
     # Hand each model the *other* rank's axis order.
-    axes = "lzyx" if cls is DinoVisionTransformer else "lyx"
+    axes = "lxyz" if cls is DinoVisionTransformer else "lyx"
     with pytest.raises(ValueError, match="not usable by a"):
         model.prepare_input(torch.randn(2, 1, 4, 4, 4), axes)
 
@@ -541,7 +566,7 @@ def test_prepare_input_rejects_the_wrong_spatial_rank(cls):
 @pytest.mark.unit
 @BOTH
 def test_prepare_input_rejects_a_batch_that_contradicts_its_axes(cls):
-    axes = "lcyx" if cls is DinoVisionTransformer else "lczyx"
+    axes = "lcyx" if cls is DinoVisionTransformer else "lcxyz"
     with pytest.raises(ValueError, match="implies a"):
         _model(cls).prepare_input(torch.randn(2, 1, 4), axes)
 
@@ -553,7 +578,7 @@ def test_prepare_input_output_feeds_straight_into_the_model(cls):
     if cls is DinoVisionTransformer:
         batch, axes = torch.randn(2, 1, 3, 32, 32), "lcyx"
     else:
-        batch, axes = torch.randn(2, 1, 1, 16, 16, 16), "lczyx"
+        batch, axes = torch.randn(2, 1, 1, 16, 16, 16), "lcxyz"
     assert model(model.prepare_input(batch, axes)).shape == (2, model.embed_dim)
 
 

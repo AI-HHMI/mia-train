@@ -60,7 +60,7 @@ class _Volumes(data.Dataset):
 class _Dataset(BaseDataset):
     @property
     def sample_axes(self) -> str | None:
-        return "lzyx"
+        return "lxyz"
 
     def build_dataset(self) -> data.Dataset:
         return _Volumes()
@@ -75,7 +75,7 @@ class _MeanOfPatches(BaseAlgorithm):
 
     def training_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         volumes = batch["img"].unsqueeze(1)  # (B, L=1, C, ...) for prepare_input
-        tokens, _ = self.model.patch_features(self.model.prepare_input(volumes, "lczyx"))
+        tokens, _ = self.model.patch_features(self.model.prepare_input(volumes, "lcxyz"))
         return {"loss": self.head(tokens).pow(2).mean()}
 
     def validation_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
