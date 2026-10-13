@@ -688,8 +688,15 @@ class DeviceAugmentation:
             if present:
                 count = batch[present[0]].shape[0]
                 transformed: dict[str, list[torch.Tensor]] = {key: [] for key in present}
+                # Each sample's voxel sizes go along, so the guard refuses a rotation they do not
+                # admit here as it does in the workers. Left behind, it returned early and let
+                # `rotate = "full"` turn a 20 nm z into the plane.
+                sizes = batch.get("pixel_size")
                 for index in range(count):
-                    one = self.geometric({key: batch[key][index] for key in present})
+                    sample = {key: batch[key][index] for key in present}
+                    if sizes is not None:
+                        sample["pixel_size"] = sizes[index]
+                    one = self.geometric(sample)
                     for key in present:
                         transformed[key].append(one[key])
                 batch = dict(batch)

@@ -151,7 +151,7 @@ def cmd_probe(args: argparse.Namespace) -> None:
     from layers.common.prompt import FOREGROUND
     from layers.common.rope import voxel_coords
     from predict import resolve_patch
-    from prediction.grid import VolumeGrid
+    from prediction.grid import AxisOrder, VolumeGrid
 
     config = load_config(args.gt_config)
     resolved = resolve_volume(config, args.volume)
@@ -168,6 +168,11 @@ def cmd_probe(args: argparse.Namespace) -> None:
     patch = resolve_patch(resolved["config"], resolved_cfg, name, None)
     (index, box), = plan_blocks(resolved, args.block, 1)
     grid = VolumeGrid(resolved["config"], name, patch, box=box)
+    # Tiles reach the model in the order it was trained on, as in `PromptGridPredictor.run`; the
+    # truth tile follows, and the clicks and mask grid come from the tile's extent, so all of it
+    # is in the model's order. Without this, kasthuri15_ac3 (stored z, y, x) put its 29 nm section
+    # axis in the x slot of models trained on lcxyz with `rotate = "inplane"`.
+    order = AxisOrder.of(grid, algorithm)
 
     truth_np = grid.read_ground_truth()
     # Dense ids: this corpus stores 64-bit segment ids, and everything below indexes by id.
@@ -191,13 +196,14 @@ def cmd_probe(args: argparse.Namespace) -> None:
     started = time.perf_counter()
     bounds: tuple[int, float] | None = None
     for tile_index, (native, out) in enumerate(tiles):
-        volume = torch.from_numpy(grid.read_image(handle, native)[None, None]).to(device)
+        tile = np.ascontiguousarray(order.to_model(grid.read_image(handle, native)))
+        volume = torch.from_numpy(tile[None, None]).to(device)
         extent = tuple(int(v) for v in volume.shape[-3:])
         min_cells, max_cells = predictor._bounds(extent)
         bounds = (int(min_cells), float(max_cells))
         window = tuple(slice(o, o + p) for o, p in zip(out, patch, strict=True))
         # Connected components of the tile, as training defines an object (`PromptTargets`).
-        truth_tile = relabel_connected_cc3d(truth[window])
+        truth_tile = relabel_connected_cc3d(order.to_model(truth[window]).contiguous())
         ids = torch.unique(truth_tile)
         ids = ids[ids > 0]
         n_cells = int(np.prod([e // s for e, s in zip(extent, stride, strict=True)]))

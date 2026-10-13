@@ -246,6 +246,25 @@ def test_a_finished_artifact_is_left_alone(tmp_path):
     assert later.calls == 0
 
 
+def test_a_finished_artifact_from_a_different_prediction_is_refused(tmp_path):
+    """Another step or block shape finds the finished artifact and refuses it instead of calling
+    it complete, which once scored a relaunched run under the stale predictions of the old one."""
+    _predict(tmp_path)
+    with pytest.raises(SystemExit, match="different prediction"):
+        _predict(tmp_path, attrs={**ATTRS, "step": 2})
+    with pytest.raises(SystemExit, match="different prediction"):
+        _predict(tmp_path, block=(8, 8, 16))
+
+
+def test_a_finished_artifact_that_predates_an_attribute_is_reused(tmp_path, capsys):
+    _predict(tmp_path)
+    later = _Algorithm()
+    newer = {**ATTRS, "code_version": "0123abc"}
+    assert _predict(tmp_path, algorithm=later, attrs=newer) == tmp_path / "v.zarr"
+    assert later.calls == 0
+    assert "predates recording code_version" in capsys.readouterr().out
+
+
 def test_a_partial_left_by_a_different_prediction_is_refused(tmp_path):
     _predict(tmp_path, worker=0, workers=2)
     with pytest.raises(SystemExit, match="different prediction"):

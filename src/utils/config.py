@@ -10,6 +10,11 @@ from distributed.parallel_dims import ParallelDims
 from engine.config import AugmentConfig, InitConfig, LoRAConfig, TrainerConfig
 
 _COMPONENT_SECTIONS = ("model", "algorithm", "data")
+# Every top-level key `load_run_config` reads; anything else in a config is a mistake.
+_TOP_LEVEL = frozenset(
+    {"experiment_name", *_COMPONENT_SECTIONS, "trainer", "parallelism", "val_data", "init",
+     "augment", "lora"}
+)
 
 
 @dataclass(frozen=True)
@@ -95,6 +100,15 @@ def load_run_config(path: Path) -> RunConfig:
     missing = [section for section in (*_COMPONENT_SECTIONS, "trainer") if section not in raw]
     if missing:
         raise ValueError(f"config is missing required section(s): {missing}")
+    # A misspelled optional section is otherwise dropped and its defaults used without a word:
+    # `[LoRA]` fine-tunes the whole encoder, `[intit]` trains from scratch, `[augmnet]` trains with
+    # no augmentation. A stray key above the first header goes the same way.
+    unknown = sorted(set(raw) - _TOP_LEVEL)
+    if unknown:
+        raise ValueError(
+            f"config has unknown top-level key(s) or section(s) {unknown}; valid ones are "
+            f"{sorted(_TOP_LEVEL)}"
+        )
 
     return RunConfig(
         experiment_name=raw["experiment_name"],

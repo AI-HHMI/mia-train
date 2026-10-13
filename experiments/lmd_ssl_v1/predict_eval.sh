@@ -36,7 +36,6 @@ REPO=/groups/scicompsoft/home/orhane/projects/mia-train
 VENV=/groups/scicompsoft/home/orhane/myvenv
 EXP=/nrs/scicompsoft/orhane/mia-train-experiments/lmd_ssl_v1   # this experiment's home on /nrs: runs/ jobs/ eval/ probes/ (layout of 2026-09-16)
 RUNS=$EXP/runs
-OUT_ROOT=$EXP/eval/arm2_eval
 LOGS="$EXP/jobs"
 PROJECT=miaai
 STEP=50000
@@ -66,6 +65,10 @@ run=${run%/}
   ls "$run/checkpoints" >&2; exit 1; }
 echo "run  $run"
 echo "step $STEP"
+# Per arm and step. It was eval/arm2_eval for every arm and step, and predict.py replaces a store it
+# writes to, so predicting 2b or another step of 2c would have replaced 2c's step-50000 affinities,
+# the ones its published records were scored from (those stay in eval/arm2_eval).
+OUT_ROOT=$EXP/eval/${ARM}_step${STEP}
 
 # volume -> slots, sized from the predict-side accumulator and kept at or under each queue's
 # slots-per-GPU ratio so no job strands a GPU it cannot use.

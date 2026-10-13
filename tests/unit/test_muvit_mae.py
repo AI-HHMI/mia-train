@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import torch
 
-from algorithms.muvit_mae import MuViTDecoderLayer, MuViTMAE
+from algorithms.muvit_mae import MuViTDecoderLayer, MuViTMAE, finest_pixel_frame
 from algorithms.registry import AlgorithmRegistry
 from models.muvit import MuViT3D
 
@@ -35,11 +35,26 @@ def _algorithm(encoder: MuViT3D | None = None, **overrides: Any) -> MuViTMAE:
     return MuViTMAE(encoder, **kwargs)
 
 
+def _miao_boxes(
+    encoder: MuViT3D, batch_size: int, voxel: tuple[float, ...] = (20.0, 9.0, 9.0)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """What miao reports for concentric crops: each level's read extent, out to its voxels' faces,
+    in nanometres about an arbitrary absolute centre -> (B, L, 2, 3) boxes, (B, L, 3) voxel sizes."""
+    finest = torch.tensor(voxel)
+    pixel = torch.stack([level * finest for level in encoder.levels])  # (L, 3)
+    half = torch.tensor(encoder.img_size, dtype=torch.float32) / 2 * pixel
+    centre = torch.tensor([5_000.0, 41_000.0, 12_000.0])
+    bbox = torch.stack((centre - half, centre + half), dim=1)  # (L, 2, 3)
+    return bbox.expand(batch_size, -1, -1, -1), pixel.expand(batch_size, -1, -1)
+
+
 def _batch(batch_size: int = 2, encoder: MuViT3D | None = None) -> dict[str, torch.Tensor]:
     encoder = encoder or _encoder()
+    bbox, pixel_size = _miao_boxes(encoder, batch_size)
     return {
-        "img": torch.randn(batch_size, len(LEVELS), 16, 16, 16),
-        "bbox": encoder.default_bbox(batch_size, torch.device("cpu")),
+        "img": torch.randn(batch_size, encoder.num_levels, 16, 16, 16),
+        "bbox": bbox,
+        "pixel_size": pixel_size,
     }
 
 
@@ -219,7 +234,9 @@ def test_visible_coordinates_stay_in_step_with_visible_tokens():
 
     # `embed` is deterministic, so recomputing it gives the same tokens to compare against.
     volumes = encoder.prepare_input(batch["img"], "lzyx")
-    all_tokens, all_coords = encoder.embed(volumes, batch["bbox"])
+    all_tokens, all_coords = encoder.embed(
+        volumes, finest_pixel_frame(batch["bbox"], batch["pixel_size"])
+    )
     assert torch.allclose(seen["tokens"], all_tokens[:, keep[0]], atol=1e-5)
     assert torch.allclose(seen["coords"], all_coords[:, keep[0]], atol=1e-5)
 
@@ -321,6 +338,46 @@ def test_requires_world_coordinates_in_the_batch():
     algorithm = _algorithm()
     with pytest.raises(KeyError, match="needs world coordinates"):
         algorithm({"img": torch.randn(2, 2, 16, 16, 16)})
+
+
+@pytest.mark.unit
+def test_requires_voxel_sizes_to_convert_the_boxes():
+    batch = _batch()
+    del batch["pixel_size"]
+    with pytest.raises(KeyError, match="pixel_size"):
+        _algorithm()(batch)
+
+
+@pytest.mark.unit
+def test_miao_boxes_land_in_the_frame_fine_tuning_uses():
+    """Fine-tuning, the dense heads and predict.py position tokens by `default_bbox` -- finest
+    pixels, outermost voxel centres -- and miao's boxes are nanometres out to the voxel faces."""
+    encoder = _encoder()
+    bbox, pixel_size = _miao_boxes(encoder, 2)
+    pretraining = encoder.world_coords(finest_pixel_frame(bbox, pixel_size))
+    fine_tuning = encoder.world_coords(encoder.default_bbox(2, torch.device("cpu")))
+    assert torch.allclose(pretraining, fine_tuning, atol=1e-4)
+
+
+@pytest.mark.unit
+def test_pretraining_positions_tokens_where_fine_tuning_does():
+    """Taken as given, miao's boxes put pretraining in nanometres: at 8 nm a fine-tuned encoder saw
+    a frame 8x smaller than the one it learned its rotary frequencies in, and those frequencies
+    barely move in a fine-tune."""
+    encoder = _encoder()
+    algorithm = _algorithm(encoder)
+    seen: dict[str, torch.Tensor] = {}
+    real_embed = encoder.embed
+
+    def spy(volumes, bbox=None):
+        tokens, coords = real_embed(volumes, bbox)
+        seen["coords"] = coords
+        return tokens, coords
+
+    encoder.embed = spy
+    algorithm(_batch(2, encoder=encoder))
+    expected = encoder.world_coords(encoder.default_bbox(2, torch.device("cpu")))
+    assert torch.allclose(seen["coords"], expected, atol=1e-4)
 
 
 @pytest.mark.unit
@@ -465,8 +522,5 @@ def test_a_single_level_still_works():
     # target a same-level token. It should run rather than divide by zero somewhere.
     encoder = _encoder(levels=(1,))
     algorithm = _algorithm(encoder)
-    batch = {
-        "img": torch.randn(2, 1, 16, 16, 16),
-        "bbox": encoder.default_bbox(2, torch.device("cpu")),
-    }
+    batch = _batch(2, encoder=encoder)
     assert torch.isfinite(algorithm(batch)["loss"])

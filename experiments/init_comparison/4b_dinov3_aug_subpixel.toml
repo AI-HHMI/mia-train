@@ -24,11 +24,13 @@ pos_embed_rope_type = "superposition"
 # submission time. Phase 1 of this arm.
 path = "PREV_CHECKPOINT"
 prefix = "model."
-# `rope_embed` buffers are derived from `base` by the model's own init_weights, not learned, so the
-# model keeps its own and nothing is lost. Skipping them also means a stage can be pointed at any
-# trained encoder of this width -- which is how the smoke test exercises this load path without a
-# predecessor, and it costs nothing in the real chain, where the RoPE type matches anyway.
-skip = ["rope_embed."]
+# The `rope_embed` *buffers* are derived from `base` by the model's own init_weights, not learned,
+# so the model keeps its own and nothing is lost. Skipping them also means a stage can be pointed at
+# any trained encoder of this width -- which is how the smoke test exercises this load path without
+# a predecessor. Only the buffers: `rope_embed.` would also catch `rope_embed.depth_scale`, the
+# learned depth gate, and reset it to zero (load_pretrained refuses that now). This stage's run of
+# 2026-08-14 loaded with that wider skip, so its gate restarted at zero.
+skip = ["rope_embed.periods", "rope_embed.depth_periods"]
 strict = true
 
 [algorithm]

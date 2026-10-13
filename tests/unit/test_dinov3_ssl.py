@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 import torch
+import torch.utils.data as data
 
 from algorithms.dinov3.losses import DINOLoss, IBOTPatchLoss, KoLeoLoss, sinkhorn_knopp
 from algorithms.dinov3.multicrop import (
@@ -17,6 +18,9 @@ from algorithms.dinov3.multicrop import (
 )
 from algorithms.dinov3_ssl import DINOv3
 from algorithms.registry import AlgorithmRegistry
+from data.base import BaseDataset
+from engine.config import TrainerConfig
+from engine.trainer import Trainer
 from layers.dinov3.head import DINOHead
 from models.dinov3_vit import DinoVisionTransformer
 from models.dinov3_vit3d import DinoVisionTransformer3D
@@ -25,17 +29,17 @@ from models.vit import ViT3D
 PROTOTYPES = 64
 
 
-def _encoder(rank: int):
+def _encoder(rank: int, **overrides: Any):
     # Annotated because a heterogeneous dict literal infers dict[str, object], which cannot be
     # unpacked into the models' typed signatures.
     common: dict[str, Any] = dict(patch_size=8, in_chans=1, embed_dim=96, depth=2, num_heads=4,
-                                  pos_embed_rope_dtype="fp32")
+                                  pos_embed_rope_dtype="fp32", **overrides)
     if rank == 2:
         return DinoVisionTransformer(img_size=32, **common)
     return DinoVisionTransformer3D(img_size=16, **common)
 
 
-def _algorithm(rank: int = 3, **overrides: Any) -> DINOv3:
+def _algorithm(rank: int = 3, *, encoder: Any = None, **overrides: Any) -> DINOv3:
     kwargs: dict[str, Any] = dict(
         input_axes="lcxy" if rank == 2 else "lcxyz",
         total_steps=100,
@@ -48,7 +52,7 @@ def _algorithm(rank: int = 3, **overrides: Any) -> DINOv3:
         warmup_teacher_temp_steps=10,
     )
     kwargs.update(overrides)
-    return DINOv3(_encoder(rank), **kwargs)
+    return DINOv3(encoder if encoder is not None else _encoder(rank), **kwargs)
 
 
 def _batch(rank: int, batch_size: int = 2) -> dict[str, torch.Tensor]:
@@ -173,6 +177,13 @@ def test_koleo_penalises_a_collapsed_batch():
     assert loss(collapsed) > loss(spread)
 
 
+@pytest.mark.unit
+def test_koleo_refuses_a_batch_with_no_neighbour():
+    """One embedding is its own only candidate: the term is then a constant with no gradient."""
+    with pytest.raises(ValueError, match="nearest neighbour"):
+        KoLeoLoss()(torch.randn(1, 8))
+
+
 # ---------------------------------------------------------------- head
 
 
@@ -205,8 +216,8 @@ def test_two_global_views_differ(rank):
     spatial = (64,) * rank
     volumes = torch.rand(4, 1, *spatial)
     out = (16,) * rank
-    first = random_resized_crop(volumes, out, (0.32, 1.0))
-    second = random_resized_crop(volumes, out, (0.32, 1.0))
+    first = random_resized_crop(volumes, out, (0.32, 1.0), plane=(0, 1))
+    second = random_resized_crop(volumes, out, (0.32, 1.0), plane=(0, 1))
 
     assert first.shape == (4, 1, *out)
     assert not torch.allclose(first, second)
@@ -270,6 +281,63 @@ def test_mask_respects_its_ratio_bound_and_leaves_some_samples_whole(grid):
     assert masks.shape == (8, math.prod(grid))
     assert fractions.max() <= 0.5 + 1e-6, "the upper bound is a cap, not a suggestion"
     assert (fractions == 0).sum() == 4, "half the batch is deliberately left unmasked"
+
+
+@pytest.mark.unit
+def test_one_masked_view_is_masked_at_the_top_of_its_range():
+    """At one sample per rank the two global views give one masked view, and the reference masks it
+    at the upper edge of its one bin, the maximum ratio. `linspace(lo, hi, 1)` is `[lo]`, which
+    pinned iBOT at the 10% floor: at most 6 of these 64 patches."""
+    torch.manual_seed(0)
+    masks = block_mask((4, 4, 4), batch=2, ratio=(0.1, 0.5), sample_probability=0.5)
+    fractions = masks.float().mean(dim=1)
+    assert (fractions > 0).sum() == 1
+    assert 0.25 < fractions.max() <= 0.5 + 1e-6
+
+
+@pytest.mark.unit
+def test_a_quarter_turn_never_moves_the_section_axis():
+    """Under lcxyz the section axis z is the last spatial slot, and views turn in x-y only. The turn
+    used to be built in theta's first two indices -- affine_grid's W and H, the last two tensor
+    axes -- which swapped y with z and carried the coarse axis into the plane."""
+    ramp = torch.linspace(0, 1, 32).view(1, 1, 1, 1, 32).expand(8, 1, 32, 32, 32).contiguous()
+    torch.manual_seed(0)
+    views = random_resized_crop(ramp, (16, 16, 16), (0.5, 1.0), plane=(0, 1), flip_prob=0,
+                                rotate_prob=1.0)
+    assert views.std(dim=(2, 3)).max() < 1e-5, "the views vary across x or y"
+
+
+@pytest.mark.unit
+def test_rotated_crops_stay_inside_the_volume(monkeypatch):
+    """The centre's bound follows the sides through the turn. Bounded by the unturned sides, about
+    one rotated global crop in ten reached past the volume into reflection padding."""
+    import algorithms.dinov3.multicrop as multicrop
+
+    grids = []
+    real = multicrop.F.grid_sample
+
+    def recording(volumes, grid, *args, **kwargs):
+        grids.append(grid)
+        return real(volumes, grid, *args, **kwargs)
+
+    monkeypatch.setattr(multicrop.F, "grid_sample", recording)
+    torch.manual_seed(0)
+    random_resized_crop(torch.rand(256, 1, 8, 8, 8), (8, 8, 8), (0.32, 1.0), plane=(0, 1),
+                        rotate_prob=1.0)
+    # A crop that fits never asks for a coordinate past the volume's edge at +-1.
+    assert grids[0].abs().max() <= 1 + 1e-6
+
+
+@pytest.mark.unit
+def test_a_volume_must_name_its_rotation_plane():
+    with pytest.raises(ValueError, match="plane"):
+        random_resized_crop(torch.rand(2, 1, 8, 8, 8), (8, 8, 8), (0.5, 1.0))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("axes, plane", [("lcxyz", (0, 1)), ("lczyx", (1, 2))])
+def test_views_turn_in_the_plane_the_axis_names_give(axes, plane):
+    assert _algorithm(3, input_axes=axes).in_plane == plane
 
 
 @pytest.mark.unit
@@ -352,6 +420,59 @@ def test_teacher_takes_no_gradient_and_moves_only_by_ema():
         algorithm.student["backbone"].blocks[0].attn.qkv.weight.add_(1.0)
     algorithm.update_teacher()
     assert not torch.equal(algorithm.teacher["backbone"].blocks[0].attn.qkv.weight, before)
+
+
+class _Volumes(data.Dataset):
+    def __len__(self) -> int:
+        return 4
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        generator = torch.Generator().manual_seed(index)
+        return {"img": torch.rand(1, 1, 32, 32, 32, generator=generator)}
+
+
+class _VolumeDataset(BaseDataset):
+    def build_dataset(self) -> data.Dataset:
+        return _Volumes()
+
+
+@pytest.mark.unit
+def test_the_trainer_moves_the_teacher_by_ema(tmp_path):
+    """`update_teacher` is the teacher's only writer, and nothing in the engine used to call it: a
+    20-step run through the Trainer changed 0 of 44 teacher tensors -- static-teacher distillation
+    under DINOv3's name. One step at a constant momentum pins the update exactly."""
+    momentum = 0.9
+    algorithm = _algorithm(3, momentum_teacher=momentum, final_momentum_teacher=momentum)
+    before = {name: p.detach().clone() for name, p in algorithm.teacher.named_parameters()}
+    trainer = Trainer(
+        algorithm=algorithm,
+        train_dataset=_VolumeDataset(),
+        config=TrainerConfig(max_steps=1, batch_size=2, lr=1e-2, log_every=1000, seed=0),
+        output_dir=tmp_path,
+    )
+    trainer.train()
+
+    student = dict(algorithm.student.named_parameters())
+    for name, teacher in algorithm.teacher.named_parameters():
+        expected = momentum * before[name] + (1 - momentum) * student[name].detach()
+        assert torch.allclose(teacher, expected, atol=1e-6), name
+    assert any(
+        not torch.equal(teacher, before[name])
+        for name, teacher in algorithm.teacher.named_parameters()
+    )
+
+
+@pytest.mark.unit
+@BOTH_RANKS
+def test_local_crops_train_the_untied_local_cls_norm(rank):
+    """Meta trained the SAT-493M ViT-L and both 7Bs with an untied local-crop CLS norm, and it
+    received no gradient here: the models overwrote its output (the reference's `elif` was lost),
+    and the algorithm ran the local crops in a call of their own, where the branch is unreachable."""
+    encoder = _encoder(rank, untie_global_and_local_cls_norm=True)
+    algorithm = _algorithm(rank, encoder=encoder)
+    algorithm.training_step(_batch(rank))["loss"].backward()
+    grad = algorithm.student["backbone"].local_cls_norm.weight.grad
+    assert grad is not None and grad.abs().sum() > 0
 
 
 @pytest.mark.unit

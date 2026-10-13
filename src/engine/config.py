@@ -80,6 +80,14 @@ class InitConfig:
                 "[init] sets loading options but no 'path', so nothing would be loaded and the "
                 "run would silently start from scratch"
             )
+        # A bare string would be frozen one character at a time: `skip = "rope_embed."` becomes
+        # ("r", "o", "p", ...), which skips nearly every tensor and leaves the encoder at random
+        # init under a "pretrained" label.
+        if isinstance(self.skip, str):
+            raise ValueError(
+                f"[init].skip must be a list of key prefixes, e.g. skip = [{self.skip!r}], not "
+                "a bare string"
+            )
         # TOML gives arrays as lists; freeze so the config stays hashable and immutable.
         object.__setattr__(self, "skip", tuple(self.skip))
 

@@ -378,7 +378,7 @@ class DinoVisionTransformer3D(BaseModel):
                     # We only ever apply this during training.
                     assert self.local_cls_norm is not None  # implied by the flag
                     x_norm_cls_reg = self.local_cls_norm(x[:, : self.n_storage_tokens + 1])
-                if self.untie_cls_and_patch_norms:
+                elif self.untie_cls_and_patch_norms:
                     assert self.cls_norm is not None  # implied by the flag
                     x_norm_cls_reg = self.cls_norm(x[:, : self.n_storage_tokens + 1])
                 else:
@@ -542,7 +542,21 @@ class DinoVisionTransformer3D(BaseModel):
         the output norms stay replicated: together they are 0.3% of this architecture's parameters
         at 7B, they are not on the sequence-parallel stream (the plan gathers before the final
         norm), and sharding them would buy nothing for the collectives it would add.
+
+        Superposition RoPE is refused. Its depth gate `rope_embed.depth_scale` is one replicated
+        parameter that scales every head's rotary angles, while each rank applies the tables to its
+        own heads only (after `to_local()`); its backward therefore holds just those heads' share
+        of the gate's gradient, and nothing reduces the shares over tp. The peers would train tp
+        different gates, and a checkpoint, predict.py and eval would apply one rank's to all heads.
         """
+        if isinstance(self.rope_embed, RopePositionEmbedding3DSuperposition):
+            raise ValueError(
+                "tensor parallelism does not support superposition RoPE: its depth gate "
+                "(rope_embed.depth_scale) scales every head's rotary angles, each rank applies the "
+                "tables to its own heads only, and nothing reduces the gate's gradient over tp, so "
+                'the peers would train different gates. Use pos_embed_rope_type = "vanilla" with '
+                "tp > 1, or tp = 1."
+            )
         return self_attention_stack_plan(self._self_attention_blocks())
 
     def _self_attention_blocks(self) -> tuple[SelfAttentionBlock, ...]:

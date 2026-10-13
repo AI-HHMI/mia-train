@@ -227,6 +227,20 @@ def test_on_device_leaves_the_workers_nothing():
 
 
 @pytest.mark.unit
+def test_on_device_the_voxel_guard_still_sees_pixel_size():
+    """The device path hands each sample over in a dict of its own, which used to hold only the
+    image and label: `pixel_size` stayed behind, the voxel guard returned early, and `rotate =
+    "full"` would turn a 20 nm z into the plane -- a config the worker path refuses."""
+    _, device = split_augmentation(sample_axes="lcxyz", on_device=True, rotate="full")
+    batch = {
+        "img": torch.rand(2, 1, 1, 8, 8, 8),
+        "pixel_size": torch.tensor([[[9.0, 9.0, 20.0]]] * 2),
+    }
+    with pytest.raises(ValueError, match="share a voxel size"):
+        device(batch)
+
+
+@pytest.mark.unit
 def test_on_device_applies_geometry_and_photometry():
     """Both halves reach the batch, in that order."""
     worker, device = split_augmentation(

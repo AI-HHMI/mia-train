@@ -68,9 +68,9 @@ path = "PREV_CHECKPOINT"
 # are dropped before the unused-key check, which is what makes taking the encoder alone legal
 # rather than an error about 2 tensors with no home.
 prefix = "model."
-# `rope_embed` buffers are derived from `base` by the model's own init_weights rather than
-# learned, so keeping this model's own costs nothing and sidesteps any disagreement in length.
-skip = ["rope_embed."]
+# No `skip`: the encoder this loads has the same RoPE type, so every rope tensor already fits, and
+# `rope_embed.` would also catch `rope_embed.depth_scale` -- the learned depth gate -- and reset it
+# to zero; load_pretrained refuses that now.
 strict = true
 
 [algorithm]

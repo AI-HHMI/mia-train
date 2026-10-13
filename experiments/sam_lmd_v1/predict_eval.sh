@@ -92,6 +92,11 @@ OVERRIDES+=" --override algorithm.points_per_batch=$batch"
 # labeller's defaults are a 256-voxel window and 14 clicks per side; another crop keeps the click
 # spacing (256/14 = 18.3 voxels): 7 per side at 128, 19 at 352.
 CROP=$("$VENV/bin/python" -c "import json,sys; print(int(json.load(open(sys.argv[1]))['model']['kwargs'].get('img_size', 256)))" "$run/resolved_config.json")
+# The split YAMLs below are lmd_ssl_v1's 8 nm ones, so only a run trained at 8 nm can be scored on
+# them: a 4 nm arm would see its objects at half the scale it learned, and the row would still land
+# in the table. predict.py refuses the mismatch too; this says why, before any job is queued.
+AT_8NM=$("$VENV/bin/python" -c "import json,sys; levels = json.load(open(sys.argv[1]))['data']['kwargs'].get('resolutions') or [[0]]; print(all(float(v) == 8.0 for level in levels for v in level))" "$run/resolved_config.json")
+[[ "$AT_8NM" == True ]] || { echo "$run was not trained at 8 nm; this script scores on lmd_ssl_v1's 8 nm splits" >&2; exit 2; }
 if [[ "$CROP" != 256 ]]; then
   PPS=$(( (14 * CROP + 128) / 256 ))
   OVERRIDES=${OVERRIDES//points_per_side=14/points_per_side=$PPS}

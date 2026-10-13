@@ -149,6 +149,17 @@ def normalize(
     return out
 
 
+def patch_normalize(tile: np.ndarray) -> np.ndarray:
+    """miao's `_patch_normalize_image_tensor` for a single-level tile: zero mean, unit std.
+
+    Through torch, as miao computes it -- its unbiased std, floored at 1e-8 -- so that a tile and
+    miao's training sample agree to the bit.
+    """
+    values = torch.from_numpy(np.ascontiguousarray(tile, dtype=np.float32))
+    std = values.std().clamp_min(1e-8)
+    return ((values - values.mean()) / std).numpy()
+
+
 def storage_axes_of(config: Any, volume_name: str) -> str:
     """The spatial axis order this volume is *stored* in, which is not the config's output order.
 
@@ -474,11 +485,18 @@ class VolumeGrid:
             window.insert(self.info.img_axes.index("c"), 0)
         block = np.asarray(handle[tuple(window)])
         resampled = resample_image(block, tuple(self.patch))
-        return normalize(
-            resampled, np.dtype(block.dtype),
-            self.volume.normalize_min if self.volume.normalize else None,
-            self.volume.normalize_max if self.volume.normalize else None,
-        )
+        # Both of miao's steps, in its order. `normalize: false` leaves the intensities raw -- no
+        # window and no division by the dtype's maximum -- and `patch_normalize` then standardises
+        # each sample, so each tile here; skipping either hands the model off-distribution input
+        # that is still scored without complaint.
+        if self.volume.normalize:
+            out = normalize(resampled, np.dtype(block.dtype),
+                            self.volume.normalize_min, self.volume.normalize_max)
+        else:
+            out = resampled.astype(np.float32, copy=False)
+        if self.volume.patch_normalize:
+            out = patch_normalize(out)
+        return out
 
     def read_ground_truth(self) -> np.ndarray:
         """The whole aligned region's labelling, on the output lattice, as int64.

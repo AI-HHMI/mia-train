@@ -90,6 +90,15 @@ def test_requires_an_axis_order_from_somewhere():
         AffinitySegmentation(_encoder())
 
 
+@pytest.mark.unit
+def test_a_positive_ignore_index_is_refused():
+    """Unannotated voxels stored as 255 would be renumbered into ordinary instances by the
+    connected-components split before anything masked them: masked_fraction rose from 0.29 to
+    0.66 in a CPU check, with a finite loss throughout."""
+    with pytest.raises(ValueError, match="ignore_index must be 0 or negative"):
+        _algorithm(ignore_index=255)
+
+
 # ---------------------------------------------------------------- the step
 
 

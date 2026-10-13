@@ -14,10 +14,10 @@ succeeds and produces numbers.
 `_StridedShard(0, split_factor=3)` is the placement that says "this extent was already cut into 3
 pieces before you sharded it", which is exactly true of a fused qkv. It hands rank *r* rows
 `[q_r | k_r | v_r]` -- its own heads' share of each of the three -- so the existing reshape is
-correct on the local tensor with the local head count, and `full_tensor()` still reassembles the
-ordinary `[q | k | v]` global weight, so a checkpoint written under tensor parallelism is
-byte-identical in layout to one written without it. It is also the placement FSDP2 itself composes
-with a TP shard, so the 2D (dp, tp) case works rather than being a special case to write.
+correct on the local tensor with the local head count, and under TP alone `full_tensor()` still
+reassembles the ordinary `[q | k | v]` global weight. DCP cannot checkpoint the placement, though,
+and composed with FSDP it no longer describes the layout (`strided_tensor_parallel_tensors`), so
+a run under tp > 1 can neither save nor resume; `CheckpointManager` refuses both.
 
 **Entering and leaving sequence parallelism.** Sequence parallelism is what makes tensor
 parallelism worth anything for large volumetric crops: plain TP shards the projections but leaves
@@ -65,6 +65,28 @@ from torch.distributed.tensor.placement_types import _StridedShard
 
 #: How many projections the fused qkv Linear holds, in output order.
 QKV_FUSION = 3
+
+
+def strided_tensor_parallel_tensors(module: nn.Module) -> list[str]:
+    """Parameters and buffers tensor parallelism split with `_StridedShard` -- the fused qkv's.
+
+    DCP (torch 2.13) cannot checkpoint them. It describes each rank's shard as one contiguous box
+    starting at its first global offset, while a `[q_r | k_r | v_r]` shard is three disjoint row
+    blocks. Saving therefore fails plan validation ("overlapping chunks") on every rank, and
+    loading, which has no overlap check, fills each rank's k and v rows with other heads'. Composed
+    with FSDP the placements misdescribe the layout further, so not even `full_tensor()`
+    reassembles it.
+    """
+    names = []
+    for name, tensor in (*module.named_parameters(), *module.named_buffers()):
+        if not isinstance(tensor, DTensor):
+            continue
+        mesh_dims = tensor.device_mesh.mesh_dim_names or ()
+        if "tp" in mesh_dims and isinstance(
+            tensor.placements[mesh_dims.index("tp")], _StridedShard
+        ):
+            names.append(name)
+    return names
 
 #: Token axis of a `(batch, tokens, features)` activation.
 SEQUENCE_DIM = 1

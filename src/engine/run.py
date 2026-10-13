@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,11 +34,14 @@ def _latest_run_dir(output_root: Path, experiment_name: str) -> Path | None:
     """Newest existing run directory for this experiment, if there is one.
 
     Names end in a `%Y%m%d_%H%M%S` stamp, so sorting them lexicographically orders them by time.
+    Matched as the whole name, stamp included, not as a prefix: `lsd_aux_v1__mtlsd_s80_` is the
+    start of `lsd_aux_v1__mtlsd_s80_bgzero_...`, and 'b' sorts after every stamp's '2', so a
+    resume of the first would have adopted the second's directory and trained its checkpoint.
     """
     if not output_root.is_dir():
         return None
-    prefix = f"{experiment_name}_"
-    existing = sorted(p for p in output_root.iterdir() if p.is_dir() and p.name.startswith(prefix))
+    name = re.compile(rf"{re.escape(experiment_name)}_\d{{8}}_\d{{6}}")
+    existing = sorted(p for p in output_root.iterdir() if p.is_dir() and name.fullmatch(p.name))
     return existing[-1] if existing else None
 
 

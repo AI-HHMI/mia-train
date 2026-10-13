@@ -101,6 +101,29 @@ def _validate_returns_metrics(rank: int, world_size: int, output_dir: str) -> di
     return trainer.validate()
 
 
+class _FewSamples(BaseDataset):
+    def build_dataset(self) -> data.Dataset:
+        return _FixedDataset(n=3)
+
+
+def _validate_a_share_smaller_than_a_batch(
+    rank: int, world_size: int, output_dir: str
+) -> tuple[dict[str, float], int]:
+    dims = ParallelDims(dp_shard=world_size)
+    mesh = dims.build_mesh("cpu")
+    trainer = Trainer(
+        algorithm=_ReconstructAlgorithm(_TinyModel()),
+        train_dataset=_SyntheticDataset(),
+        config=TrainerConfig(max_steps=2, batch_size=4, log_every=1000, seed=0),
+        output_dir=Path(output_dir),
+        dims=dims,
+        mesh=mesh,
+        val_dataset=_FewSamples(),
+    )
+    assert trainer.val_loader is not None
+    return trainer.validate(), len(trainer.val_loader)
+
+
 def _dp_rank_covers_every_shard(rank: int, world_size: int) -> int:
     dims = ParallelDims(dp_shard=world_size)
     mesh = dims.build_mesh("cpu")
@@ -130,6 +153,19 @@ def test_validate_returns_metrics(run_distributed):
     for metrics in results:
         assert "loss" in metrics
         assert metrics["loss"] > 0.0
+
+
+@pytest.mark.cpu_dist
+def test_a_validation_share_smaller_than_a_batch_still_validates(run_distributed):
+    """3 samples over 2 ranks at batch 4: each rank's padded share of 2 used to be dropped whole,
+    so validation ran no batches and reported nothing, on every rank alike."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        results = run_distributed(
+            _validate_a_share_smaller_than_a_batch, world_size=2, args=(tmp,)
+        )
+    for metrics, batches in results:
+        assert batches == 1
+        assert metrics.get("loss", 0.0) > 0.0
 
 
 @pytest.mark.cpu_dist

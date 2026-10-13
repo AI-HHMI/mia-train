@@ -66,6 +66,14 @@ def test_latest_run_dir_ignores_other_experiments(tmp_path):
 
 
 @pytest.mark.unit
+def test_latest_run_dir_ignores_an_experiment_its_name_is_a_prefix_of(tmp_path):
+    """lsd_aux_v1's `mtlsd_s80` and `mtlsd_s80_bgzero`: 'b' sorts after the stamp's '2'."""
+    mine = _run_dir(tmp_path, "lsd_aux_v1__mtlsd_s80_20260101_000000")
+    _run_dir(tmp_path, "lsd_aux_v1__mtlsd_s80_bgzero_20260101_000000")
+    assert _latest_run_dir(tmp_path, "lsd_aux_v1__mtlsd_s80") == mine
+
+
+@pytest.mark.unit
 def test_without_resume_a_fresh_directory_is_minted(tmp_path):
     existing = _run_dir(tmp_path, "exp_20260101_000000")
     chosen = resolve_output_dir(tmp_path, "exp")

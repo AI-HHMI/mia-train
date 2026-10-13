@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed._composable.replicate import replicate
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import register_fsdp_forward_method
+from torch.distributed.fsdp import FSDPModule, register_fsdp_forward_method
 from torch.distributed.tensor.parallel import parallelize_module
 
 from algorithms.base import BaseAlgorithm
@@ -248,6 +250,13 @@ def shard_algorithm(
 
     if _shard(algorithm, mesh, dims):
         register_fsdp_forward_method(algorithm, "validation_step")
+        # A step may use a parameter on some ranks and not on others -- a promptable correction
+        # round feeds its mask prompt on a coin each rank draws for itself -- and FSDP2 leaves a
+        # parameter without a gradient out of the reduce-scatter, so the ranks would enter that
+        # collective with different sizes: a hang, or gradients summed at shifted offsets.
+        # Zero gradients for the unused ones keep every rank's collective the same. Recursive,
+        # so it covers the model's units as well.
+        cast(FSDPModule, algorithm).set_reduce_scatter_unused_params(True)
     elif dims.dp_replicate > 1:
         replicate(algorithm, device_mesh=mesh["dp_replicate"])
 

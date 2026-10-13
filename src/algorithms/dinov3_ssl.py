@@ -31,8 +31,10 @@ import math
 from typing import Any, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
+from data.augment import SECTION_AXIS, SPATIAL_AXES
 from data.base import BaseDataset
 from layers.dinov3.head import DINOHead
 from models.base import BaseModel
@@ -127,6 +129,17 @@ class DINOv3(BaseAlgorithm):
 
         rank = self._spatial_rank(model)
         self.spatial_rank = rank
+        # The spatial slots a view's quarter turn exchanges, found by name: the axes other than
+        # the section axis. Their positions follow the axis order -- slots 0 and 1 under
+        # "lcxyz", 1 and 2 under "lczyx" -- and an image's two axes are both in-plane.
+        spatial = [axis for axis in self.input_axes if axis in SPATIAL_AXES]
+        in_plane = tuple(slot for slot, axis in enumerate(spatial) if axis != SECTION_AXIS)
+        self.in_plane: tuple[int, int] = (0, 1) if rank == 2 else in_plane  # type: ignore[assignment]
+        if len(self.in_plane) != 2:
+            raise ValueError(
+                f"input_axes={self.input_axes!r} has spatial axes {spatial}; a volume needs "
+                f"exactly two besides the section axis {SECTION_AXIS!r} to rotate views within"
+            )
         self.global_crop_size = (global_crop_size,) * rank
         self.local_crop_size = (local_crop_size,) * rank
         patch_size = cast(Any, model).patch_size
@@ -146,7 +159,8 @@ class DINOv3(BaseAlgorithm):
         )
 
         # The teacher starts where the student is or the first steps just distil noise. 
-        # `update_teacher` is its only writer, its parameters are detached from autograd entirely.
+        # `update_teacher` is its only writer -- the trainer calls it after every optimizer step,
+        # through `after_optimizer_step` -- and its parameters are detached from autograd entirely.
         self.teacher = copy.deepcopy(self.student)
         for parameter in self.teacher.parameters():
             parameter.requires_grad_(False)
@@ -220,6 +234,9 @@ class DINOv3(BaseAlgorithm):
         span = self.final_momentum_teacher - self.momentum_teacher
         return self.final_momentum_teacher - span * (1 + math.cos(math.pi * progress)) / 2
 
+    def after_optimizer_step(self) -> None:
+        self.update_teacher()
+
     @torch.no_grad()
     def update_teacher(self) -> None:
         """One EMA step over parameters. Buffers are left alone, following the reference."""
@@ -250,6 +267,7 @@ class DINOv3(BaseAlgorithm):
         globals_ = [
             photometric(
                 random_resized_crop(volumes, self.global_crop_size, self.global_crop_scale,
+                                    plane=self.in_plane,
                                     flip_prob=self.augmentation.flip_prob,
                                     rotate_prob=self.augmentation.rotate_prob),
                 self.augmentation,
@@ -259,6 +277,7 @@ class DINOv3(BaseAlgorithm):
         locals_ = [
             photometric(
                 random_resized_crop(volumes, self.local_crop_size, self.local_crop_scale,
+                                    plane=self.in_plane,
                                     flip_prob=self.augmentation.flip_prob,
                                     rotate_prob=self.augmentation.rotate_prob),
                 self.augmentation,
@@ -301,8 +320,11 @@ class DINOv3(BaseAlgorithm):
                 )
 
         # --- student: global views masked, local views whole ---
-        student_global = backbone.forward_features(global_views, masks)
-        student_local = backbone.forward_features(local_views)
+        # In one call, as the reference makes it: the backbone takes the second entry to be the
+        # local crops, which is how `untie_global_and_local_cls_norm` reaches them at all.
+        student_global, student_local = backbone.forward_features(
+            [global_views, local_views], [masks, None]
+        )
 
         student_head = self._part(self.student, "dino_head")
         student_global_cls = student_head(student_global["x_norm_clstoken"])
@@ -337,7 +359,10 @@ class DINOv3(BaseAlgorithm):
             loss = loss + self.ibot_loss_weight * ibot
             metrics["ibot"] = ibot.detach()
 
-        if self.koleo_loss_weight > 0:
+        # Not over a validation batch of one sample in all: its last batch may be partial, and one
+        # embedding has no neighbour. In training that size is a configuration error KoLeo raises.
+        world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        if self.koleo_loss_weight > 0 and (train or batch_size * world >= 2):
             # On pre-head CLS features, and per global view: the regularizer is about the geometry
             # of the representation, not of the prototype logits.
             pre_head = student_global["x_norm_clstoken"].unflatten(0, (2, batch_size))

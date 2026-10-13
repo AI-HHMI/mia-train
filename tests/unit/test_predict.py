@@ -15,6 +15,7 @@ plus the `VolumePredictor` dispatch in `prediction.dense` and the `--override` p
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -125,6 +126,37 @@ def test_normalisation_follows_the_volume_not_the_dtype():
     assert plain[2] == pytest.approx(569 / 65535)
 
 
+# ----------------------------------------------------------------- checks against the run
+
+
+def test_the_window_is_checked_per_axis_name(monkeypatch):
+    """A permuted non-cubic window is refused; the same window in another axis order is not."""
+    import predict
+
+    monkeypatch.setattr(predict, "storage_axes_of", lambda config, name: "zyx")
+    run = {"data": {"kwargs": {"patch_size": [256, 256, 128], "output_axes": "lcxyz"}}}
+    same = SimpleNamespace(output_axes="lczyx", patch_size=[128, 256, 256])
+    assert predict.resolve_patch(same, run, "v", None) == [128, 256, 256]
+    swapped = SimpleNamespace(output_axes="lczyx", patch_size=[256, 256, 128])
+    with pytest.raises(SystemExit, match="trained on"):
+        predict.resolve_patch(swapped, run, "v", None)
+
+
+def test_predicting_at_another_resolution_is_refused():
+    import predict
+
+    run = {"data": {"kwargs": {"resolutions": [[9.0, 9.0, 20.0]], "output_axes": "lcxyz"}}}
+    predict.check_resolution(
+        SimpleNamespace(resolutions=[[20, 9, 9]], output_axes="lczyx"), run, allow=False
+    )
+    swapped = SimpleNamespace(resolutions=[[9, 9, 20]], output_axes="lczyx")
+    with pytest.raises(SystemExit, match="trained at"):
+        predict.check_resolution(swapped, run, allow=False)
+    predict.check_resolution(swapped, run, allow=True)
+    sampled = {"data": {"kwargs": {"resolutions": None, "output_axes": "lcxyz"}}}
+    predict.check_resolution(swapped, sampled, allow=False)
+
+
 # ----------------------------------------------------------------- parity with miao
 
 
@@ -161,6 +193,27 @@ def test_reader_matches_miao_exactly(config: Path, volume: str, box: list[list[i
             v.model_copy(update={"bounding_box": box}) if v.name == volume else v
             for v in base.volumes
         ]})
+    _assert_reader_matches_miao(base, volume)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("override", [{"patch_normalize": True}, {"normalize": False}])
+def test_reader_matches_miao_under_its_other_normalisations(override: dict[str, Any]) -> None:
+    """`patch_normalize` and `normalize: false` reach predict.py's reader as they reach miao's.
+
+    Both were once ignored here: tiles stayed windowed (or were divided by the dtype's maximum)
+    while training saw standardised (or raw) intensities.
+    """
+    pytest.importorskip("miao")
+    if not DATA_CONFIG.is_file():
+        pytest.skip(f"{DATA_CONFIG} not present")
+    from miao.config import load_config
+
+    volume = "kasthuri15_ac4"
+    base = load_config(DATA_CONFIG)
+    base = base.model_copy(update={"volumes": [
+        v.model_copy(update=override) if v.name == volume else v for v in base.volumes
+    ]})
     _assert_reader_matches_miao(base, volume)
 
 

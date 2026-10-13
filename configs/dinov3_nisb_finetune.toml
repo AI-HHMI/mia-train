@@ -25,7 +25,7 @@ name = "dinov3_vit3d"
 img_size = 64
 patch_size = 16          # must match the checkpoint's: the in-plane kernel is transferred as is,
                          # only the new depth axis is synthesised
-in_chans = 1             # microscopy is single-channel; the RGB kernel is averaged down
+in_chans = 1             # microscopy is single-channel; the RGB kernel is summed down
 embed_dim = 768          # ViT-B/16
 depth = 12
 num_heads = 12
@@ -46,13 +46,17 @@ pos_embed_rope_type = "superposition"
 path = "/path/to/dinov3_vitb16_pretrain_lvd1689m.pth"
 
 # The 2D patch embedding is a (768, 3, 16, 16) kernel; this model wants (768, 1, 16, 16, 16).
-# The kernel is averaged over RGB and spread over the new depth axis, divided by its length so a
-# z-constant volume reproduces the 2D response exactly.
+# The release's input standardisation (named by its file: LVD-1689M or SAT-493M) is folded into the
+# kernel and bias, the RGB channels are summed, and the result is spread over the new depth axis,
+# divided by its length -- so a z-constant volume reproduces the 2D model's response to that image
+# exactly.
 inflate_2d_to_3d = true
 
 # `rope_embed` buffers are recomputed from `base` in the model's own init_weights and carry no
 # learned information; 2D and 3D split their channels differently, so their lengths disagree.
-# Skipping them loses nothing and avoids a spurious shape mismatch.
+# Skipping them loses nothing and avoids a spurious shape mismatch. For stage 3, drop the skip:
+# from your own 3D run every rope tensor fits, and `rope_embed.` would also catch the learned depth
+# gate `rope_embed.depth_scale` and reset it (load_pretrained refuses that).
 skip = ["rope_embed."]
 
 # Every remaining tensor must fit. Loading nothing, or silently dropping a block, would train a

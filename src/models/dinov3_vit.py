@@ -270,7 +270,7 @@ class DinoVisionTransformer(BaseModel):
                     # We only ever apply this during training.
                     assert self.local_cls_norm is not None  # implied by the flag
                     x_norm_cls_reg = self.local_cls_norm(x[:, : self.n_storage_tokens + 1])
-                if self.untie_cls_and_patch_norms:
+                elif self.untie_cls_and_patch_norms:
                     assert self.cls_norm is not None  # implied by the flag
                     x_norm_cls_reg = self.cls_norm(x[:, : self.n_storage_tokens + 1])
                 else:

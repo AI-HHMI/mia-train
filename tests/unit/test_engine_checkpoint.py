@@ -81,6 +81,50 @@ def _trainer(output_dir: Path, **overrides: Any) -> Trainer:
     )
 
 
+class _Headed(BaseAlgorithm):
+    """A head on the model's output, so a frozen-backbone warm-up still has something to train."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__(model)
+        self.head = nn.Linear(4, 4)
+
+    def training_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"loss": (self.head(self.model(batch)) - batch).pow(2).mean()}
+
+    def validation_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self.training_step(batch)
+
+
+class _Interrupted(Exception):
+    """A job killed right after a save."""
+
+
+def _interrupt_after_saving(trainer: Trainer, step: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_save = trainer.checkpoints.save
+
+    def _save(saved: int) -> Path:
+        path = real_save(saved)
+        if saved == step:
+            raise _Interrupted
+        return path
+
+    monkeypatch.setattr(trainer.checkpoints, "save", _save)
+
+
+def _headed_trainer(output_dir: Path, **overrides: Any) -> Trainer:
+    settings: dict[str, Any] = dict(
+        max_steps=6, batch_size=2, lr=1e-2, log_every=1000, checkpoint_every=2, seed=0,
+        freeze_backbone_steps=4,
+    )
+    settings.update(overrides)
+    return Trainer(
+        algorithm=_Headed(_TinyModel()),
+        train_dataset=_Synthetic(),
+        config=TrainerConfig(**settings),
+        output_dir=output_dir,
+    )
+
+
 def _recorded_saves(trainer: Trainer, monkeypatch: pytest.MonkeyPatch) -> list[int]:
     """The steps this trainer asks `CheckpointManager` to write, filled in as it runs.
 
@@ -103,6 +147,46 @@ def _saved_steps(output_dir: Path) -> list[int]:
     if not checkpoints.is_dir():
         return []
     return sorted(int(p.name.removeprefix("step_")) for p in checkpoints.iterdir())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("saved_at", [2, 4])
+def test_resumes_from_a_checkpoint_saved_in_the_frozen_warmup(tmp_path, monkeypatch, saved_at):
+    # Inside the warm-up (2) and at its last step (4) the checkpoint holds no optimizer state for
+    # the frozen backbone, which a fresh optimizer's template would demand.
+    first = _headed_trainer(tmp_path)
+    _interrupt_after_saving(first, saved_at, monkeypatch)
+    with pytest.raises(_Interrupted):
+        first.train()
+    resumed = _headed_trainer(tmp_path)
+    resumed.train()
+    assert _saved_steps(tmp_path)[-1] == 6
+    assert all(p.requires_grad for p in resumed.algorithm.model.parameters())
+
+
+@pytest.mark.unit
+def test_model_only_load_reads_a_warmup_checkpoint(tmp_path, monkeypatch):
+    # What predict.py does: the weights and the step, and no optimizer state to match.
+    first = _headed_trainer(tmp_path)
+    _interrupt_after_saving(first, 2, monkeypatch)
+    with pytest.raises(_Interrupted):
+        first.train()
+    algorithm = _Headed(_TinyModel())
+    manager = CheckpointManager(
+        algorithm, torch.optim.AdamW(algorithm.parameters()), tmp_path / "checkpoints"
+    )
+    assert manager.load_latest(model_only=True) == 2
+
+
+@pytest.mark.unit
+def test_an_unfinished_save_is_skipped(tmp_path):
+    _trainer(tmp_path, max_steps=5).train()
+    # What a save interrupted before DCP wrote its metadata leaves behind.
+    (tmp_path / "checkpoints" / "step_9").mkdir()
+    manager = _trainer(tmp_path).checkpoints
+    assert manager.latest_checkpoint() == tmp_path / "checkpoints" / "step_5"
+    with pytest.raises(ValueError, match="unfinished"):
+        manager.load_step(9)
 
 
 @pytest.mark.unit
@@ -213,6 +297,7 @@ def test_save_and_load_pass_the_coordination_group_to_dcp(tmp_path, monkeypatch)
 
     manager.save(step=1)
     (tmp_path / "step_1").mkdir(exist_ok=True)
+    (tmp_path / "step_1" / ".metadata").touch()  # what makes a save complete; the fake writes none
     manager.load_latest()
 
     assert seen == {"save": "the-gloo-group", "load": "the-gloo-group"}

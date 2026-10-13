@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -23,6 +24,22 @@ def _git(repo_dir: Path, *args: str) -> str | None:
     if result.returncode != 0:
         return None
     return result.stdout
+
+
+def code_version(repo_dir: Path, paths: Sequence[str] = ("src",)) -> str:
+    """The commit, plus a digest of any uncommitted change under `paths`, as one string.
+
+    Equal for two processes running the same code, so an artifact can record what made it and a
+    later run can tell whether that is still the code it would run. Only `paths`, so an edit to an
+    experiment's notes does not make yesterday's predictions look stale.
+    """
+    commit = _git(repo_dir, "rev-parse", "HEAD")
+    if commit is None:
+        return "unknown"
+    diff = _git(repo_dir, "diff", "HEAD", "--", *paths) or ""
+    if not diff.strip():
+        return commit.strip()
+    return f"{commit.strip()}+{hashlib.sha256(diff.encode()).hexdigest()[:12]}"
 
 
 def git_metadata(repo_dir: Path) -> dict[str, Any] | None:

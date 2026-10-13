@@ -73,6 +73,14 @@ class BaseAlgorithm(nn.Module, abc.ABC):
         """
         return None
 
+    def after_optimizer_step(self) -> None:
+        """Called by the trainer after every optimizer step, on the algorithm itself.
+
+        For state that follows the trained parameters without being trained -- an EMA teacher.
+        Nothing else in the engine writes such state: it is not in the optimizer, and it takes no
+        gradient. A no-op unless a strategy needs it.
+        """
+
     def checkpointable_modules(self) -> tuple[nn.Module, ...]:
         """Submodules of the *strategy* worth recomputing in backward, beside the model's own.
 

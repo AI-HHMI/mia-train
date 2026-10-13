@@ -64,6 +64,7 @@ rows score different regions.
 from __future__ import annotations
 
 import argparse
+import functools
 import gc
 import json
 import tomllib
@@ -240,7 +241,11 @@ def load_algorithm(
     if path is not None and path.is_dir():
         assert_checkpoint_is_fully_consumed(algorithm, path)
 
-    loaded = manager.load_latest() if step is None else manager.load_step(step)
+    # The weights alone: prediction never steps the optimizer, and a checkpoint saved during a
+    # frozen-backbone warm-up holds no optimizer state for the backbone, which a full load of a
+    # fresh optimizer's template would refuse.
+    loaded = (manager.load_latest(model_only=True) if step is None
+              else manager.load_step(step, model_only=True))
     if loaded == 0:
         raise SystemExit(f"no checkpoint found under {run_dir / 'checkpoints'}")
     print(f"loaded step {loaded} from {run_dir.name}", flush=True)
@@ -272,6 +277,28 @@ def resolve_patch(
         print(f"[patch] overriding {patch} with {override} on every axis", flush=True)
         return [override] * len(storage_axes)
 
+    # Per axis *name*, against the window the run's own data config trained on. Comparing sorted
+    # extents let any permutation of a non-cubic window through -- a model trained 256 x 256 x 128
+    # in x, y, z then ran with x = 128 and z = 256 -- and nothing downstream objects: AxisOrder
+    # transposes by name and the encoder takes its grid from the input.
+    data = resolved.get("data", {}).get("kwargs", {})
+    trained_patch, trained_axes = data.get("patch_size"), data.get("output_axes")
+    if trained_patch is not None and trained_axes is not None:
+        spatial = "".join(axis for axis in trained_axes if axis in "xyz")
+        sizes = ([int(trained_patch)] * len(spatial) if isinstance(trained_patch, (int, float))
+                 else [int(v) for v in trained_patch])
+        trained_by_axis = dict(zip(spatial, sizes, strict=True))
+        requested = dict(zip(storage_axes, patch, strict=True))
+        if trained_by_axis != requested:
+            raise SystemExit(
+                f"the data config asks for a window of {requested} but the run trained on "
+                f"{trained_by_axis} (axis: voxels). Predicting at a window other than the one the "
+                "encoder trained at silently moves every position it sees, because RoPE normalises "
+                "coordinates by the runtime grid extent. Fix the config, or pass --patch to override "
+                "deliberately."
+            )
+        return patch
+
     img_size = resolved.get("model", {}).get("kwargs", {}).get("img_size")
     if img_size is not None:
         trained = (
@@ -287,6 +314,43 @@ def resolve_patch(
                 "runtime grid extent. Fix the config, or pass --patch to override deliberately."
             )
     return patch
+
+
+def check_resolution(config: Any, resolved: dict[str, Any], allow: bool) -> None:
+    """Refuse a data config whose resolutions are not the ones the run trained at.
+
+    A model run at another resolution sees its objects at another scale -- a 4 nm model on 8 nm
+    data sees them at half the size it learned -- and its scores still land in a table beside the
+    others with nothing to tell them apart. Compared per axis name and per level. A run trained
+    with resolution sampling covered a range rather than a point, so it is not checked; `allow`
+    (`--allow-resolution-mismatch`) is for predicting at another resolution on purpose.
+    """
+    data = resolved.get("data", {}).get("kwargs", {})
+    trained = data.get("resolutions")
+    if allow or trained is None:
+        return
+
+    def per_axis(levels: Any, axes: str) -> list[dict[str, float]]:
+        spatial = "".join(axis for axis in axes if axis in "xyz")
+        return [dict(zip(spatial, (float(v) for v in level), strict=True)) for level in levels]
+
+    trained_axes = data.get("output_axes", config.output_axes)
+    want = per_axis(config.resolutions, config.output_axes)
+    have = per_axis(trained, trained_axes)
+    if want != have:
+        raise SystemExit(
+            f"the data config predicts at {want} nm but the run trained at {have} nm (per level, "
+            "axis: nm). Use a data config at the run's resolution, or pass "
+            "--allow-resolution-mismatch to predict at another one deliberately."
+        )
+
+
+@functools.cache
+def _code_version() -> str:
+    """This checkout's commit plus any uncommitted change under src/, once per process."""
+    from utils.provenance import code_version
+
+    return code_version(Path(__file__).resolve().parents[1])
 
 
 def shared_attrs(
@@ -322,6 +386,9 @@ def shared_attrs(
         "step": step,
         "data_config": str(data_config),
         "volume": grid.volume.name,
+        # So a finished blockwise artifact can tell whether it was made by the code that would
+        # remake it: re-predicting after a fix must not quietly keep the old values.
+        "code_version": _code_version(),
     }
 
 
@@ -502,6 +569,9 @@ def main() -> None:
                         help="for class scores: write the class each voxel ranks first, as a "
                              "class_labels labelling, instead of every class's score -- a fraction "
                              "of the size, and of the memory, since no float16 copy is blended")
+    parser.add_argument("--allow-resolution-mismatch", action="store_true",
+                        help="predict at a resolution the run did not train at, on purpose; "
+                             "refused otherwise, since its objects then sit at another scale")
     args = parser.parse_args()
     if args.block is None and (args.worker != 0 or args.workers != 1):
         raise SystemExit("--worker and --workers share out blocks, so they need --block")
@@ -544,6 +614,7 @@ def main() -> None:
         algorithm, step, resolved = load_algorithm(
             args.run_dir, device, args.step, overrides=args.override
         )
+        check_resolution(config, resolved, args.allow_resolution_mismatch)
         # Resolved before any store is opened, so a strategy that cannot be run over a volume fails
         # here in a second rather than after the reads.
         predictor = select_predictor(algorithm)

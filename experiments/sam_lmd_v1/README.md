@@ -543,12 +543,20 @@ disagreement the block tables and the oracle galleries showed. **The region epis
 lattice fills more of each volume than the 256 lattice (the tail a 256 stride cannot complete:
 kasthuri15_ac4 320x704x704 against 256x640x640), so the first record was scored over a larger
 region, and the leaderboard -- which groups rows by scored region and refuses to rank different
-regions together -- put it in a table of its own at pq 0.2040. `crop_artifacts.py` crops an arm's
-predictions and co-registered truth to another arm's extents (origins are all 0, so only the tail
-goes and the OME placement holds); `score.sh` takes `ART_DIR` / `SCRATCH_DIR` to score such a copy
-(`eval/arm9_..._r0_lattice256/`, `score/arm9_..._r0_lattice256/`). The sub-region record is kept
-at `score/arm9_..._r0/record_lattice128_region.json`. Any arm whose window is not 256 needs this
-step before its row is comparable; arm 10 (352) will.
+regions together -- put it in a table of its own at pq 0.2040. `crop_artifacts.py` cropped arm 9's
+predictions and co-registered truth to arm 8's extents, keeping the leading voxels on the
+assumption that every lattice starts at origin 0; `score.sh` takes `ART_DIR` / `SCRATCH_DIR` to
+score such a copy (`eval/arm9_..._r0_lattice256/`, `score/arm9_..._r0_lattice256/`). The sub-region
+record is kept at `score/arm9_..._r0/record_lattice128_region.json`. **That crop is misplaced**
+(2026-10-13 audit, #15): `VolumeGrid` centres each window-dependent lattice in the box, so the 128
+lattice starts 7-45 native voxels before the 256 one, and the cropped regions overlap the common
+region by only 79.5% (kasthuri15_ac4), 90.5% (expid82), 83.8% (hippocampus) and 96.7% (zebrafish);
+the `origin` attrs it compared are 0 on every artifact. Its order against arm 5 (0.2038) is
+undetermined -- arm 9 scores 0.2040 on its own full region -- while its gap to arm 8 is robust. The
+script now aligns by each artifact's recorded `native_box` and output voxel, and refuses 7 of the 8
+arm-9 volumes: the two lattices' voxels differ by up to 2.4%, so no crop can line them up. An arm
+whose window is not 256 needs predicting onto the 256 lattice's box before its row is comparable;
+arm 10 (352) will too.
 
 **Why arm 9's single windows leave objects unpainted** (2026-09-22, `probes/unpainted-window-objects/`
 under the experiment root). In the gallery's central 128-voxel windows, 20% (kasthuri) and 15%

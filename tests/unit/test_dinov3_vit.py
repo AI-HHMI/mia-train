@@ -479,6 +479,16 @@ def test_tensor_parallel_plan_refuses_stochastic_depth(cls):
         _model(cls, drop_path_rate=0.1).tensor_parallel_plan()
 
 
+@pytest.mark.unit
+def test_tensor_parallel_plan_refuses_superposition_rope():
+    # The depth gate scales every head's angles but each rank applies the tables to its own heads,
+    # so its gradient would be one rank's share: tp = 2 measured -1.03e-2 and +1.19e-2 against a
+    # true +1.61e-3, and the peers would train different gates.
+    model = _model(DinoVisionTransformer3D, pos_embed_rope_type="superposition")
+    with pytest.raises(ValueError, match="superposition RoPE"):
+        model.tensor_parallel_plan()
+
+
 # ---------------------------------------------------------------- prepare_input
 
 

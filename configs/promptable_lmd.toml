@@ -68,9 +68,10 @@ use_fa4 = false
 
 [init]
 path = "/groups/miaai/miaai/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
-# The 2D patch embedding is a (1024, 3, 16, 16) kernel; this model wants (1024, 1, 16, 16, 16). It is
-# averaged over RGB and spread over the new depth axis, divided by its length so a z-constant volume
-# reproduces the 2D response exactly.
+# The 2D patch embedding is a (1024, 3, 16, 16) kernel; this model wants (1024, 1, 16, 16, 16). The
+# release's ImageNet standardisation is folded in, the RGB channels summed, and the kernel spread
+# over the new depth axis, divided by its length, so a z-constant volume reproduces the 2D model's
+# response to that image exactly.
 inflate_2d_to_3d = true
 # `rope_embed` buffers are recomputed from `base` in the model's own init_weights and carry no
 # learned information; 2D and 3D split their channels differently, so their lengths disagree.

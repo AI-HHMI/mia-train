@@ -34,6 +34,14 @@ logger = logging.getLogger(__name__)
 # Wrappers a checkpoint's real state dict is commonly buried under.
 _NESTING_KEYS = ("model", "state_dict", "teacher", "student")
 
+# The per-channel (mean, std) each released DINOv3 backbone standardises its [0, 1] RGB input
+# with, keyed by the pretraining dataset its filename names (upstream README, "Pretrained
+# backbones": ImageNet's statistics for LVD-1689M, satellite ones for SAT-493M).
+_RELEASE_STATISTICS = {
+    "lvd1689m": ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    "sat493m": ((0.430, 0.411, 0.296), (0.213, 0.156, 0.143)),
+}
+
 
 @dataclass
 class LoadReport:
@@ -41,6 +49,10 @@ class LoadReport:
 
     copied: list[str] = field(default_factory=list)
     inflated: list[str] = field(default_factory=list)
+    # Kernels whose release's input standardisation was folded in before inflation, and the
+    # dataset whose statistics were used.
+    folded: list[str] = field(default_factory=list)
+    folded_statistics: str = ""
     merged: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     kept_initial: list[str] = field(default_factory=list)
@@ -144,14 +156,56 @@ def resize_patch_kernel(kernel: torch.Tensor, ratio: int) -> torch.Tensor:
     )
 
 
+def release_statistics(path: str | Path) -> tuple[str, tuple[float, ...], tuple[float, ...]]:
+    """(dataset, mean, std) of the released DINOv3 checkpoint at `path`, read off its filename.
+
+    A release file names its pretraining dataset (`dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth`),
+    and the dataset decides the input standardisation; nothing inside the file records it.
+    """
+    name = Path(path).name.lower()
+    found = [dataset for dataset in _RELEASE_STATISTICS if dataset in name]
+    if len(found) != 1:
+        raise ValueError(
+            f"{path} carries an RGB patch kernel, and inflating it into a grey model reproduces "
+            "the 2D model only once the input standardisation that model was trained with is "
+            "folded in. That is known for the released DINOv3 files, whose names say which "
+            f"dataset they were pretrained on ({sorted(_RELEASE_STATISTICS)}); this name says "
+            f"{'none' if not found else 'several'}. Load the release file under its own name."
+        )
+    mean, std = _RELEASE_STATISTICS[found[0]]
+    return found[0], mean, std
+
+
+def fold_input_standardisation(
+    weight: torch.Tensor, bias: torch.Tensor, mean: Sequence[float], std: Sequence[float]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A patch kernel and bias that take raw [0, 1] input -> ones that take it standardised.
+
+    The released 2D model computes `sum_c w_c * (x_c - m_c) / s_c + b`. Nothing in the data
+    pipeline standardises with a release's statistics -- miao's `normalize` stops at [0, 1] -- so
+    they are moved into the layer instead: `w_c / s_c` per channel, and the constant
+    `-sum_c (m_c / s_c) * sum_hw w_c` into the bias. The patch embedding is a stride-equals-kernel
+    convolution with no padding, so that constant is the same for every patch and the fold is
+    exact.
+    """
+    shape = (1, -1, 1, 1)
+    mean_t = torch.tensor(mean, dtype=torch.float64).view(shape)
+    std_t = torch.tensor(std, dtype=torch.float64).view(shape)
+    folded = weight.double() / std_t
+    shifted = bias.double() - (folded * mean_t).sum(dim=(1, 2, 3))
+    return folded.to(weight.dtype), shifted.to(bias.dtype)
+
+
 def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size) -> torch.Tensor:
     """A 2D patch-embedding kernel (E, C, kh, kw) -> a 3D one (E, C', kd, kh, kw).
 
-    Two independent adjustments, in the order the reference implementation makes them:
+    Two independent adjustments:
 
     *Channels.* A checkpoint trained on RGB has three input channels where volumetric microscopy
-    has one. Averaging over them is what DINOv3's own hub loader does, and it means a grey input
-    produces the response the 2D model would have given the same image.
+    has one. A grey image is an RGB image whose channels are equal, so the 2D model's response to
+    it is the per-channel responses SUMMED, and the kernel is summed to match. That holds only
+    for a kernel that takes its input unstandardised: a released kernel expects the release's
+    standardisation, which `load_pretrained` folds in first (`fold_input_standardisation`).
 
     *Depth.* The kernel is repeated along the new axis and divided by its length, so a volume that
     is constant in z reproduces the 2D model's output on that slice exactly. Dividing matters: a
@@ -193,13 +247,13 @@ def inflate_2d_to_3d(weight: torch.Tensor, target: torch.Size) -> torch.Tensor:
 
     if in_channels != target_in:
         if target_in == 1:
-            weight = weight.mean(dim=1, keepdim=True)
+            weight = weight.sum(dim=1, keepdim=True)
         elif in_channels == 1:
             weight = weight.expand(-1, target_in, -1, -1) / target_in
         else:
             raise ValueError(
                 f"cannot map {in_channels} checkpoint input channels onto {target_in}; only "
-                "averaging to 1 channel or spreading 1 channel over several is defined"
+                "summing to 1 channel or spreading 1 channel over several is defined"
             )
 
     # (E, C, kh, kw) -> (E, C, kd, kh, kw), each z-slice carrying 1/kd of the original kernel.
@@ -271,8 +325,10 @@ def load_pretrained(
     encoder under `model.` alongside its decoder, and `prefix="model."` takes the former and
     ignores the latter.
 
-    `inflate` allows a 2D patch embedding to be reshaped into a 3D one. Nothing else is reshaped,
-    so a transformer block whose width disagrees is reported rather than quietly truncated.
+    `inflate` allows a 2D patch embedding to be reshaped into a 3D one, after folding a released
+    RGB kernel's input standardisation into it (see `fold_input_standardisation`). Nothing else is
+    reshaped, so a transformer block whose width disagrees is reported rather than quietly
+    truncated.
 
     `allow_unused` permits the checkpoint to carry tensors this model has no home for. Left off,
     that is an error, because the usual cause is an architecture that disagrees: a released DINOv3
@@ -285,8 +341,15 @@ def load_pretrained(
     is a buffer the model *derives* rather than learns: DINOv3's `rope_embed.periods` is computed
     from `base` in `init_weights`, and its length depends on how many axes the rotary embedding
     splits across -- 2D and 3D disagree. Transferring it would be meaningless and not transferring
-    it costs nothing, so it is skipped rather than treated as a mismatch.
+    it costs nothing, so it is skipped rather than treated as a mismatch. A prefix that also
+    catches a *learned* parameter the checkpoint holds at the model's own shape is refused, since
+    it would discard trained weights rather than sidestep a mismatch: `rope_embed.` at a 3D->3D
+    load under superposition RoPE caught the learned depth gate `rope_embed.depth_scale` and reset
+    it to zero.
     """
+    if isinstance(skip, str):
+        # Matched one character at a time, a string would skip nearly everything.
+        raise ValueError(f"skip must be a sequence of key prefixes, e.g. [{skip!r}], not a string")
     checkpoint = read_state_dict(path)
     filtered_by_prefix: list[str] = []
     if prefix:
@@ -313,10 +376,19 @@ def load_pretrained(
     destinations.update(model.named_buffers())
 
     report = LoadReport(merged=merged_layers, filtered_by_prefix=filtered_by_prefix)
+    if inflate:
+        _fold_release_standardisation(checkpoint, destinations, path, skip, report)
+    discarded: list[str] = []
     with torch.no_grad():
         for name, destination in destinations.items():
             source = checkpoint.pop(name, None)
             if any(name.startswith(ignored) for ignored in skip):
+                if (
+                    isinstance(destination, nn.Parameter)
+                    and source is not None
+                    and source.shape == destination.shape
+                ):
+                    discarded.append(name)
                 report.skipped.append(name)
                 continue
             if source is None:
@@ -336,16 +408,26 @@ def load_pretrained(
         key for key in checkpoint if not any(key.startswith(ignored) for ignored in skip)
     )
 
+    if discarded:
+        raise ValueError(
+            f"skip = {list(skip)} catches {discarded}, learned parameter(s) {path} holds at this "
+            "model's own shape, so it would throw trained weights away rather than sidestep a "
+            "mismatch. Skip only what the model derives -- for DINOv3's rotary embedding the "
+            'buffers, ["rope_embed.periods", "rope_embed.depth_periods"] -- or nothing: at a '
+            "3D->3D load every rope tensor already fits, and `rope_embed.depth_scale` is "
+            "superposition RoPE's learned depth gate."
+        )
     logger.info("loaded pretrained weights from %s: %s", path, report.summary())
     if report.inflated:
         logger.info("inflated 2D->3D: %s", ", ".join(report.inflated))
     if report.kept_initial:
         logger.info("kept at initial value: %s", ", ".join(report.kept_initial))
 
-    if not strict:
-        return report
-
-    if report.mismatched:
+    # `strict` relaxes the shape and leftover checks only. A load that matched nothing still
+    # raises -- it would train from scratch under an [init] path -- and every load is summarised:
+    # returning early used to skip both, so a wrong prefix under strict = false loaded zero
+    # tensors without printing a line.
+    if strict and report.mismatched:
         details = "\n".join(
             f"  {name}: checkpoint {source} vs model {destination}"
             for name, source, destination in report.mismatched
@@ -363,7 +445,7 @@ def load_pretrained(
             f"{sorted(destinations)[:5]}. Set `prefix` if the checkpoint stores the encoder under "
             "one."
         )
-    if report.unused and not allow_unused:
+    if strict and report.unused and not allow_unused:
         raise ValueError(
             f"{len(report.unused)} tensor(s) in {path} have no home in this model, so it is "
             f"configured differently from the one that was trained: {report.unused[:6]}"
@@ -371,6 +453,42 @@ def load_pretrained(
         )
     _log_load(model, path, report)
     return report
+
+
+def _fold_release_standardisation(
+    checkpoint: dict[str, torch.Tensor],
+    destinations: dict[str, torch.Tensor],
+    path: str | Path,
+    skip: Sequence[str],
+    report: LoadReport,
+) -> None:
+    """Fold the release's input standardisation into every RGB kernel about to be inflated.
+
+    In place on `checkpoint`, before anything is matched, so a kernel and its bias change together
+    whichever order the model lists them in.
+    """
+    for name, destination in destinations.items():
+        source = checkpoint.get(name)
+        if (
+            source is None
+            or source.ndim != 4
+            or destination.ndim != 5
+            or source.shape[1] != 3
+            or any(name.startswith(ignored) for ignored in skip)
+        ):
+            continue
+        dataset, mean, std = release_statistics(path)
+        bias = name.removesuffix("weight") + "bias"
+        checkpoint[name], checkpoint[bias] = fold_input_standardisation(
+            source, checkpoint[bias], mean, std
+        )
+        report.folded.append(name)
+        report.folded_statistics = dataset
+    if report.folded:
+        logger.info(
+            "folded the %s input standardisation into: %s",
+            report.folded_statistics, ", ".join(report.folded),
+        )
 
 
 def _log_load(model: nn.Module, path: Path, report: LoadReport) -> None:
@@ -393,10 +511,17 @@ def _log_load(model: nn.Module, path: Path, report: LoadReport) -> None:
 
     print(f"[init] {type(model).__name__} <- {path}", flush=True)
     print(f"[init]   {report.summary()}", flush=True)
+    if report.folded:
+        print(
+            f"[init]   {report.folded_statistics} input standardisation folded into: "
+            f"{examples(report.folded)}",
+            flush=True,
+        )
     for label, names in (
         ("filtered out by prefix", report.filtered_by_prefix),
         ("skipped", report.skipped),
         ("kept at initial value", report.kept_initial),
+        ("mismatched, kept at initial value", [name for name, _, _ in report.mismatched]),
         ("unused from checkpoint", report.unused),
     ):
         if names:

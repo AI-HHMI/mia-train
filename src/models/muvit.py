@@ -237,8 +237,10 @@ class MuViT3D(BaseModel):
         would collapse every level onto the origin and destroy the cross-level geometry that is the
         entire point of the architecture.
 
-        Units are whatever the dataset uses. Only ratios matter to rotary attention, and the
-        frequencies are learnable, so the scale is absorbed during training.
+        Units are finest-level pixels, as `default_bbox` gives them; `MuViTMAE` converts miao's
+        physical boxes into the same frame (`algorithms.muvit_mae.finest_pixel_frame`). They have to
+        agree between pretraining and every later stage: the frequencies are learnable but barely
+        move in a fine-tune, so a change of units between the two is not absorbed.
         """
         batch_size = bbox.shape[0]
         if bbox.shape[1:] != (self.num_levels, 2, SPATIAL_RANK):

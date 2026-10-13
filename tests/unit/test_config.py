@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from engine.config import InitConfig
 from utils.config import as_plain_dict, load_run_config
 
 _MINIMAL = """
@@ -90,6 +91,28 @@ def test_missing_required_section_is_named_in_the_error(tmp_path, section):
     body = _MINIMAL.replace(f"[{section}]", "[some_other_section]")
     with pytest.raises(ValueError, match=section):
         load_run_config(_write(tmp_path, body))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stray", ["[LoRA]\nrank = 8\n", "[intit]\npath = 'x.pth'\n"])
+def test_a_misspelled_section_is_rejected_not_dropped(tmp_path, stray):
+    """Dropped, `[LoRA]` would fine-tune the whole encoder and `[intit]` train from scratch."""
+    with pytest.raises(ValueError, match="unknown top-level"):
+        load_run_config(_write(tmp_path, _MINIMAL + "\n" + stray))
+
+
+@pytest.mark.unit
+def test_a_stray_top_level_key_is_rejected(tmp_path):
+    # Above the first header, so a top-level key rather than the trainer's.
+    with pytest.raises(ValueError, match="unknown top-level"):
+        load_run_config(_write(tmp_path, "max_steps = 100\n" + _MINIMAL))
+
+
+@pytest.mark.unit
+def test_a_bare_string_skip_is_rejected():
+    """Frozen one character at a time it would skip nearly the whole encoder."""
+    with pytest.raises(ValueError, match="list of key prefixes"):
+        InitConfig(path="x.pth", skip="rope_embed.")
 
 
 @pytest.mark.unit

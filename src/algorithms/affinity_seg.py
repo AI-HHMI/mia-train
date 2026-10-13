@@ -230,6 +230,17 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
         self.input_axes = self._resolve_input_axes(input_axes, dataset)
         self.input_key = input_key
         self.label_key = label_key
+        # The connected-components split, `relabel_connected` and the descriptor target all take
+        # every id above 0 for an object, so a positive sentinel -- unannotated voxels stored as
+        # 255 -- would be renumbered into ordinary instances before anything masked it, and the
+        # unannotated region trained as solid objects.
+        if ignore_index > 0:
+            raise ValueError(
+                f"ignore_index must be 0 or negative, got {ignore_index}: every id above 0 is an "
+                "object to the connected-components split and the descriptor target, so a "
+                "positive one would be trained as instances rather than ignored. Store the "
+                "unannotated voxels as a negative id (-1 by default)."
+            )
         self.ignore_index = ignore_index
         self.split_disconnected = split_disconnected
         self.label_erosion = label_erosion

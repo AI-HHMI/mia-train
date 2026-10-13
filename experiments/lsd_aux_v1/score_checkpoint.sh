@@ -22,7 +22,10 @@ RUNS=$EXP/runs
 STEP=$1
 ARM=$2
 
-RUN=$(ls -dt "$RUNS"/lsd_aux_v1__${ARM}_*/ 2>/dev/null | head -1 || true)
+# Anchored on the run stamp: a bare `${ARM}_*` also matches every arm whose name starts with this
+# one's (mtlsd_s80_* is mtlsd_s80_bgzero_* too).
+STAMP='[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]'
+RUN=$(ls -dt "$RUNS"/lsd_aux_v1__${ARM}_$STAMP/ 2>/dev/null | head -1 || true)
 [[ -n "$RUN" ]] || { echo "no run of arm $ARM under $RUNS" >&2; exit 1; }
 
 # The step first, then this experiment's defaults, then the caller's flags, so a caller's `--tag`

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import random
 import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
@@ -23,13 +25,46 @@ from utils.hardware_flops import peak_flops
 from utils.metrics import MetricLogger, reduce_metrics
 
 from .activation_checkpoint import apply_activation_checkpointing
-from .checkpoint import CheckpointManager
+from .checkpoint import CheckpointManager, checkpoint_step
 from .config import TrainerConfig
 from .mfu import ThroughputMeter, measure_step_flops
 from .optimizer import build_lr_scheduler, build_optimizer, is_stem, optimizer_step
 from .profiler import StepProfiler, annotate, current_rank, should_profile
 
 _AUTOCAST_DTYPES = {"bf16": torch.bfloat16}
+
+
+def _stream_seed(seed: int, dp_rank: int, step: int) -> int:
+    """The seed of one data-parallel rank's random streams for an attempt starting at `step`.
+
+    Rank 0 at step 0 keeps `seed` itself, so a fresh single-GPU run draws what it always did. The
+    strides are odd 32-bit constants (the golden ratio, and murmur3's), not powers of two: torch's
+    CPU generator keeps only a seed's low 32 bits -- seeds 5 and 5 + 2**32 draw identically -- and
+    odd strides move those bits for every rank and every restart.
+    """
+    return (seed + dp_rank * 0x9E3779B9 + step * 0x85EBCA6B) % 2**32
+
+
+def _fingerprint(batch: Any) -> tuple[float, ...]:
+    """Each tensor's float64 sum and sum of squares, in a fixed order: equal only for equal data."""
+    tensors: list[torch.Tensor] = []
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, torch.Tensor):
+            tensors.append(obj)
+        elif isinstance(obj, dict):
+            for key in sorted(obj):
+                walk(obj[key])
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                walk(item)
+
+    walk(batch)
+    sums: list[float] = []
+    for tensor in tensors:
+        values = tensor.detach().to(torch.float64)
+        sums += [values.sum().item(), (values * values).sum().item()]
+    return tuple(sums)
 
 
 class Trainer:
@@ -95,6 +130,9 @@ class Trainer:
         self.checkpoints = CheckpointManager(
             self.algorithm, self.optimizer, output_dir / "checkpoints"
         )
+        if config.checkpoint_every:
+            # Now rather than at the first save, `checkpoint_every` steps into the run.
+            self.checkpoints.check_supported()
 
         # Compiled into a handle of its own rather than over `self.algorithm`, and last, once the
         # optimizer already holds its parameter groups.
@@ -111,19 +149,12 @@ class Trainer:
         self._forward = torch.compile(self.algorithm) if config.compile else self.algorithm
 
         dp_rank = self.dims.dp_rank(mesh) if mesh is not None else 0
+        self._dp_rank = dp_rank
         # Seeded per data-parallel rank, once everything that must be identical on every rank
-        # exists (`build_trainer` initialised the model under `config.seed` alone). Everything
-        # drawn from here on must differ between ranks: the DataLoader takes each epoch's worker
-        # seeds from this generator, and a dataset that samples at random rather than by index
-        # (miao's `sampling: random`) would otherwise draw the same crops on every rank -- one
-        # sample, copied dp_world_size times -- as would the augmentation and masks drawn on the
-        # device. The ranks of one tensor-parallel group share a data-parallel rank, so they still
-        # see one batch. Rank 0 keeps `config.seed` itself, so a single-GPU run draws what it
-        # always did. The stride is the 32-bit golden ratio, not a power of two: torch's CPU
-        # generator keeps only a seed's low 32 bits (seeds 5 and 5 + 2**32 draw identically),
-        # and this odd stride keeps the seeds of distinct (seed, rank) pairs millions apart for
-        # every seed and rank count in use.
-        torch.manual_seed((config.seed + dp_rank * 0x9E3779B9) % 2**32)
+        # exists (`build_trainer` initialised the model under `config.seed` alone); `train()`
+        # reseeds with the step it resumes from. See `_seed_streams`.
+        self._seed_streams(step=0)
+        self._batches_checked = False
         self.train_loader = train_dataset.build_dataloader(
             batch_size=config.batch_size,
             rank=dp_rank,
@@ -140,6 +171,11 @@ class Trainer:
                 rank=dp_rank,
                 world_size=self.dims.dp_world_size,
                 shuffle=False,
+                # Keep the partial batch. Dropped, a rank's share smaller than one batch yielded no
+                # validation at all, on every rank alike -- 32 samples over 8 ranks at batch 8 ran
+                # 80 empty validations in one 200k-step run. The sampler pads every share to the
+                # same length, so the ranks still run the same number of batches.
+                drop_last=False,
                 num_workers=config.num_workers,
                 persistent_workers=config.persistent_workers,
                 prefetch_factor=config.prefetch_factor,
@@ -159,6 +195,57 @@ class Trainer:
             log_dir=output_dir / "tensorboard",
             is_primary=self.is_primary,
         )
+
+    def _seed_streams(self, step: int) -> None:
+        """Seed torch (CPU and CUDA), numpy and Python's `random` for this rank and attempt.
+
+        Per data-parallel rank, because everything drawn from here on must differ between ranks:
+        the DataLoader takes each epoch's worker seeds from torch's generator, and a dataset that
+        samples at random rather than by index (miao's `sampling: random`) would otherwise draw
+        the same crops on every rank -- one sample, copied dp_world_size times -- as would the
+        augmentation and masks drawn on the device. The ranks of one tensor-parallel group share a
+        data-parallel rank, so they still draw one batch. numpy and `random` too, because with
+        `num_workers = 0` miao draws from numpy's global state in this process, which nothing else
+        seeds.
+
+        Per attempt, because checkpoints hold no generator state: without the restored step a
+        resumed run would replay its data, augmentation and masks from step 0, and a run resumed
+        at step S of T would train min(S, T - S) of its steps on batches it had already seen.
+        """
+        seed = _stream_seed(self.config.seed, self._dp_rank, step)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+    def _check_rank_batches(self, batch: Any) -> None:
+        """Stop the run if its first batch breaks data parallelism, which no metric shows.
+
+        Data-parallel ranks must hold different data, and the ranks of one tensor-parallel group
+        the same data. Every rank training on one crop looks like an ordinary run at batch 1, so
+        the first batch's fingerprint is compared across ranks once. Identical batches on some
+        data-parallel ranks can be legitimate -- a sampler padding a set smaller than the world --
+        so only all of them holding one batch is refused.
+        """
+        self._batches_checked = True
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return
+        gathered: list[Any] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, (self._dp_rank, _fingerprint(batch)))
+        by_dp_rank: dict[int, set[tuple[float, ...]]] = {}
+        for dp_rank, fingerprint in gathered:
+            by_dp_rank.setdefault(dp_rank, set()).add(fingerprint)
+        split = sorted(rank for rank, prints in by_dp_rank.items() if len(prints) > 1)
+        if split:
+            raise RuntimeError(
+                f"the tensor-parallel ranks of data-parallel rank(s) {split} hold different first "
+                "batches; a tensor-parallel group must train on one batch"
+            )
+        if len(by_dp_rank) > 1 and len({next(iter(p)) for p in by_dp_rank.values()}) == 1:
+            raise RuntimeError(
+                f"all {len(by_dp_rank)} data-parallel ranks hold the same first batch, so the run "
+                "would train on one sample copied to every rank; their data must differ (is the "
+                "dataset drawing from an unseeded or shared generator?)"
+            )
 
     def _autocast(self) -> Any:
         dtype = _AUTOCAST_DTYPES.get(self.config.precision)
@@ -259,10 +346,26 @@ class Trainer:
 
     def train(self) -> int:
         """Train until `max_steps`, resuming from the newest checkpoint if one exists."""
-        step = self.checkpoints.load_latest()
+        latest = self.checkpoints.latest_checkpoint()
+        # A checkpoint saved inside the frozen-backbone warm-up, up to and including its last step,
+        # holds no optimizer state for the backbone: frozen parameters get no gradient, so AdamW
+        # never created any. A fresh optimizer's template does have it, and DCP's strict load
+        # refuses the difference ("Missing key ... optim.state.model..."), so the checkpoint is
+        # loaded into the layout it was saved with. Only then: a frozen template on a later
+        # checkpoint would silently drop the backbone's moments.
+        saved_frozen = (
+            latest is not None
+            and 0 < checkpoint_step(latest) <= self.config.freeze_backbone_steps
+        )
+        if saved_frozen:
+            self._set_backbone_frozen(True)
+        step = self.checkpoints.load(latest) if latest is not None else 0
         resumed_from = step
         for _ in range(step):
             self.scheduler.step()
+        # Before the first `next(batches)`, which is when the DataLoader draws its worker seeds:
+        # an attempt resumed at a later step must not replay the data of the first one.
+        self._seed_streams(step)
 
         batches = self._endless_batches(self.train_loader, start_epoch=step)
         self.algorithm.train()
@@ -271,8 +374,11 @@ class Trainer:
         # come back unfrozen, and one resumed inside the warm-up must come back frozen. Getting
         # this from `config` alone would silently retrain a resumed run with a frozen backbone.
         backbone_frozen = step < self.config.freeze_backbone_steps
-        if backbone_frozen:
+        if backbone_frozen and not saved_frozen:
             self._set_backbone_frozen(True)
+        elif saved_frozen and not backbone_frozen:
+            # Saved at the warm-up's last step, frozen; the backbone trains from here.
+            self._set_backbone_frozen(False)
 
         meter: ThroughputMeter | None = None
         if self.config.measure_mfu and step < self.config.max_steps:
@@ -283,6 +389,7 @@ class Trainer:
             probe_batch = self._finish_train(
                 move_to_device(next(batches), self.device), self.device
             )
+            self._check_rank_batches(probe_batch)
             batches = itertools.chain([probe_batch], batches)
             meter = self._build_throughput_meter(probe_batch)
             meter.start()
@@ -321,6 +428,8 @@ class Trainer:
                     batch = self._finish_train(
                         move_to_device(raw_batch, self.device), self.device
                     )
+                if not self._batches_checked:
+                    self._check_rank_batches(batch)
 
                 if self.photometric is not None:
                     # After the transfer, so the intensity and noise passes run on the device
@@ -350,6 +459,9 @@ class Trainer:
 
                 with annotate("optimizer"):
                     optimizer_step(self.optimizer)
+                    # On `self.algorithm`, not the compiled `_forward`: it reads the parameters the
+                    # step just wrote, and none of it belongs in the traced graph.
+                    self.algorithm.after_optimizer_step()
                     self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                 step += 1

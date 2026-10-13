@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 
 
 def _world_size() -> int:
@@ -180,6 +181,14 @@ class KoLeoLoss(nn.Module):
     nearest neighbour spreads the batch over the sphere. Without it the CLS features are free to
     crowd into a small region while still satisfying the cross-entropy, and the representation
     degrades even though the loss looks healthy.
+
+    The batch is the whole data-parallel one, as in the reference's `KoLeoLossDistributed`: each
+    rank's embeddings look for their nearest neighbour among every rank's, gathered with autograd
+    so the push also reaches a neighbour another rank holds. Over the rank's own share alone, the
+    one sample per rank that 3D runs here use has no neighbour but itself, and the term was a
+    constant -log((sqrt(D) + 1) * eps) -- about 14.9 at D = 1024 -- with exactly zero gradient.
+    Gathered over the default group, like the Sinkhorn sums above; that is the data-parallel world,
+    since this algorithm does not run under tensor parallelism.
     """
 
     def __init__(self, eps: float = 1e-8) -> None:
@@ -187,20 +196,36 @@ class KoLeoLoss(nn.Module):
         self.eps = eps
         self.pdist = nn.PairwiseDistance(2, eps=eps)
 
-    def _pairwise_nearest(self, x: torch.Tensor) -> torch.Tensor:
-        dots = torch.mm(x, x.t())
-        n = x.shape[0]
-        # Blank the diagonal so a point is not its own nearest neighbour. The strided view walks
-        # the diagonal of the flattened matrix.
-        dots.view(-1)[:: n + 1].fill_(-1)
+    @staticmethod
+    def _pairwise_nearest(x: torch.Tensor, everyone: torch.Tensor, offset: int) -> torch.Tensor:
+        """For each row of `x`, the index in `everyone` of its nearest other embedding.
+
+        `x` sits at rows `offset:offset + len(x)` of `everyone`; those entries are blanked so that
+        no embedding is its own neighbour.
+        """
+        dots = torch.mm(x, everyone.t())
+        rows = torch.arange(x.shape[0], device=x.device)
+        dots[rows, offset + rows] = -1
         return torch.argmax(dots, dim=1)
 
     def forward(self, student_output: torch.Tensor) -> torch.Tensor:
-        """(B, D) embeddings -> scalar."""
+        """(B, D) embeddings, this rank's share of the batch -> scalar."""
         # Explicitly outside autocast: the distances here are small and a half-precision log of
         # them loses the differences that carry the gradient.
         with torch.autocast("cuda", enabled=False):
             x = F.normalize(student_output.float(), eps=self.eps, p=2, dim=-1)
-            nearest = self._pairwise_nearest(x)
-            distances = self.pdist(x, x[nearest])
+            everyone, offset = x, 0
+            if _world_size() > 1:
+                everyone = torch.cat(differentiable_all_gather(x), dim=0)
+                offset = dist.get_rank() * x.shape[0]
+            if everyone.shape[0] < 2:
+                raise ValueError(
+                    f"KoLeo needs two embeddings to find a nearest neighbour, and the "
+                    f"data-parallel batch holds {everyone.shape[0]}: its term would be a constant "
+                    "with no gradient. Train with at least two samples in total, or set "
+                    "koleo_loss_weight = 0."
+                )
+            with torch.no_grad():
+                nearest = self._pairwise_nearest(x, everyone, offset)
+            distances = self.pdist(x, everyone[nearest])
             return -torch.log(distances + self.eps).mean()

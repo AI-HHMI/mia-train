@@ -82,11 +82,57 @@ class _RandomDrawsDataset(BaseDataset):
         return _RandomDraws()
 
 
+class _ConstantDraws(data.Dataset):
+    """The same item whatever the index: what every rank received before 2026-10-12."""
+
+    def __len__(self) -> int:
+        return 32
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        return torch.ones(8)
+
+
+class _ConstantDataset(BaseDataset):
+    def build_dataset(self) -> data.Dataset:
+        return _ConstantDraws()
+
+
+class _RecordingAlgorithm(_ReconstructAlgorithm):
+    """Records a fingerprint of every batch it trains on."""
+
+    def __init__(self, model: nn.Module, dataset: BaseDataset | None = None) -> None:
+        super().__init__(model, dataset)
+        self.seen: list[float] = []
+
+    def training_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
+        self.seen.append(float(batch.double().sum()))
+        return super().training_step(batch)
+
+
+class _RankDependentHead(BaseAlgorithm):
+    """Each rank trains through a different head, as a promptable correction round that feeds its
+    mask prompt on some ranks and not on others uses different parameters on each."""
+
+    def __init__(self, model: nn.Module, dataset: BaseDataset | None = None) -> None:
+        super().__init__(model, dataset)
+        self.heads = nn.ModuleList([nn.Linear(8, 8), nn.Linear(8, 8)])
+
+    def training_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
+        head = self.heads[torch.distributed.get_rank() % 2]
+        return {"loss": (head(self.model(batch)) - batch).pow(2).mean()}
+
+    def validation_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self.training_step(batch)
+
+
 def _register_components() -> None:
     ModelRegistry.register("tiny")(_TinyModel)
     AlgorithmRegistry.register("reconstruct")(_ReconstructAlgorithm)
+    AlgorithmRegistry.register("recording")(_RecordingAlgorithm)
+    AlgorithmRegistry.register("rank_dependent_head")(_RankDependentHead)
     DataRegistry.register("synthetic")(_SyntheticDataset)
     DataRegistry.register("random_draws")(_RandomDrawsDataset)
+    DataRegistry.register("constant")(_ConstantDataset)
 
 
 def _run_config(world_size: int, max_steps: int = 5) -> RunConfig:
@@ -150,6 +196,73 @@ def _parameters_after_unrelated_draws(
     return [p.full_tensor().detach().numpy() for p in trainer.algorithm.parameters()]
 
 
+def _first_batch_without_workers(rank: int, world_size: int, output_dir: str) -> np.ndarray:
+    _register_components()
+    config = _run_config(world_size)
+    # No workers: the dataset then draws from numpy's global state in this very process, which
+    # PyTorch reseeds only inside workers.
+    config = dataclasses.replace(config, data=ComponentConfig(name="random_draws"), val_data=None)
+    trainer = build_trainer(config, Path(output_dir), mesh=config.parallelism.build_mesh("cpu"))
+    return next(iter(trainer.train_loader)).numpy()
+
+
+def _batches_across_a_resume(
+    rank: int, world_size: int, output_dir: str
+) -> tuple[list[float], list[float]]:
+    _register_components()
+    config = _run_config(world_size, max_steps=2)
+    config = dataclasses.replace(
+        config,
+        algorithm=ComponentConfig(name="recording"),
+        data=ComponentConfig(name="random_draws"),
+        val_data=None,
+        # No FLOP probe, so `seen` holds exactly the batches trained on.
+        trainer=dataclasses.replace(
+            config.trainer, num_workers=1, checkpoint_every=2, measure_mfu=False
+        ),
+    )
+    first = build_trainer(config, Path(output_dir), mesh=config.parallelism.build_mesh("cpu"))
+    first.train()
+    longer = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, max_steps=4))
+    second = build_trainer(longer, Path(output_dir), mesh=longer.parallelism.build_mesh("cpu"))
+    second.train()
+    return first.algorithm.seen, second.algorithm.seen
+
+
+def _train_with_rank_dependent_parameters(
+    rank: int, world_size: int, output_dir: str
+) -> list[bool]:
+    _register_components()
+    config = _run_config(world_size, max_steps=3)
+    config = dataclasses.replace(
+        config, algorithm=ComponentConfig(name="rank_dependent_head"), val_data=None
+    )
+    trainer = build_trainer(config, Path(output_dir), mesh=config.parallelism.build_mesh("cpu"))
+    heads = trainer.algorithm.heads
+    before = [p.full_tensor().detach().clone() for p in heads.parameters()]
+    trainer.train()
+    after = [p.full_tensor().detach() for p in heads.parameters()]
+    # Every row, not just the tensor: each rank holds a slice of every head, and a reduce-scatter
+    # that pairs one rank's head-0 gradient with another's head-1 gradient (equal sizes, so
+    # nothing raises) updates each head only in the slice of the rank that used it.
+    return [
+        bool((b != a).reshape(b.shape[0], -1).any(dim=1).all())
+        for b, a in zip(before, after, strict=True)
+    ]
+
+
+def _train_on_constant_data(rank: int, world_size: int, output_dir: str) -> str | None:
+    _register_components()
+    config = _run_config(world_size)
+    config = dataclasses.replace(config, data=ComponentConfig(name="constant"), val_data=None)
+    trainer = build_trainer(config, Path(output_dir), mesh=config.parallelism.build_mesh("cpu"))
+    try:
+        trainer.train()
+    except RuntimeError as error:
+        return str(error)
+    return None
+
+
 def _unregistered_model_name_raises(rank: int, world_size: int, output_dir: str) -> bool:
     _register_components()
     config = _run_config(world_size)
@@ -209,6 +322,50 @@ def test_initialisation_follows_the_seed(run_distributed):
             ))
     for a, b in zip(results[0][0], results[1][0], strict=True):
         np.testing.assert_array_equal(a, b)
+
+
+@pytest.mark.cpu_dist
+def test_draws_without_workers_follow_the_seed(run_distributed):
+    """With `num_workers = 0` a dataset drawing from numpy's global state still gives each rank
+    its own draws, and the same ones on every run: numpy is seeded with torch, per rank."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        first = run_distributed(_first_batch_without_workers, world_size=2, args=(tmp,))
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        again = run_distributed(_first_batch_without_workers, world_size=2, args=(tmp,))
+    assert not np.array_equal(first[0], first[1]), "both ranks drew the same batch"
+    for rank in range(2):
+        np.testing.assert_array_equal(first[rank], again[rank])
+
+
+@pytest.mark.cpu_dist
+def test_resume_does_not_replay_the_data(run_distributed):
+    """A run resumed at step 2 trains steps 3-4 on new draws, not on the draws of steps 1-2:
+    checkpoints hold no generator state, so the streams are reseeded from the restored step."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        results = run_distributed(_batches_across_a_resume, world_size=2, args=(tmp,))
+    for first, second in results:
+        assert len(first) == 2 and len(second) == 2
+        assert not set(first) & set(second), f"the resumed attempt replayed {first} as {second}"
+
+
+@pytest.mark.cpu_dist
+def test_ranks_may_use_different_parameters(run_distributed):
+    """Ranks that train through different parameters in one step still reduce gradients over
+    one layout, so every slice of both heads trains."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        results = run_distributed(_train_with_rank_dependent_parameters, world_size=2, args=(tmp,))
+    for changed in results:
+        assert all(changed), f"part of a head did not train: {changed}"
+
+
+@pytest.mark.cpu_dist
+def test_identical_batches_on_every_rank_stop_the_run(run_distributed):
+    """Every data-parallel rank holding the same first batch stops the run, instead of training
+    one sample copied to every rank."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        messages = run_distributed(_train_on_constant_data, world_size=2, args=(tmp,))
+    for message in messages:
+        assert message is not None and "same first batch" in message, message
 
 
 @pytest.mark.cpu_dist

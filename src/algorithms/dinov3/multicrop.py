@@ -52,6 +52,7 @@ def random_resized_crop(
     out_size: tuple[int, ...],
     scale: tuple[float, float],
     *,
+    plane: tuple[int, int] | None = None,
     flip_prob: float = 0.5,
     rotate_prob: float = 0.5,
     generator: torch.Generator | None = None,
@@ -62,10 +63,12 @@ def random_resized_crop(
     the same numbers mean the same thing at either rank -- a side length scales as the rank-th
     root. Sampling is uniform in that fraction, then jittered per axis so crops are not all cubes.
 
-    Flips are applied on every axis independently. Rotation is by a quarter turn in the first two
-    axes only: for the volumes this is built for those are the in-plane axes, which share a voxel
-    size, while the third is coarser -- rotating into it would resample across a different
-    physical spacing and present the model with geometry that does not occur in the data.
+    Flips are applied on every axis independently. Rotation is by a quarter turn in `plane`, the
+    two spatial slots (in tensor order) holding the in-plane axes, which share a voxel size; the
+    section axis is coarser, and rotating into it would resample across a different physical
+    spacing and present the model with geometry that does not occur in the data. A volume must
+    name its plane -- which slots those are depends on the axis order -- while an image's two axes
+    are both in-plane.
     """
     batch, channels = volumes.shape[0], volumes.shape[1]
     rank = volumes.ndim - 2
@@ -80,28 +83,40 @@ def random_resized_crop(
     side = (side * jitter).clamp(0.05, 1.0)
 
     # grid_sample works in [-1, 1], so a crop is a scaling by `side` about a centre that must stay
-    # far enough inside the volume for the crop to fit.
-    centre = (draw(batch, rank) * 2 - 1) * (1 - side)
+    # far enough inside the volume for the crop to fit. Drawn here, placed once the rotation is
+    # known, since a turn exchanges which side lies along which axis.
+    placement = draw(batch, rank) * 2 - 1
 
     if flip_prob > 0:
         flips = torch.where(draw(batch, rank) < flip_prob, -1.0, 1.0)
         side = side * flips
 
-    # theta maps output coordinates to input ones: a diagonal scale plus a translation.
+    # theta maps output coordinates to input ones: a diagonal scale plus a translation. Its rows
+    # and columns follow affine_grid's coordinates, which list the spatial axes last-first --
+    # (W, H) for an image, (W, H, D) for a volume -- so spatial slot `s` is theta index
+    # `rank - 1 - s`.
     theta = torch.zeros(batch, rank, rank + 1, device=device, dtype=torch.float32)
-    theta[:, :, rank] = centre
-    diagonal = torch.diag_embed(side)
+    rotation = torch.eye(rank, device=device).expand(batch, rank, rank).clone()
 
     if rotate_prob > 0 and rank >= 2:
-        # A quarter turn in the first two axes, as a permutation with a sign flip.
+        if plane is None:
+            if rank != 2:
+                raise ValueError(
+                    "rotating a volume needs `plane`, the spatial slots of its two in-plane axes: "
+                    "a quarter turn into the section axis would mix voxel sizes"
+                )
+            plane = (0, 1)
+        # A quarter turn in the plane, as a permutation with a sign flip.
+        a, b = sorted(rank - 1 - slot for slot in plane)
         turn = draw(batch) < rotate_prob
-        rotation = torch.eye(rank, device=device).expand(batch, rank, rank).clone()
-        rotation[turn, 0, 0] = 0.0
-        rotation[turn, 1, 1] = 0.0
-        rotation[turn, 0, 1] = -1.0
-        rotation[turn, 1, 0] = 1.0
-        diagonal = torch.bmm(rotation, diagonal)
-    theta[:, :, :rank] = diagonal
+        rotation[turn, a, a] = 0.0
+        rotation[turn, b, b] = 0.0
+        rotation[turn, a, b] = -1.0
+        rotation[turn, b, a] = 1.0
+    theta[:, :, :rank] = torch.bmm(rotation, torch.diag_embed(side))
+    # Each axis's half-extent after the turn, which is what has to fit inside the volume.
+    extent = torch.bmm(rotation.abs(), side.abs().unsqueeze(-1)).squeeze(-1)
+    theta[:, :, rank] = placement * (1 - extent)
 
     # affine_grid's size argument carries the *output* extent, which is how the resize happens.
     grid = F.affine_grid(
@@ -210,8 +225,11 @@ def block_mask(
     if n_masked == 0:
         return masks.reshape(batch, total)
 
-    # A spread of ratios rather than one, so the model sees both light and heavy masking.
-    targets = torch.linspace(ratio[0], ratio[1], n_masked)
+    # A spread of ratios rather than one, so the model sees both light and heavy masking: the
+    # upper edges of `n_masked` equal bins, as the reference takes them. Not `linspace(lo, hi, n)`,
+    # which at one masked sample -- one sample per rank -- is `[lo]`, pinning every mask at the
+    # minimum ratio.
+    targets = torch.linspace(ratio[0], ratio[1], n_masked + 1)[1:]
     for sample in range(n_masked):
         wanted = int(targets[sample].item() * total)
         filled = 0

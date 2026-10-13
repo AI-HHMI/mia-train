@@ -34,6 +34,26 @@ from .base import BaseAlgorithm
 from .registry import AlgorithmRegistry
 
 
+def finest_pixel_frame(bbox: torch.Tensor, pixel_size: torch.Tensor) -> torch.Tensor:
+    """miao's per-level boxes -> the frame `MuViT3D.default_bbox` gives fine-tuning and prediction.
+
+    miao reports each level's read extent in the store's physical units -- nanometres for lmd --
+    out to its voxels' outer faces; `default_bbox` spans the outermost voxel centres, in pixels of
+    the finest level, and it is what every later stage positions tokens by (the dense heads,
+    promptable_seg, predict.py). Pretraining on miao's boxes as given put a fine-tuned encoder in
+    a frame 8x smaller than the one it was pretrained in at 8 nm, 2.6x on kasthuri, and the rotary
+    frequencies barely move in a fine-tune (median ratio 1.02), so the gap never closed.
+
+    (B, L, 2, 3) boxes and (B, L, 3) voxel sizes, in the batch's spatial order -> (B, L, 2, 3). The
+    geometry miao records is kept, including a coarse level shifted inward at a volume border,
+    which `default_bbox` has no way to know.
+    """
+    pixel_size = pixel_size.to(bbox.dtype)
+    inward = torch.tensor([0.5, -0.5], dtype=bbox.dtype, device=bbox.device).view(1, 1, 2, 1)
+    centres = bbox + inward * pixel_size.unsqueeze(2)
+    return centres / pixel_size[:, :1].unsqueeze(2)
+
+
 class MuViTDecoderLayer(nn.Module):
     """Pre-norm decoder layer: self-attention, optional cross-attention, feed-forward.
 
@@ -300,8 +320,15 @@ class MuViTMAE(BaseAlgorithm):
                 "algorithm is for."
             )
 
+        if "pixel_size" not in batch:
+            raise KeyError(
+                "MuViTMAE needs each level's voxel size under batch['pixel_size'] to put the "
+                "physical boxes into the finest-level pixel frame fine-tuning and prediction use; "
+                f"the batch has only {sorted(batch)}. miao's VolumeDataset supplies it."
+            )
+
         volumes = self.encoder.prepare_input(batch[self.input_key], self.input_axes)
-        bbox = batch[self.bbox_key]
+        bbox = finest_pixel_frame(batch[self.bbox_key], batch["pixel_size"])
         tokens, coords = self.encoder.embed(volumes, bbox)
 
         keep_indices, mask = self._dirichlet_masking(tokens.shape[0], tokens.device)

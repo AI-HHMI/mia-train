@@ -91,6 +91,36 @@ def fingerprint(attrs: dict[str, Any], geometry: dict[str, Any], shape: Sequence
     return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
 
 
+def _check_finished_matches(path: Path, attrs: dict[str, Any], block: Sequence[int]) -> None:
+    """Refuse a finished artifact that a different prediction made.
+
+    An existing artifact used to count as done whatever made it, so relaunching a run under its
+    old name, predicting another step or data config, or re-predicting after a fix all quietly
+    kept the old values. A finished artifact keeps the attributes of the prediction that wrote it
+    -- run, step, data config, lattice, block, and the code version -- and any disagreement is
+    refused. An artifact from before an attribute was recorded is still reused when everything it
+    does record agrees, with a warning naming what it lacks.
+    """
+    stored = dict(zarr.open_group(str(path), mode="r").attrs)
+    wanted = json.loads(json.dumps(attrs))
+    differing = {key: (stored[key], value) for key, value in wanted.items()
+                 if key in stored and stored[key] != value}
+    stored_block = (stored.get("blockwise") or {}).get("block")
+    if stored_block is not None and list(stored_block) != list(block):
+        differing["block"] = (stored_block, list(block))
+    if differing:
+        detail = "; ".join(f"{key} is {have!r}, this run's is {want!r}"
+                           for key, (have, want) in differing.items())
+        raise SystemExit(
+            f"{path} was made by a different prediction ({detail}). Delete it to predict again, "
+            "or write this prediction elsewhere with --out."
+        )
+    missing = sorted(key for key in wanted if key not in stored)
+    if missing:
+        print(f"{path} predates recording {', '.join(missing)}; reusing it because everything it "
+              "does record agrees", flush=True)
+
+
 def predict_blocks(
     algorithm: Any,
     grid: VolumeGrid,
@@ -114,6 +144,7 @@ def predict_blocks(
         raise SystemExit(f"--worker {worker} is not one of --workers {workers} (0-based)")
     path = Path(path)
     if path.exists():
+        _check_finished_matches(path, attrs, block)
         print(f"{path} is complete already", flush=True)
         return path
     partial = path.with_name(path.name + ".partial")

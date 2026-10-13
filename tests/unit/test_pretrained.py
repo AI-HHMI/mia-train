@@ -8,22 +8,33 @@ import torch.nn as nn
 
 from models.dinov3_vit import DinoVisionTransformer
 from models.dinov3_vit3d import DinoVisionTransformer3D
-from utils.pretrained import inflate_2d_to_3d, load_pretrained, read_state_dict
+from utils.pretrained import (
+    fold_input_standardisation,
+    inflate_2d_to_3d,
+    load_pretrained,
+    read_state_dict,
+)
 
 DINO = dict(img_size=32, patch_size=8, embed_dim=96, depth=1, num_heads=4,
             pos_embed_rope_dtype="fp32")
+# What the releases standardise their input with, as the upstream README gives it.
+STATISTICS = {
+    "lvd1689m": ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    "sat493m": ((0.430, 0.411, 0.296), (0.213, 0.156, 0.143)),
+}
 
 
-def _released_checkpoint(tmp_path, **overrides):
-    """A file structurally identical to a published DINOv3 release.
+def _released_checkpoint(tmp_path, dataset="lvd1689m", **overrides):
+    """A file structurally identical to a published DINOv3 release, named the way they are.
 
     The port kept upstream's attribute names, so a 2D model's own state dict has exactly the key
     names Meta ships -- which is what makes this a faithful stand-in without needing the (licence
-    gated) weights themselves.
+    gated) weights themselves. The name matters too: it is how a release states the dataset, and
+    so the input standardisation, it was pretrained with.
     """
     kwargs = {**DINO, "in_chans": 3, **overrides}
     model = DinoVisionTransformer(**kwargs)
-    path = tmp_path / "dinov3_pretrain.pth"
+    path = tmp_path / f"dinov3_vits8_pretrain_{dataset}-00000000.pth"
     torch.save(model.state_dict(), path)
     return path, model
 
@@ -43,10 +54,68 @@ def test_inflation_spreads_the_kernel_over_depth_and_normalises():
 
 
 @pytest.mark.unit
-def test_inflation_averages_rgb_down_to_one_channel():
+def test_inflation_sums_rgb_down_to_one_channel():
+    """A grey image is an RGB image with equal channels, so its response is the channel sum."""
     weight = torch.randn(4, 3, 8, 8)
     out = inflate_2d_to_3d(weight, torch.Size((4, 1, 8, 8, 8)))
-    assert torch.allclose(out.sum(dim=2), weight.mean(dim=1, keepdim=True), atol=1e-6)
+    assert torch.allclose(out.sum(dim=2), weight.sum(dim=1, keepdim=True), atol=1e-6)
+
+
+@pytest.mark.unit
+def test_folding_the_standardisation_matches_standardising_the_input():
+    # Float64, so the comparison checks the algebra rather than float32 summation order.
+    torch.manual_seed(0)
+    weight, bias = torch.randn(4, 3, 8, 8, dtype=torch.float64), torch.randn(4, dtype=torch.float64)
+    mean, std = STATISTICS["sat493m"]
+    image = torch.rand(1, 3, 16, 16, dtype=torch.float64)
+    shape = (1, 3, 1, 1)
+    standardised = (image - torch.tensor(mean, dtype=torch.float64).view(shape)) / torch.tensor(
+        std, dtype=torch.float64
+    ).view(shape)
+
+    folded_weight, folded_bias = fold_input_standardisation(weight, bias, mean, std)
+    expected = torch.nn.functional.conv2d(standardised, weight, bias, stride=8)
+    got = torch.nn.functional.conv2d(image, folded_weight, folded_bias, stride=8)
+    assert torch.allclose(got, expected, atol=1e-10)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dataset", sorted(STATISTICS))
+def test_an_rgb_release_sees_a_grey_volume_as_its_standardised_image(tmp_path, dataset):
+    """What inflation promises for the releases every [init] config loads: a volume constant along
+    depth is embedded exactly as the 2D model embeds that picture -- given as RGB, standardised the
+    way the release was trained -- on every slice. Averaging the channels without the statistics,
+    as this used to, left the released ViT-L's stem tokens at cosine ~0.69 (LVD) and ~0.53 (SAT)
+    to the 2D model's on a real NISB slice."""
+    torch.manual_seed(0)
+    path, model_2d = _released_checkpoint(tmp_path, dataset=dataset)
+    model_3d = DinoVisionTransformer3D(in_chans=1, **DINO)
+    report = load_pretrained(model_3d, path, inflate=True, skip=["rope_embed."])
+    assert report.folded == ["patch_embed.proj.weight"] and report.folded_statistics == dataset
+
+    mean, std = STATISTICS[dataset]
+    image = torch.rand(1, 1, 32, 32)  # [0, 1], as miao's normalize delivers it
+    rgb = (image.expand(-1, 3, -1, -1) - torch.tensor(mean).view(1, 3, 1, 1)) / torch.tensor(
+        std
+    ).view(1, 3, 1, 1)
+    volume = image.unsqueeze(2).expand(-1, -1, 32, -1, -1).contiguous()
+    with torch.no_grad():
+        flat = model_2d.eval().patch_embed(rgb)
+        solid = model_3d.eval().patch_embed(volume)
+
+    for z in range(solid.shape[1]):
+        assert torch.allclose(solid[0, z], flat[0], atol=1e-5)
+
+
+@pytest.mark.unit
+def test_an_rgb_checkpoint_of_unknown_standardisation_is_refused(tmp_path):
+    """Without the release's name there is no telling which statistics to fold in, and guessing
+    would reproduce the mis-scaled stem this exists to prevent."""
+    path, _ = _released_checkpoint(tmp_path)
+    renamed = path.rename(tmp_path / "my_backbone.pth")
+    model = DinoVisionTransformer3D(in_chans=1, **DINO)
+    with pytest.raises(ValueError, match="input standardisation"):
+        load_pretrained(model, renamed, inflate=True, skip=["rope_embed."])
 
 
 @pytest.mark.unit
@@ -191,6 +260,25 @@ def test_superposition_depth_gate_stays_closed_after_a_2d_load(tmp_path):
 
 
 @pytest.mark.unit
+def test_a_skip_that_would_discard_a_learned_parameter_is_refused(tmp_path):
+    """At 3D->3D under superposition every rope tensor already fits, and `rope_embed.` also catches
+    the learned depth gate: four runs restarted it at zero where their predecessors had learned
+    0.05-0.28. Skipping the derived buffers alone keeps it."""
+    source = DinoVisionTransformer3D(in_chans=1, pos_embed_rope_type="superposition", **DINO)
+    with torch.no_grad():
+        source.rope_embed.depth_scale.fill_(0.25)
+    path = tmp_path / "stage_a.pth"
+    torch.save(source.state_dict(), path)
+
+    model = DinoVisionTransformer3D(in_chans=1, pos_embed_rope_type="superposition", **DINO)
+    with pytest.raises(ValueError, match="rope_embed.depth_scale"):
+        load_pretrained(model, path, skip=["rope_embed."])
+
+    load_pretrained(model, path, skip=["rope_embed.periods", "rope_embed.depth_periods"])
+    assert model.rope_embed.depth_scale.item() == pytest.approx(0.25)
+
+
+@pytest.mark.unit
 def test_rope_mismatch_without_skip_says_what_to_add(tmp_path):
     path, _ = _released_checkpoint(tmp_path)
     model = DinoVisionTransformer3D(in_chans=1, **DINO)
@@ -245,6 +333,31 @@ def test_non_strict_reports_mismatches_instead_of_raising(tmp_path):
 
     assert report.mismatched, "the mismatches are still reported"
     assert report.copied, "and what did fit was still loaded"
+
+
+@pytest.mark.unit
+def test_non_strict_still_refuses_a_checkpoint_matching_nothing(tmp_path):
+    """`strict = false` relaxes shapes and leftovers, not the scratch-run guard."""
+    path = tmp_path / "unrelated.pth"
+    torch.save({"totally.different.key": torch.zeros(3)}, path)
+    model = DinoVisionTransformer(in_chans=3, **DINO)
+    with pytest.raises(ValueError, match="would have trained from scratch"):
+        load_pretrained(model, path, strict=False)
+
+
+@pytest.mark.unit
+def test_non_strict_still_prints_what_it_loaded(tmp_path, capsys):
+    path, _ = _released_checkpoint(tmp_path)
+    load_pretrained(DinoVisionTransformer3D(in_chans=1, **DINO), path, strict=False)
+    out = capsys.readouterr().out
+    assert "[init]" in out and "mismatched, kept at initial value" in out
+
+
+@pytest.mark.unit
+def test_a_string_skip_is_rejected(tmp_path):
+    path, _ = _released_checkpoint(tmp_path)
+    with pytest.raises(ValueError, match="not a string"):
+        load_pretrained(DinoVisionTransformer(in_chans=3, **DINO), path, skip="rope_embed.")
 
 
 @pytest.mark.unit

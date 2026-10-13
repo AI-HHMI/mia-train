@@ -9,6 +9,9 @@ finite-value assertion.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 import torch
 import torch.nn as nn
@@ -18,6 +21,7 @@ from torch.distributed.tensor.placement_types import _StridedShard
 from distributed.grad_norm import clip_grad_norm_
 from distributed.parallel_dims import ParallelDims
 from distributed.parallelize import apply_tensor_parallel, parallelize_model, shard_algorithm
+from distributed.tensor_parallel import strided_tensor_parallel_tensors
 from engine.activation_checkpoint import apply_activation_checkpointing
 from engine.optimizer import optimizer_step
 from models.dinov3_vit3d import DinoVisionTransformer3D
@@ -57,6 +61,34 @@ def _max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a - b).abs().max())
 
 
+def _probe_loss(tokens: torch.Tensor) -> torch.Tensor:
+    """A loss every parameter gets a real gradient from.
+
+    Not `tokens.square().mean()`: the tokens are layer-normed, which takes out each token's scale,
+    so that loss is nearly constant and the block gradients it gave were ~1e-8 -- under the 1e-5
+    tolerance they were compared at, so no tensor-parallel gradient error could have failed it.
+    """
+    weights = torch.randn(tokens.shape, generator=torch.Generator().manual_seed(2))
+    return (tokens * weights).sum()
+
+
+def _worst_gradient_error(reference: nn.Module, sharded: nn.Module, world_size: int) -> float:
+    """Largest gradient difference under tp, relative to each tensor's own largest gradient."""
+    worst = 0.0
+    reference_grads = dict(reference.named_parameters())
+    for name, parameter in sharded.named_parameters():
+        grad = parameter.grad
+        assert grad is not None, f"{name} received no gradient under tp={world_size}"
+        full = grad.full_tensor() if isinstance(grad, DTensor) else grad
+        expected = reference_grads[name].grad
+        scale = float(expected.abs().max())
+        if scale == 0.0:
+            assert float(full.abs().max()) == 0.0, f"{name} has a gradient only under tp"
+            continue
+        worst = max(worst, _max_abs_diff(expected, full) / scale)
+    return worst
+
+
 def _forward_worker(rank: int, world_size: int, size: int) -> tuple[float, int]:
     """Sharded patch tokens against the same weights run unsharded, and the token count."""
     dims = ParallelDims(tp=world_size)
@@ -83,17 +115,9 @@ def _gradient_worker(rank: int, world_size: int) -> float:
     apply_tensor_parallel(sharded, mesh, dims)
 
     volume = _volume()
-    reference.patch_features(volume)[0].square().mean().backward()
-    sharded.patch_features(volume)[0].square().mean().backward()
-
-    worst = 0.0
-    reference_grads = dict(reference.named_parameters())
-    for name, parameter in sharded.named_parameters():
-        grad = parameter.grad
-        assert grad is not None, f"{name} received no gradient under tp={world_size}"
-        full = grad.full_tensor() if isinstance(grad, DTensor) else grad
-        worst = max(worst, _max_abs_diff(reference_grads[name].grad, full))
-    return worst
+    _probe_loss(reference.patch_features(volume)[0]).backward()
+    _probe_loss(sharded.patch_features(volume)[0]).backward()
+    return _worst_gradient_error(reference, sharded, world_size)
 
 
 def _qkv_placement_worker(rank: int, world_size: int) -> bool:
@@ -283,16 +307,9 @@ def _windowed_worker(rank: int, world_size: int) -> tuple[float, float]:
     actual = sharded.patch_features(volume)[0]
     forward = _max_abs_diff(expected, actual)
 
-    expected.square().mean().backward()
-    actual.square().mean().backward()
-    worst = 0.0
-    reference_grads = dict(reference.named_parameters())
-    for name, parameter in sharded.named_parameters():
-        grad = parameter.grad
-        assert grad is not None, f"{name} received no gradient under tp={world_size}"
-        full = grad.full_tensor() if isinstance(grad, DTensor) else grad
-        worst = max(worst, _max_abs_diff(reference_grads[name].grad, full))
-    return forward, worst
+    _probe_loss(expected).backward()
+    _probe_loss(actual).backward()
+    return forward, _worst_gradient_error(reference, sharded, world_size)
 
 
 @pytest.mark.cpu_dist
@@ -316,7 +333,7 @@ def test_tp_forward_matches_one_process_with_an_indivisible_sequence(run_distrib
 @pytest.mark.cpu_dist
 def test_tp_gradients_match_one_process(run_distributed):
     for worst in run_distributed(_gradient_worker, world_size=2):
-        assert worst < 1e-5, f"gradients diverged by {worst}"
+        assert worst < 1e-4, f"gradients diverged by {worst} of their own magnitude"
 
 
 def _sliding_forward_worker(rank: int, world_size: int) -> float:
@@ -345,7 +362,9 @@ def test_tp_sliding_windows_match_one_process(run_distributed, world_size):
 def test_tp_windowed_and_pooled_attention_match_one_process(run_distributed, world_size):
     for forward, gradients in run_distributed(_windowed_worker, world_size=world_size):
         assert forward < 1e-5, f"tp={world_size} windowed forward diverged by {forward}"
-        assert gradients < 1e-5, f"tp={world_size} windowed gradients diverged by {gradients}"
+        assert gradients < 1e-4, (
+            f"tp={world_size} windowed gradients diverged by {gradients} of their own magnitude"
+        )
 
 
 @pytest.mark.cpu_dist
@@ -383,6 +402,64 @@ def test_tensor_parallel_must_precede_activation_checkpointing(run_distributed):
 @pytest.mark.cpu_dist
 def test_tp_refuses_stochastic_depth(run_distributed):
     assert all(run_distributed(_stochastic_depth_refused_worker, world_size=2))
+
+
+def _checkpointing_worker(
+    rank: int, world_size: int, tp: int, directory: str
+) -> tuple[list[str], bool, bool]:
+    """What DCP is refused for, and whether a save and a load are each refused."""
+    from pathlib import Path
+
+    from engine.checkpoint import CheckpointManager
+
+    dims = ParallelDims(dp_shard=world_size // tp, tp=tp)
+    mesh = dims.build_mesh("cpu")
+    algorithm = _Algorithm(_build())
+    apply_tensor_parallel(algorithm.model, mesh, dims)
+    shard_algorithm(algorithm, mesh, dims)  # type: ignore[arg-type]
+    manager = CheckpointManager(
+        algorithm, torch.optim.AdamW(algorithm.parameters()), Path(directory)
+    )
+
+    def refused(action: Callable[[], Any]) -> bool:
+        try:
+            action()
+        except ValueError as error:
+            return "DCP cannot checkpoint" in str(error)
+        return False
+
+    flagged = strided_tensor_parallel_tensors(algorithm)
+    if not flagged:
+        return flagged, False, False
+    return (
+        flagged,
+        refused(lambda: manager.save(1)),
+        refused(lambda: manager.load(Path(directory) / "step_1")),
+    )
+
+
+@pytest.mark.cpu_dist
+@pytest.mark.parametrize("world_size", [2, 4], ids=["tp_only", "fsdp_tp"])
+def test_tp_checkpointing_is_refused_not_scrambled(run_distributed, tmp_path, world_size):
+    """DCP describes each rank's `[q_r | k_r | v_r]` as one contiguous box: a save fails on every
+    rank with "overlapping chunks", and a load -- resuming a run saved at tp = 1, which a changed
+    `[parallelism]` allows -- fills k and v with other heads' rows. Both are refused instead, and
+    only the fused projection is blamed: the other TP shards, and FSDP's own, are left alone."""
+    expected = sorted(
+        f"model.blocks.{index}.attn.qkv.{name}"
+        for index in range(MODEL["depth"])
+        for name in ("weight", "bias", "bias_mask")
+    )
+    results = run_distributed(_checkpointing_worker, world_size=world_size, args=(2, str(tmp_path)))
+    for flagged, save_refused, load_refused in results:
+        assert sorted(flagged) == expected
+        assert save_refused and load_refused
+
+
+@pytest.mark.cpu_dist
+def test_fsdp_alone_is_not_refused_checkpointing(run_distributed, tmp_path):
+    results = run_distributed(_checkpointing_worker, world_size=2, args=(1, str(tmp_path)))
+    assert all(flagged == [] for flagged, _, _ in results)
 
 
 def _one_block_gb() -> float:
