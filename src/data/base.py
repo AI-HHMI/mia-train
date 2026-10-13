@@ -191,15 +191,13 @@ class BaseDataset(abc.ABC):
             sampler=sampler,
             num_workers=num_workers,
             drop_last=drop_last,
-            # A volumetric crop is large enough that how it reaches the GPU is a real cost, not a
-            # detail. At 256^3 one sample is 134 MB (a float32 image beside an int32 label), and
+            # A volumetric crop is large enough that how it reaches the GPU is a real cost.
+            # At 256^3 one sample is 134 MB (a float32 image beside an int32 label), and
             # out of pageable memory the driver cannot DMA it directly: it stages through an
             # internal bounce buffer at roughly a fifth of the link's rate, and `.to(non_blocking=
             # True)` silently degrades to a blocking copy because there is no way to know when a
-            # pageable page may be reused. Measured in a trace of this repo's affinity fine-tune,
-            # that copy was 21.7 ms of every 377 ms step, spent as `Memcpy HtoD (Pageable ->
-            # Device)`. Pinning makes the same transfer a direct DMA and lets it overlap the
-            # previous step's compute.
+            # pageable page may be reused. Pinning makes the same transfer a direct DMA and lets 
+            # it overlap the previous step's compute.
             #
             # Conditional on there being workers to pin in: the pinning thread only exists on the
             # multi-process path, and asking for it with `num_workers=0` adds a synchronous copy
@@ -207,10 +205,7 @@ class BaseDataset(abc.ABC):
             pin_memory=num_workers > 0,
             collate_fn=self.collate_fn(),
             worker_init_fn=_single_threaded_worker if num_workers > 0 else None,
-            # Defaults off; see `TrainerConfig.persistent_workers` for the measurement. Briefly:
-            # respawning workers each epoch costs ~4 ms per step amortized, and keeping them alive
-            # costs ~68 ms, because a process that never restarts never gives back the memory a
-            # 134 MB sample and a 256^3 components pass churn through.
+            # Defaults off; see `TrainerConfig.persistent_workers` for the measurement.
             persistent_workers=persistent_workers and num_workers > 0,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
         )
