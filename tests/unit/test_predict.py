@@ -114,6 +114,70 @@ def test_label_resampling_preserves_large_ids():
     assert len(set(np.float32(big).astype(np.int64).ravel().tolist())) == 1
 
 
+def _write_slabs(root: Path, key: str, dtype: str, offset: int) -> None:
+    """A (z, y, x) array at 1 nm voxels holding slabs along z four voxels thick, each its index
+    plus `offset`, in the OME-NGFF layout `VolumeGrid` opens (level path `s0`)."""
+    import json
+
+    import zarr
+    from zarr.storage import LocalStore
+
+    group = zarr.open_group(LocalStore(str(root)), mode="a", zarr_format=2)
+    for part in key.split("/"):
+        group = group[part] if part in group else group.create_group(part)
+    shape = (96, 32, 32)
+    slabs = np.floor((np.arange(shape[0]) + 0.5) / 4) + offset
+    array = group.create_array("s0", shape=shape, chunks=shape, dtype=dtype, overwrite=True)
+    array[:] = np.broadcast_to(slabs[:, None, None], shape).astype(dtype)
+    (root / key / ".zattrs").write_text(json.dumps({"multiscales": [{
+        "version": "0.4",
+        "axes": [{"name": a, "type": "space", "unit": "nanometer"} for a in "zyx"],
+        "datasets": [{"path": "s0", "coordinateTransformations": [
+            {"type": "scale", "scale": [1.0, 1.0, 1.0]}]}],
+    }]}))
+
+
+@pytest.mark.parametrize("resolution", [1.0, 1.5, 0.6, 2.0])
+def test_ground_truth_lines_up_with_the_tiles_the_model_sees(tmp_path, resolution):
+    """The truth a prediction is scored against must describe the place each tile shows.
+
+    Image and labels hold one pattern on one grid, slabs along z four voxels thick, so where a tile
+    interpolates across a boundary its value rounds to the slab under the voxel's centre, and
+    `truth == round(image) + 1000` holds at every voxel (a voxel centred exactly on a boundary
+    shows both slabs, and either is right). Resampled with `i * s // t`, the truth took the first
+    label voxel each output voxel overlaps and sat 0.4-0.5 output voxels off the image by any
+    non-integer ratio: 1.5 and 0.6 here.
+    """
+    from miao.config import MiaoConfig
+
+    from prediction.grid import VolumeGrid
+
+    _write_slabs(tmp_path, "raw", "float32", 0)
+    _write_slabs(tmp_path, "labels/seg", "uint16", 1000)
+    config = MiaoConfig(
+        volumes=[{"name": "slabs", "path": str(tmp_path), "image_key": "raw",
+                  "label_key": "labels/seg", "bounding_box": [[0, 32], [0, 32], [0, 96]]}],
+        resolutions=[[resolution] * 3], output_axes="lcxyz", patch_size=[8, 8, 8],
+    )
+    grid = VolumeGrid(config, "slabs", [8, 8, 8])
+    truth = grid.read_ground_truth() - 1000
+    handle = grid.image_handle()
+    # An upsampled tile clamps at its own faces, where its neighbours take over; compare inside.
+    inside = (slice(1, -1) if any(r < p for r, p in zip(grid.read, grid.patch, strict=True))
+              else slice(None),) * 3
+    for native, out in grid.tiles:
+        image = grid.read_image(handle, native)[inside]
+        label = truth[tuple(slice(o, o + p) for o, p in zip(out, grid.patch, strict=True))][inside]
+        tie = np.abs(image - np.floor(image) - 0.5) < 1e-6
+        right = (label == np.round(image)) | (
+            tie & ((label == np.floor(image)) | (label == np.ceil(image)))
+        )
+        assert right.all(), (
+            f"tile at {native}: {(~right).mean():.0%} of the truth names another slab than the "
+            "tile shows there"
+        )
+
+
 def test_normalisation_follows_the_volume_not_the_dtype():
     """A windowed uint16 volume must not be divided by 255 or by 65535."""
     block = np.array([100, 219, 569, 919, 2000], dtype=np.uint16)

@@ -120,18 +120,20 @@ def resample_image(block: np.ndarray, target: tuple[int, ...]) -> np.ndarray:
 
 
 def resample_labels(block: np.ndarray, target: tuple[int, ...]) -> np.ndarray:
-    """Nearest to `target` by index map, which is the only resampling an id survives.
+    """Nearest to `target` by index map: each output voxel takes the source voxel under its centre.
 
-    Indexed rather than run through `F.interpolate`: miao's nearest path casts to float32 first, and
-    float32 cannot represent an id above 2**24 -- the mechanism by which a store holding 32,039
-    instances in a region delivers a median of one per patch while the tensor is still int64. An
-    index map has no such ceiling, so this is deliberately *not* bit-identical to miao for ids past
-    that point. It is identical wherever miao is correct.
+    `((2i + 1) * s) // (2t)`, i.e. floor((i + 0.5) * s / t) -- the voxel an output voxel's centre
+    falls in, where the trilinear image resampling samples (align_corners=False). `i * s // t`, as
+    this was, takes the first source voxel an output voxel overlaps instead, which by any
+    non-integer ratio puts labels 0.4-0.5 output voxels (up to 1) behind the image.
+
+    By index map rather than through `F.interpolate`, whose float32 round trip cannot represent an
+    id above 2**24.
     """
     if tuple(block.shape) == target:
         return block
     index = [
-        np.minimum((np.arange(t) * s // t).astype(np.int64), s - 1)
+        np.minimum(((2 * np.arange(t) + 1) * s) // (2 * t), s - 1).astype(np.int64)
         for t, s in zip(target, block.shape, strict=True)
     ]
     return block[np.ix_(*index)]
