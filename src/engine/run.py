@@ -294,6 +294,18 @@ def build_trainer(
         if config.val_data is not None
         else None
     )
+    # The algorithm adopts `[data]`'s layout when it is built and reads validation batches in it
+    # too, so a `[val_data]` laid out otherwise would be read transposed, with no error anywhere
+    # downstream. Only checkable when both datasets declare a layout.
+    if val_dataset is not None:
+        train_axes, val_axes = train_dataset.sample_axes, val_dataset.sample_axes
+        if train_axes is not None and val_axes is not None and val_axes != train_axes:
+            raise ValueError(
+                f"[val_data] gives samples as {val_axes!r} but [data] as {train_axes!r}, and the "
+                f"algorithm reads both in one order. Lay [val_data] out as {train_axes!r}: miao "
+                "reads resolutions, patch_size, bounding_box and overlap in output_axes order, so "
+                "rewrite those along with it, or point [val_data] at a YAML written in that order"
+            )
     model = prepare_model(config)
     algorithm = AlgorithmRegistry.build(
         config.algorithm.name, model, train_dataset, **config.algorithm.kwargs

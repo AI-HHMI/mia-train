@@ -127,18 +127,24 @@ def _sections(table: torch.Tensor, spatial_axes: str, extent: dict[str, int]) ->
 
 @pytest.mark.unit
 @pytest.mark.parametrize("spatial_axes", AXIS_ORDERS)
-def test_superposition_rope_starts_out_identical_to_2d(spatial_axes):
+@pytest.mark.parametrize("normalize_coords", ["separate", "max", "min"])
+@pytest.mark.parametrize("z", [1, 2, 7])
+def test_superposition_rope_starts_out_identical_to_2d(spatial_axes, normalize_coords, z):
     """`depth_scale` initialises at zero, so a 2D checkpoint transfers with no change in output:
-    whatever order the axes come in, every z-section is encoded as the 2D image I[y, x]."""
+    whatever order the axes come in, every z-section is encoded as the 2D image I[y, x] -- in every
+    normalisation, with z the shortest side of the grid (1, 2) or its longest (7). "max" and "min"
+    used to divide the in-plane coordinates by all three extents, which only the 2D-sized z kept
+    from rescaling them."""
+    common = dict(embed_dim=64, num_heads=4, base=100.0, normalize_coords=normalize_coords)
     rope3d = RopePositionEmbedding3DSuperposition(
-        embed_dim=64, spatial_axes=spatial_axes, num_heads=4, base=100.0, dtype=torch.float32
+        spatial_axes=spatial_axes, dtype=torch.float32, **common
     )
-    rope2d = RopePositionEmbedding(embed_dim=64, num_heads=4, base=100.0, dtype=torch.float32)
+    rope2d = RopePositionEmbedding(dtype=torch.float32, **common)
 
     assert rope3d.depth_scale.detach().item() == 0.0
     assert rope3d.periods.shape == rope2d.periods.shape, "buffer footprint must match 2D exactly"
 
-    extent = {"x": 5, "y": 3, "z": 2}
+    extent = {"x": 5, "y": 3, "z": z}
     D, H, W = (extent[axis] for axis in spatial_axes)
     for table3, table2 in zip(rope3d(D=D, H=H, W=W), rope2d(H=extent["y"], W=extent["x"])):
         sections = _sections(table3, spatial_axes, extent)

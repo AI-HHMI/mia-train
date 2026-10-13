@@ -248,7 +248,8 @@ def test_inflated_patch_embedding_reproduces_the_2d_response(tmp_path):
 
 
 @pytest.mark.unit
-def test_a_2d_release_one_patch_deep_is_the_2d_model(tmp_path):
+@pytest.mark.parametrize("normalize_coords", ["separate", "max", "min"])
+def test_a_2d_release_one_patch_deep_is_the_2d_model(tmp_path, normalize_coords):
     """The whole network, not just the stem: superposition RoPE and inflation bind depth to z and
     the 2D rows and columns to y and x, so a volume one patch deep whose z-section is the image
     I[y, x] gives the 2D model's tokens on I. With depth bound by position instead, the kernel was
@@ -257,10 +258,15 @@ def test_a_2d_release_one_patch_deep_is_the_2d_model(tmp_path):
     One patch deep because only then is the comparison exact: the CLS and storage tokens appear
     once while a deeper volume repeats every in-plane patch, which reweights attention. No
     LayerScale, so the block's attention -- where RoPE acts -- contributes in full; and the image
-    is not square, so it also pins which extent the model hands the RoPE as x and which as y.
+    is not square, so it also pins which extent the model hands the RoPE as x and which as y. In
+    every normalisation: one patch deep, z is the grid's shortest side, which "min" used to
+    divide the in-plane coordinates by.
     """
     torch.manual_seed(0)
-    options = dict(in_chans=1, n_storage_tokens=4, mask_k_bias=True)
+    options = dict(
+        in_chans=1, n_storage_tokens=4, mask_k_bias=True,
+        pos_embed_rope_normalize_coords=normalize_coords,
+    )
     path, model_2d = _released_checkpoint(tmp_path, **options)
     model_3d = DinoVisionTransformer3D(pos_embed_rope_type="superposition", **options, **DINO)
     load_pretrained(model_3d, path, inflate=True, skip=["rope_embed."])

@@ -318,10 +318,8 @@ class RopePositionEmbedding3DSuperposition(nn.Module):
     The parts are bound to axes by name, through `spatial_axes` -- the input's spatial letters in
     tensor order: the depth angle goes to z, the section axis, and the 2D layout's rows and
     columns (the h and w channels of the 2D embedding) to y and x, so that at a closed gate a
-    z-section is encoded as the 2D image I[y, x] -- exactly so under the default "separate"
-    normalisation; "max" and "min" divide by all three extents, z's included. Required, because
-    the positional binding this replaced gave depth to whichever axis came first -- x under the
-    "xyz" every config feeds.
+    z-section is encoded as the 2D image I[y, x]. Required, because the positional binding this
+    replaced gave depth to whichever axis came first -- x under the "xyz" every config feeds.
     """
 
     periods: torch.Tensor
@@ -392,17 +390,20 @@ class RopePositionEmbedding3DSuperposition(nn.Module):
         extent = dict(zip(self.spatial_axes, (D, H, W), strict=True))
         depth, rows, cols = extent["z"], extent["y"], extent["x"]
 
-        # Prepare coords in range [0, 1] before shifting to [-1, +1]
+        # Prepare coords in range [0, 1] before shifting to [-1, +1]. The in-plane pair is
+        # normalised as the 2D embedding normalises it, over y and x alone, so a z-section is the 2D
+        # table in every mode; dividing by all three extents, as this did, rescaled it whenever z
+        # was the longest ("max") or shortest ("min") side.
         if self.normalize_coords == "max":
-            max_DHW = max(D, H, W)
+            max_DHW, max_HW = max(D, H, W), max(rows, cols)
             coords_d = torch.arange(0.5, depth, **dd) / max_DHW
-            coords_h = torch.arange(0.5, rows, **dd) / max_DHW
-            coords_w = torch.arange(0.5, cols, **dd) / max_DHW
+            coords_h = torch.arange(0.5, rows, **dd) / max_HW
+            coords_w = torch.arange(0.5, cols, **dd) / max_HW
         elif self.normalize_coords == "min":
-            min_DHW = min(D, H, W)
+            min_DHW, min_HW = min(D, H, W), min(rows, cols)
             coords_d = torch.arange(0.5, depth, **dd) / min_DHW
-            coords_h = torch.arange(0.5, rows, **dd) / min_DHW
-            coords_w = torch.arange(0.5, cols, **dd) / min_DHW
+            coords_h = torch.arange(0.5, rows, **dd) / min_HW
+            coords_w = torch.arange(0.5, cols, **dd) / min_HW
         elif self.normalize_coords == "separate":
             coords_d = torch.arange(0.5, depth, **dd) / depth
             coords_h = torch.arange(0.5, rows, **dd) / rows
