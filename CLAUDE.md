@@ -16,8 +16,9 @@ can't explain why, dig deeper.
 already handle the case. Unify similar code paths across models rather than creating
 per-model wrappers. If upstream (torchao, PyTorch) already provides functionality, use it.
 
-4. **Don't leak experiments into core.** Use the `mia-train/experiments/` folder for any 
-experiments. Don't modify core code to accommodate experiment-specific needs (e.g. don't add 
+4. **Don't leak experiments into core.** Experiments live in the separate `mia-train-experiments`
+repository (github.com/eminorhan/mia-train-experiments), not here. Don't modify core code to
+accommodate experiment-specific needs (e.g. don't add 
 `if experiment_x:` branches to core files). Deprecated files should be removed, not updated.
 
 5. **Protect battle-tested code paths.** Be cautious changing converged behavior. Flag 

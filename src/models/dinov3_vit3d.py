@@ -32,7 +32,7 @@ setting of them; the CLS and storage tokens attend globally in every block.
 keys (`layers.common.attention.cap_lengths`). Off by default, it adds no parameters either, and it
 changes nothing while a model's scores stay below it. It exists because fine-tuning grew a
 released ViT-L's first-block scores past what fused attention kernels can differentiate
-accurately (`experiments/large_inputs_nisb`).
+accurately (`mia-train-experiments/large_inputs_nisb`).
 """
 
 from __future__ import annotations

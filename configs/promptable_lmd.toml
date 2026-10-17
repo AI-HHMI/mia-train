@@ -1,11 +1,11 @@
 # Promptable instance segmentation on the lmd corpus, from a released 2D DINOv3 checkpoint.
 #
 # EITHER queue, provided `compile = true`. Measured on this algorithm at this scale
-# (experiments/promptable_seg_v1/RESULTS.md): compiled, H100 and B300 come out within 4% of each
-# other (5.740 vs 5.527 samples/s on 2 GPUs), so take whichever is free. Do NOT run either eager --
-# the step is host-bound, not GPU-bound, and compilation is the only setting measured to move it
-# (1.30x on H100, 1.66x on B300). A first pass at a much smaller encoder reached the opposite
-# conclusion; do not trust a device recommendation taken below production scale.
+# (mia-train-experiments/promptable_seg_v1/RESULTS.md): compiled, H100 and B300 come out within 4%
+# of each other (5.740 vs 5.527 samples/s on 2 GPUs), so take whichever is free. Do NOT run either
+# eager -- the step is host-bound, not GPU-bound, and compilation is the only setting measured to
+# move it (1.30x on H100, 1.66x on B300). A first pass at a much smaller encoder reached the
+# opposite conclusion; do not trust a device recommendation taken below production scale.
 #
 #   bsub -P miaai -q gpu_b300 -gpu "num=8" -n 96 -W 12:00 ... \
 #     torchrun --standalone --nproc_per_node=8 src/train.py --config configs/promptable_lmd.toml
@@ -32,9 +32,9 @@ in_chans = 1
 embed_dim = 1024         # ViT-L/16, ~300M parameters. ViT-B/16 (768 / 12 / 12, ~86M) is the
 depth = 24               # cheaper option and loads from `dinov3_vitb16_pretrain_lvd1689m`; L is
 num_heads = 16           # the default here because it is the scale the profiling arms in
-                         # experiments/promptable_seg_v1 were measured at, and a device or kernel
-                         # recommendation taken at a smaller encoder does not transfer -- at ViT-B
-                         # and below the step is dominated by the decoder's many small kernels
+                         # mia-train-experiments/promptable_seg_v1 were measured at, and a device or
+                         # kernel recommendation taken at a smaller encoder does not transfer -- at
+                         # ViT-B and below the step is dominated by the decoder's many small kernels
                          # rather than by the encoder's matmuls.
 n_storage_tokens = 4
 pos_embed_rope_dtype = "fp32"
@@ -60,10 +60,10 @@ pos_embed_rope_type = "superposition"
 # The ENCODER's attention kernel. Note the two knobs have different names and different homes:
 # `[model].use_fa4` is the DINOv3 encoder's (a bool, defaulting to SDPA) and
 # `[algorithm].attention_backend` below is the mask decoder's. Both are set to SDPA here, for two
-# measured reasons (experiments/promptable_seg_v1): FlashAttention-4 buys nothing at these shapes,
-# and it CANNOT be combined with `[trainer].compile` -- inductor emits an undefined symbol inside
-# flash-attn's CuTeDSL wrapper and the run dies at step 1. Since compilation pays, SDPA is not a
-# compromise.
+# measured reasons (mia-train-experiments/promptable_seg_v1): FlashAttention-4 buys nothing at these
+# shapes, and it CANNOT be combined with `[trainer].compile` -- inductor emits an undefined symbol
+# inside flash-attn's CuTeDSL wrapper and the run dies at step 1. Since compilation pays, SDPA is
+# not a compromise.
 use_fa4 = false
 
 [init]
@@ -119,12 +119,13 @@ patch_size = [256, 256, 256]
 samples_per_epoch = 1000
 
 # Leave the image at its stored resolution in the worker and resample/normalize it on the training
-# device instead. Measured on this workload (experiments/promptable_seg_v1/RESULTS.md): throughput
-# is UNCHANGED -- the loader was never the constraint, `data_wait_frac` is ~0.0008 either way -- but
-# it costs a quarter less host CPU for the same result (13.5 -> 10.1 average cores at 20 workers).
-# That is worth taking as headroom rather than as a speedup, and it is what lets a smaller worker
-# count keep the loader ahead. `engine.run` moves the whole augmentation pipeline to the device to
-# match, via `augments_on_device`, so this composes with `[augment]` rather than conflicting.
+# device instead. Measured on this workload (mia-train-experiments/promptable_seg_v1/RESULTS.md):
+# throughput is UNCHANGED -- the loader was never the constraint, `data_wait_frac` is ~0.0008 either
+# way -- but it costs a quarter less host CPU for the same result (13.5 -> 10.1 average cores at 20
+# workers). That is worth taking as headroom rather than as a speedup, and it is what lets a smaller
+# worker count keep the loader ahead. `engine.run` moves the whole augmentation pipeline to the
+# device to match, via `augments_on_device`, so this composes with `[augment]` rather than
+# conflicting.
 defer_image_ops = true
 
 [val_data]
@@ -158,10 +159,10 @@ patch_embed_lr_mult = 0.2
 
 precision = "bf16"
 
-# Worth 1.42x on this algorithm (measured, experiments/promptable_seg_v1/RESULTS.md). The step is
-# launch-bound -- 4% MFU, because a two-way decoder runs once per prompt per round, which is many
-# small kernels -- and inductor's fusion is the direct answer to that. Requires the SDPA backend
-# selected above.
+# Worth 1.42x on this algorithm (measured, mia-train-experiments/promptable_seg_v1/RESULTS.md). The
+# step is launch-bound -- 4% MFU, because a two-way decoder runs once per prompt per round, which is
+# many small kernels -- and inductor's fusion is the direct answer to that. Requires the SDPA
+# backend selected above.
 compile = true
 activation_checkpointing = true   # the head's expansion to mask resolution, which is where this
                                   # strategy's memory goes

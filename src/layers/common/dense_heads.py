@@ -324,9 +324,10 @@ class SubPixelHead(nn.Module):
         # that each axis pairs its token index with its within-block offset before they are merged,
         # and the channel axis comes last: the volume is laid out channels-last, which is cuDNN's
         # native layout. Handed channels-first, cuDNN transposes the input and output of every
-        # refinement convolution and falls back to Ampere kernels for their backward -- ~0.9 s of
-        # a 1024-cube step on a B300, where the same convolution runs 1.7x faster channels-last
-        # (`experiments/large_inputs`). The permute is a copy either way; only its order changes.
+        # refinement convolution and falls back to Ampere kernels for their backward -- ~0.9 s of a
+        # 1024-cube step on a B300, where the same convolution runs 1.7x faster channels-last
+        # (`mia-train-experiments/large_inputs`). The permute is a copy either way; only its order
+        # changes.
         expanded = expanded.reshape(batch, *grid, readout, *self.patch_size)
         order = [0]
         for axis in range(rank):

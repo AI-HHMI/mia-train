@@ -304,7 +304,7 @@ def test_expansion_is_channels_last_and_the_head_returns_channels_first(patch_si
     """The refinement convolutions run on cuDNN's native layout; the logits leave as they did.
 
     Channels-first, cuDNN transposes every refinement convolution's input and output -- ~0.9 s of a
-    1024-cube step (`experiments/large_inputs`) -- so the expansion lays the volume out
+    1024-cube step (`mia-train-experiments/large_inputs`) -- so the expansion lays the volume out
     channels-last. Nothing downstream should see the difference: the head returns the ordinary
     contiguous layout, and values are the same either way (the equivalence test above).
     """

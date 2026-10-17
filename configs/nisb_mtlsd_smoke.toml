@@ -38,7 +38,7 @@ lsd_sigma = 80.0
 lsd_weight = 1.0
 # Statistics computed on a 2x strided grid and nearest-upsampled, as the reference does. The cost
 # is proportional to objects x voxels, and this cuts it eightfold; measured in
-# mia-train-experiments/lsd_aux_v1/probes/lsd_target_cost.
+# /nrs/scicompsoft/orhane/mia-train-experiments/lsd_aux_v1/probes/lsd_target_cost.
 lsd_downsample = 2
 # Background voxels are left out of the descriptor loss, the reference's default. "zero" would
 # supervise them towards the all-zero descriptor instead.

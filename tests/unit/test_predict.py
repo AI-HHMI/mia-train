@@ -27,10 +27,7 @@ from prediction.grid import aligned_tiling, normalize, resample_labels
 
 pytestmark = pytest.mark.unit
 
-DATA_CONFIG = (
-    Path(__file__).resolve().parents[2]
-    / "experiments/lmd_ssl_v1/lmd_val_singlescale.yaml"
-)
+DATA_CONFIG = Path(__file__).resolve().parents[1] / "data/lmd_val_singlescale.yaml"
 NISB_CONFIG = Path(__file__).resolve().parents[2] / "configs/data/nisb_base.yaml"
 # A light-sheet time series stored t, c, z, y, x (48 frames, one channel); each label array
 # annotates a single frame, so it is predicted one frame at a time via `fixed_axes`.

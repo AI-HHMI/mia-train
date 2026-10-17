@@ -12,8 +12,8 @@
 #
 # Deliberately ViT-S-shaped rather than the ViT-L the real arms use: this validates the *mechanism*,
 # and the mechanism does not care about width. For the released ViT-L settings see
-# experiments/new_ssl_recipe/2a_ssl_twophase.toml and swap its [trainer] freeze keys for a [lora]
-# section -- the two cannot both be set, and the config loader says so.
+# mia-train-experiments/new_ssl_recipe/2a_ssl_twophase.toml and swap its [trainer] freeze keys for a
+# [lora] section -- the two cannot both be set, and the config loader says so.
 
 experiment_name = "dinov3_lora_smoke"
 

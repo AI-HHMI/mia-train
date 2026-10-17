@@ -90,9 +90,10 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
     scalar or one value per axis), converted per sample from the batch's voxel size, so one setting
     means the same window on 9x9x20 nm serial-section data as on 8 nm isotropic FIB-SEM.
     `lsd_downsample` computes the statistics on a strided grid and nearest-upsamples, the
-    reference's `downsample`; its cost grows with objects times voxels, and 2 (the default, and
-    the paper's setting) is the difference between 40-75 ms and 300-630 ms per 256^3 sample of
-    50-110 objects on a B300 (`mia-train-experiments/lsd_aux_v1/probes/lsd_target_cost`).
+    reference's `downsample`; its cost grows with objects times voxels, and 2 (the default, and the
+    paper's setting) is the difference between 40-75 ms and 300-630 ms per 256^3 sample of 50-110
+    objects on a B300
+    (`/nrs/scicompsoft/orhane/mia-train-experiments/lsd_aux_v1/probes/lsd_target_cost`).
     `lsd_background` decides whether background voxels are left out of the descriptor loss
     (`"ignore"`, the reference's default) or supervised towards the all-zero descriptor (`"zero"`).
     Prediction is untouched: `logits()` and the artifact carry the affinity channels only.
@@ -105,9 +106,9 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
     It is worth having because this half of the algorithm is proportional to *voxels* -- the crop
     cubed -- while the encoder is proportional to tokens, so past a certain crop the head is the
     whole cost. Measured on a 7B DINOv3 at a 512-cube on B300s
-    (`experiments/b300_capability_run`): 72% of the step's time was `convolution_backward` in this
-    head, and the memory frontier was set by its voxel-resolution tensors rather than by the 6.7B
-    parameters in front of them.
+    (`mia-train-experiments/b300_capability_run`): 72% of the step's time was `convolution_backward`
+    in this head, and the memory frontier was set by its voxel-resolution tensors rather than by the
+    6.7B parameters in front of them.
 
     Two things make the slabs exact rather than approximate, and both are pinned by
     `tests/unit/test_affinity_chunked.py` against the undivided path:
@@ -355,7 +356,7 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
         allocates a second copy at twice the size while the caller's batch still holds the first.
         At a 1600-cube the pair is 45.8 GiB of a ~265 GiB step, 30.5 GiB of which is the copy --
         an order of magnitude more than any parallelism setting moved
-        (`experiments/b300_capability_run`).
+        (`mia-train-experiments/b300_capability_run`).
 
         Nothing downstream reads the width. `affinities_from_labels` and `relabel_connected` only
         ever evaluate `labels > 0`, `labels != ignore_index` and `a == b`: membership and sign,

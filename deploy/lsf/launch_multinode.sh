@@ -5,8 +5,8 @@
 #
 # `ENTRYPOINT` overrides the script torchrun runs. It defaults to `src/train.py`, which stays the
 # only thing a *training* job launches (DESIGN.md 4); the override is for a job that is not a run.
-# `experiments/b300_capability_run` uses it for a measurement harness that takes the same
-# `--config` but trains nothing.
+# mia-train-experiments' `b300_capability_run` uses it for a measurement harness that takes the
+# same `--config` but trains nothing.
 #
 # Lives in deploy/ rather than src/ because it is scheduler-specific: it reads LSF's host list.
 # `src/` stays scheduler-agnostic (DESIGN.md §6) and learns the topology only through the

@@ -37,12 +37,12 @@ the voxel's own fine-resolution label so that a voxel sitting in a coarse cell o
 still receives its own object's statistics -- the reference's `descriptor * mask` semantics.
 
 **Each 1-D pass is a banded matrix product, not a convolution.** Measured on a B300 over real NISB
-crops (`mia-train-experiments/lsd_aux_v1/probes/lsd_target_cost`), `conv3d` with a `(k, 1, 1)`
-kernel ran at about 3 G elements/s, some 200x under the memory bound, taking a second per 256^3
-sample at downsample 2 and ten at downsample 1: cuDNN has no good kernel for that shape. Along an
-axis of length L the same pass is `x @ M` with `M[i, j] = kernel(i - j)`, an ordinary GEMM that
-cuBLAS runs near peak; the extra arithmetic (L instead of k multiply-adds per output) is cheap
-next to that. It is the same trade the dense heads make for their resampling.
+crops (`/nrs/scicompsoft/orhane/mia-train-experiments/lsd_aux_v1/probes/lsd_target_cost`), `conv3d`
+with a `(k, 1, 1)` kernel ran at about 3 G elements/s, some 200x under the memory bound, taking a
+second per 256^3 sample at downsample 2 and ten at downsample 1: cuDNN has no good kernel for that
+shape. Along an axis of length L the same pass is `x @ M` with `M[i, j] = kernel(i - j)`, an
+ordinary GEMM that cuBLAS runs near peak; the extra arithmetic (L instead of k multiply-adds per
+output) is cheap next to that. It is the same trade the dense heads make for their resampling.
 
 **Where this runs.** On the training device, from the labels as they reach the step, never in a
 dataloader worker. Under `defer_image_ops` the geometric augmentation runs on the device *after*

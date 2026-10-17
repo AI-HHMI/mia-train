@@ -181,21 +181,10 @@ reads the gzipped form too). The command in step 2 prints the exact path to drag
 
 ## Experiments
 
-[`experiments/`](experiments/) holds complete, runnable examples: configs, submission scripts and
-a README each explaining what the experiment tested and what it found, e.g.:
-
-- [`simmim_vs_direct/`](experiments/simmim_vs_direct/): does SSL pretraining help downstream
-  instance segmentation? Four arms differing only in initialisation, plus one at twice the batch
-  across two nodes.
-- [`banis_parity/`](experiments/banis_parity/): closing the gap to the published NISB baselines,
-  and the measurements that identified which knobs mattered.
-- [`subpixel_decoder/`](experiments/subpixel_decoder/): a learned per-token readout in place of
-  trilinear upsampling, which is both sharper and cheaper. Includes the scoring pipeline the NISB
-  experiments share.
-- [`init_comparison/`](experiments/init_comparison/): does pretraining help, and do EM
-  augmentations? Four arms differing only in initialisation.
-
-These may be a good starting point for a new run: simply copy what you need from here and edit it.
+Experiments run with mia-train live in a separate repository,
+[mia-train-experiments](https://github.com/eminorhan/mia-train-experiments): configs, submission
+scripts and a README each explaining what the experiment tested and what it found. They may be a
+good starting point for a new run: simply copy what you need from there and edit it.
 
 ## Tests
 

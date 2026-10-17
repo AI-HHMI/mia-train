@@ -2,8 +2,8 @@
 
 Global self-attention over a D x H x W patch grid scores every pair of tokens, (DHW)^2 per layer,
 and at a 1024-cube crop of 16-voxel patches that is ~83% of a ViT-L training step
-(`experiments/large_inputs`). This module holds the two cheaper patterns the patch-grid ViTs here
-can run instead, shared by `layers.common.attention.SelfAttention` (ViT3D) and
+(`mia-train-experiments/large_inputs`). This module holds the two cheaper patterns the patch-grid
+ViTs here can run instead, shared by `layers.common.attention.SelfAttention` (ViT3D) and
 `layers.dinov3.attention.SelfAttention` (the DINOv3 port):
 
   - **Windows.** The grid is cut into non-overlapping `window`-shaped boxes and each grid token
@@ -19,7 +19,7 @@ can run instead, shared by `layers.common.attention.SelfAttention` (ViT3D) and
     FlashAttention-4 is installed), where boxes of whole tiles make every key block wholly inside or
     outside a window, so the kernel runs at dense speed. (Windows
     centred on each token instead leave most key blocks partly inside and cost ~18x as much;
-    `experiments/large_inputs`.)
+    `mia-train-experiments/large_inputs`.)
   - **Pooled keys and values.** Every token attends to the whole grid, but through keys and values
     averaged over `pool`-sided boxes (PVT's spatial-reduction attention), which divides a global
     layer's cost by pool^rank.

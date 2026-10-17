@@ -199,7 +199,7 @@ bsub -P $PROJECT -q gpu_h100_parallel -app parallel-96 -gpu "num=8:mode=shared" 
   -o $JOBS/train_mn_%J.log \
   -e $JOBS/train_mn_%J.err \
   "MIA_TRAIN=$MIA_TRAIN VENV=$VENV \
-   $MIA_TRAIN/deploy/lsf/launch_multinode.sh 8 experiments/<your>.toml"
+   $MIA_TRAIN/deploy/lsf/launch_multinode.sh 8 /path/to/<your>.toml"
 ```
 
 Set `NCCL_DEBUG=INFO` in the environment to confirm the transport; look for `NET/IB` (good) rather

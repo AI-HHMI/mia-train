@@ -26,8 +26,8 @@
 # Scoring therefore needs an NGFF reader in `banis` -- a change over there, not here. Training
 # reads NGFF through miao and is unaffected.
 #
-# Runs recorded in `experiments/` were produced against `legacy`; their numbers stand, and the
-# configs that produced them are in git history and in each run's own `resolved_config.json`.
+# Runs recorded in mia-train-experiments were produced against `legacy`; their numbers stand, and
+# the configs that produced them are in git history and in each run's own `resolved_config.json`.
 
 # 9x9x20 nm is the native resolution of the s0 level, and the data is anisotropic: z voxels are
 # a little over twice as long as x and y. Asking for exactly the stored size keeps miao on level 0

@@ -5,7 +5,7 @@ the channels, pre-norm residual blocks with layer scale. The block's spatial ope
 changed, because in 3D ConvNeXt's depthwise convolution is the wrong operation for a GPU. On a
 B300, PyTorch's 3D depthwise kernel runs at ~2% of the CUDA cores' peak, while a dense 3^3
 convolution reaches 38-71% of the tensor cores' peak from 64 channels up
-(experiments/large_inputs/README.md, phase 3). Two blocks:
+(mia-train-experiments/large_inputs/README.md, phase 3). Two blocks:
 
   basic   ResNet's basic block (He et al., 2016): LN -> 3^3 -> GELU -> 3^3
   fused   EfficientNetV2's Fused-MBConv (Tan & Le, 2021): LN -> 3^3 to `expansion` x width ->

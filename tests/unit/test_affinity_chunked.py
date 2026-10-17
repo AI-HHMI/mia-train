@@ -2,8 +2,9 @@
 
 `decode_chunks` exists because everything downstream of the patch grid is proportional to *voxels*
 -- the crop cubed -- and on a 7B encoder at a 512-cube that stage was 72% of the step's time and
-most of its memory (`experiments/b300_capability_run`). Splitting it is only worth anything if it
-is not also a change of objective, and the ways it could silently become one are all quiet:
+most of its memory (`mia-train-experiments/b300_capability_run`). Splitting it is only worth
+anything if it is not also a change of objective, and the ways it could silently become one are all
+quiet:
 
   - a slab decoded without halo has the wrong values within `refine_depth` voxels of each seam,
   - a slab scored without reaching `long_range` past its end gets the wrong affinity target there,
