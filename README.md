@@ -151,7 +151,7 @@ Run the job exactly as usual. The profiler trace lands in `<run>/profile/`.
 python -m engine.profiler <run directory>
 ```
 
-That prints where the step went:
+This prints a breakdown of the time spent for different annotated regions and ops per step:
 
 ```
   profiled steps        6
@@ -173,7 +173,7 @@ That prints where the step went:
 ```
 
 It accepts a run directory, its `profile/` subdirectory, or a trace file, and picks the newest
-trace it finds.
+trace it finds there.
 
 **3. For the full timeline:** Open `<run>/profile/*.pt.trace.json` at
 **[ui.perfetto.dev](https://ui.perfetto.dev)** and drag the file in (it
@@ -181,9 +181,8 @@ reads the gzipped form too). The command in step 2 prints the exact path to drag
 
 ## Experiments
 
-Experiments run with mia-train live in a separate repository,
-[mia-train-experiments](https://github.com/eminorhan/mia-train-experiments): configs, submission
-scripts and a README each explaining what the experiment tested and what it found. They may be a
+We maintain a separate repository at [`eminorhan/mia-train-experiments`](https://github.com/eminorhan/mia-train-experiments)
+for running and recording all experiments we run with `mia-train`. These may be a
 good starting point for a new run: simply copy what you need from there and edit it.
 
 ## Tests
