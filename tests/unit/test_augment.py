@@ -502,3 +502,53 @@ def test_the_config_counts_the_elastic_warp_as_augmentation():
     assert AugmentConfig(elastic_prob=0.5).enabled()
     assert not AugmentConfig(elastic_prob=0.5, elastic_sigma=0.0).enabled()
 
+
+
+# ---------------------------------------------------------------- labels past the image
+
+
+def _margin_sample(margin: int = 3) -> dict[str, Any]:
+    """An 8-cube image and a label reaching `margin` voxels past it, every voxel holding its index,
+    so the label's part over the image is the image."""
+    size = 8 + 2 * margin
+    label = torch.arange(size**3).reshape(1, size, size, size)
+    inner = label[:, margin:-margin, margin:-margin, margin:-margin]
+    return {"img": inner.float()[:, None], "label": label, "pixel_size": [[9.0, 9.0, 9.0]]}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("op", [{"rotate": "full"}, {"shift_slice_prob": 1.0}])
+def test_a_label_margin_stays_registered_with_the_image(op) -> None:
+    margin = 3
+    sample = _margin_sample(margin)
+    augmentation = VolumeAugmentation(sample_axes=AXES, shift_magnitude=2, **op)
+    inner = (slice(None), *(slice(margin, -margin),) * 3)
+    changed = False
+    for seed in range(12):
+        torch.manual_seed(seed)
+        out = augmentation(sample)
+        assert torch.equal(out["label"][inner].float(), out["img"][:, 0]), f"{op}, seed {seed}"
+        changed |= not torch.equal(out["img"], sample["img"])
+    assert changed
+
+
+@pytest.mark.unit
+def test_a_section_shift_leaves_the_label_margin_in_place() -> None:
+    """The image has nothing past its faces to shift in, so the label must not either."""
+    margin = 3
+    sample = _margin_sample(margin)
+    out = _until_applied(
+        VolumeAugmentation(sample_axes=AXES, shift_slice_prob=1.0, shift_magnitude=2), sample
+    )
+    outside = torch.ones_like(sample["label"], dtype=torch.bool)
+    outside[(slice(None), *(slice(margin, -margin),) * 3)] = False
+    assert torch.equal(out["label"][outside], sample["label"][outside])
+
+
+@pytest.mark.unit
+def test_the_elastic_warp_refuses_a_label_margin() -> None:
+    augmentation = VolumeAugmentation(
+        sample_axes=AXES, elastic_prob=1.0, elastic_sigma=2.0, elastic_spacing=4
+    )
+    with pytest.raises(ValueError, match="share the spatial extent"):
+        augmentation(_margin_sample())

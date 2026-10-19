@@ -414,3 +414,67 @@ def test_rejects_bad_arguments():
         lsd_from_labels(labels, [2.0, -1.0, 2.0])
     with pytest.raises(ValueError, match="spatial"):
         lsd_from_labels(torch.ones(2, 8, dtype=torch.long), [2.0])
+
+
+# ------------------------------------------------------------------------------ object boxes
+
+
+def _scattered_objects() -> torch.Tensor:
+    """A 32^3 crop of many small cubes -- some on the crop's faces -- beside a slab spanning it, so
+    chunks run over boxes much smaller than the crop as well as over the whole of it."""
+    labels = torch.zeros((32, 32, 32), dtype=torch.int64)
+    labels[:, 12:20, :] = 1
+    next_id = 2
+    for x in (0, 9, 18, 28):
+        for y in (0, 4, 22, 28):
+            for z in (0, 7, 15, 28):
+                labels[x : x + 4, y : y + 4, z : z + 4] = next_id
+                next_id += 1
+    return labels
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("downsample", [1, 2])
+@pytest.mark.parametrize("chunk_elements", [1, 3000, 1 << 23])
+def test_object_boxes_match_the_reference(monkeypatch, downsample, chunk_elements):
+    """One object per chunk, a few neighbours per chunk, and everything in one: all the reference."""
+    pytest.importorskip("scipy")
+    monkeypatch.setattr(lsd_module, "CHUNK_ELEMENTS", chunk_elements)
+    labels = _scattered_objects()
+    sigma = [1.5, 1.5, 1.5]
+    target, mask = lsd_from_labels(labels[None], sigma, downsample=downsample)
+    expected = reference_port(labels.numpy(), sigma, [1.0, 1.0, 1.0], downsample)
+    assert torch.equal(mask[0, 0], labels > 0)
+    difference = np.abs(target[0].numpy() - expected)
+    assert difference.max() < 2e-5, difference.max()
+
+
+@pytest.mark.unit
+def test_morton_chunks_stay_local(monkeypatch):
+    """Under a budget of a few small objects' boxes, chunks of neighbours run over much less than
+    the whole crop -- the point of ordering them."""
+    monkeypatch.setattr(lsd_module, "CHUNK_ELEMENTS", 20_000)
+    labels = _scattered_objects()
+    ids, dense = torch.unique(labels, return_inverse=True)
+    flat, order = torch.sort(dense.reshape(-1))
+    counts = torch.bincount(flat, minlength=ids.numel())
+    boxes = lsd_module._object_boxes(order, counts, labels.shape, 1)[1:].numpy()
+    ordered = boxes[lsd_module._morton_order(boxes.sum(axis=1) // 2)]
+    chunks = lsd_module._chunks(ordered, [5, 5, 5], (32, 32, 32))
+    covered = [np.prod(np.subtract(hi, lo)) for _, _, lo, hi in chunks]
+    assert sum(stop - first for first, stop, _, _ in chunks) == len(boxes)
+    assert all(first < stop for first, stop, _, _ in chunks)
+    assert np.mean(covered) < 32**3 / 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("downsample", [1, 2])
+def test_object_boxes_are_each_objects_first_and_last_cell(downsample):
+    labels = _scattered_objects()
+    ids, dense = torch.unique(labels, return_inverse=True)
+    flat, order = torch.sort(dense.reshape(-1))
+    counts = torch.bincount(flat, minlength=ids.numel())
+    boxes = lsd_module._object_boxes(order, counts, labels.shape, downsample).numpy()
+    for index, label in enumerate(ids.tolist()):
+        where = np.argwhere(labels.numpy() == label) // downsample
+        assert boxes[index].tolist() == [where.min(axis=0).tolist(), where.max(axis=0).tolist()]

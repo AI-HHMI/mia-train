@@ -98,6 +98,16 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
     (`"ignore"`, the reference's default) or supervised towards the all-zero descriptor (`"zero"`).
     Prediction is untouched: `logits()` and the artifact carry the affinity channels only.
 
+    **Labels past the window.** Labels may arrive larger than the image by a margin on each side
+    (miao's `label_margin`). Both targets are then built on the labels around the window and
+    cropped to it, so a voxel at a window face gets the target it would have inside a larger volume:
+    an affinity whose partner lies past the face is supervised rather than masked, and a descriptor
+    sees its whole Gaussian window. That is what the reference does -- gunpowder's `AddAffinities`
+    and `AddLocalShapeDescriptor` grow their label requests by exactly these reaches. A margin must
+    cover both (`long_range`, and the descriptors' `lsd_downsample * kernel_radius`) and, with
+    descriptors, be a multiple of `lsd_downsample`, which keeps their strided grid on the window's
+    first voxel as the reference's is. Without a margin the targets stop at the window's faces.
+
     `decode_chunks` splits everything downstream of the patch grid into that many slabs along the
     first spatial axis, each decoded and scored inside its own checkpoint, so only one slab's
     voxel-resolution activations are live at a time. 1 (the default) is the undivided path,
@@ -509,6 +519,93 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
                 labels, sigma, self.lsd_downsample, self.ignore_index, self.lsd_background
             )
 
+    @staticmethod
+    def _label_margin(
+        labels: torch.Tensor, volumes: torch.Tensor, spatial: Sequence[int]
+    ) -> tuple[int, ...]:
+        """How far the label crop reaches past the image crop on each side, per spatial axis."""
+        excess = [extent - size for extent, size in zip(labels.shape[1:], spatial, strict=True)]
+        if labels.shape[0] != volumes.shape[0] or any(e < 0 or e % 2 for e in excess):
+            raise ValueError(
+                f"label crop {tuple(labels.shape)} does not match the image crop "
+                f"{tuple(volumes.shape)} it must be co-registered with: expected "
+                f"{(volumes.shape[0], *spatial)}, or that plus the same margin on both sides of "
+                "each spatial axis"
+            )
+        return tuple(e // 2 for e in excess)
+
+    def _lsd_halo(self, sigma: torch.Tensor | None) -> tuple[int, ...]:
+        """How far the descriptors read past a voxel, per axis in fine voxels: the batch's widest
+        window's radius on the strided grid, widened back, so a cropped box's strided lattice is
+        the whole volume's own and every kept cell sees its whole window. Zero without them."""
+        if sigma is None:
+            return (0,) * SPATIAL_RANK
+        widest = sigma.reshape(-1, SPATIAL_RANK).max(dim=0).values.tolist()
+        return tuple(
+            self.lsd_downsample * kernel_radius(s / self.lsd_downsample) for s in widest
+        )
+
+    def _check_margin(self, margin: Sequence[int], lsd_halo: Sequence[int]) -> None:
+        """A label margin, if there is one, has to hold everything the targets read past the window."""
+        if not any(margin):
+            return
+        reach = [max(self.long_range, halo) for halo in lsd_halo]
+        if any(m < r for m, r in zip(margin, reach, strict=True)):
+            raise ValueError(
+                f"label margin {list(margin)} is narrower than the {reach} voxels the targets read "
+                f"past the window (long_range {self.long_range}, descriptor halo {list(lsd_halo)}); "
+                f"widen label_margin to at least that on each axis"
+            )
+        if self.lsd_sigma is not None and any(m % self.lsd_downsample for m in margin):
+            raise ValueError(
+                f"label margin {list(margin)} must be a multiple of lsd_downsample="
+                f"{self.lsd_downsample}, or the descriptors' strided grid would not start on the "
+                "window's first voxel as the reference's does"
+            )
+
+    def _window_targets(
+        self,
+        labels: torch.Tensor,
+        margin: Sequence[int],
+        window: Sequence[int],
+        span: tuple[int, int],
+        sigma: torch.Tensor | None,
+        lsd_halo: Sequence[int],
+    ) -> tuple[torch.Tensor, ...]:
+        """Targets for the window's voxels `span` along its first axis and all of it along the
+        others: `(affinity target, mask)`, plus `(descriptor target, mask)` with `sigma`.
+
+        `labels` hold the window plus `margin` on each side. Each target is built on the labels as
+        far around those voxels as it reads -- `lsd_halo` before them, `max(long_range, lsd_halo)`
+        past them, since the affinity offsets are positive and a descriptor's window symmetric --
+        as much of it as the labels hold, and cropped back. Built that way it equals the target of
+        an undivided volume reaching that far (`tests/unit/test_affinity_chunked.py`); without a
+        margin, its window stops at the faces of the crop and the affinities past them are masked.
+        """
+        start = [span[0] + margin[0], *margin[1:]]
+        stop = [span[1] + margin[0], *(m + n for m, n in zip(margin[1:], window[1:], strict=True))]
+        extent = labels.shape[1:]
+        lo = [max(s - halo, 0) for s, halo in zip(start, lsd_halo, strict=True)]
+        hi = [
+            min(s + max(self.long_range, halo), n)
+            for s, halo, n in zip(stop, lsd_halo, extent, strict=True)
+        ]
+        crop = (
+            slice(None),
+            slice(None),
+            *(slice(s - low, e - low) for s, e, low in zip(start, stop, lo, strict=True)),
+        )
+
+        target, mask = self._affinity_targets(labels[:, lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]])
+        terms: tuple[torch.Tensor, ...] = (target[crop], mask[crop])
+        if sigma is None:
+            return terms
+        lsd_hi = [min(s + halo, n) for s, halo, n in zip(stop, lsd_halo, extent, strict=True)]
+        lsd_target, lsd_mask = self._lsd_targets(
+            labels[:, lo[0] : lsd_hi[0], lo[1] : lsd_hi[1], lo[2] : lsd_hi[2]], sigma
+        )
+        return (*terms, lsd_target[crop], lsd_mask[crop])
+
     def _sigma_voxels(self, batch: Any) -> torch.Tensor | None:
         """`lsd_sigma` in voxels of this batch's finest level, per sample: `(B, 3)`, or None.
 
@@ -583,8 +680,9 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
         span: tuple[int, int],
         patch: int,
         sigma: torch.Tensor | None,
-        lsd_halo: int,
+        lsd_halo: tuple[int, ...],
         volumes: torch.Tensor,
+        margin: tuple[int, ...],
     ) -> tuple[torch.Tensor, ...]:
         """One slab's contribution to every metric, as unnormalized sums.
 
@@ -592,30 +690,22 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
         two of these, so a run split into slabs reports exactly what an undivided one does
         regardless of how the slabs are sized.
 
-        `labels` arrive already split. Their slab reaches `lsd_halo` voxels *before* the slab and
-        `max(long_range, lsd_halo)` past it: the affinity offsets are positive and compare a slab's
-        last voxels against the next slab's first, while a descriptor's window is symmetric and
-        reads `kernel_radius` cells on either side. Both targets are built on the extended slab
-        and cropped back, which is what keeps them equal to the undivided volume's
-        (`tests/unit/test_affinity_chunked.py`). Being inside the checkpointed region, they are
-        rebuilt in the backward pass with the slab's activations; that is the price of not holding
-        a voxel-resolution target per slab across the whole backward, and it is a price only the
-        descriptors make noticeable.
+        `labels` arrive already split. The slab's targets are built on the labels around it
+        (`_window_targets`): the affinity offsets are positive and compare a slab's last voxels
+        against the next slab's first, while a descriptor's window is symmetric and reads
+        `kernel_radius` cells on either side. Built that way and cropped back, they equal the
+        undivided volume's (`tests/unit/test_affinity_chunked.py`). Being inside the checkpointed
+        region, they are rebuilt in the backward pass with the slab's activations; that is the
+        price of not holding a voxel-resolution target per slab across the whole backward, and it
+        is a price only the descriptors make noticeable.
         """
         lo, hi = span
-        width = (hi - lo) * patch
-        logits = self._decode(
-            tokens, grid, volumes.shape[-SPATIAL_RANK:], volumes, span=(lo * patch, hi * patch)
-        )
+        spatial = volumes.shape[-SPATIAL_RANK:]
+        logits = self._decode(tokens, grid, spatial, volumes, span=(lo * patch, hi * patch))
         n_affinity = len(self.offsets)
-
-        # Past the volume's end there is nothing to reach for, and `affinities_from_labels` masks
-        # those out exactly as it does for an undivided volume.
-        label_lo = max(lo * patch - lsd_halo, 0)
-        offset = lo * patch - label_lo
-        label_hi = min(hi * patch + max(self.long_range, lsd_halo), labels.shape[1])
-        target, mask = self._affinity_targets(labels[:, label_lo:label_hi])
-        target, mask = target[:, :, offset : offset + width], mask[:, :, offset : offset + width]
+        target, mask, *lsd_targets = self._window_targets(
+            labels, margin, spatial, (lo * patch, hi * patch), sigma, lsd_halo
+        )
 
         affinity_logits = logits[:, :n_affinity]
         per_voxel = F.binary_cross_entropy_with_logits(affinity_logits, target, reduction="none")
@@ -634,12 +724,7 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
         affinity_terms = (loss_sum, *(term.float() for term in terms))
         if sigma is None:
             return affinity_terms
-
-        lsd_hi = min(hi * patch + lsd_halo, labels.shape[1])
-        lsd_target, lsd_mask = self._lsd_targets(labels[:, label_lo:lsd_hi], sigma)
-        lsd_target = lsd_target[:, :, offset : offset + width]
-        lsd_mask = lsd_mask[:, :, offset : offset + width]
-        return (*affinity_terms, *self._lsd_sums(logits[:, n_affinity:], lsd_target, lsd_mask))
+        return (*affinity_terms, *self._lsd_sums(logits[:, n_affinity:], *lsd_targets))
 
     def _step(self, batch: Any) -> dict[str, torch.Tensor]:
         if self.label_key not in batch:
@@ -656,13 +741,10 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
         # from the end. `shape[2:]` is the same thing for the 5-D case and silently picks up the
         # channel axis for the 6-D one.
         spatial = volumes.shape[-3:]
-        if labels.shape[0] != volumes.shape[0] or labels.shape[1:] != spatial:
-            raise ValueError(
-                f"label crop {tuple(labels.shape)} does not match the image crop "
-                f"{tuple(volumes.shape)} it must be co-registered with (expected "
-                f"{(volumes.shape[0], *spatial)})"
-            )
+        margin = self._label_margin(labels, volumes, spatial)
         sigma = self._sigma_voxels(batch)
+        lsd_halo = self._lsd_halo(sigma)
+        self._check_margin(margin, lsd_halo)
 
         with torch.profiler.record_function("encoder"):
             tokens, grid = self._encode(volumes)
@@ -678,7 +760,9 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
                 logits = self._decode(tokens, grid, spatial, volumes)
             # NOTE `logits()` is the same pair of calls without the profiler regions; kept separate
             # so the training step's annotations stay where the profiler expects them.
-            target, mask = self._affinity_targets(labels)
+            target, mask, *lsd_targets = self._window_targets(
+                labels, margin, spatial, (0, spatial[0]), sigma, lsd_halo
+            )
             affinity_logits = logits[:, :n_affinity]
 
             # Masked mean rather than a masked tensor: the border slab each offset shifts in from
@@ -712,8 +796,7 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
             }
             if sigma is None:
                 return metrics
-            lsd_target, lsd_mask = self._lsd_targets(labels, sigma)
-            sums = self._lsd_sums(logits[:, n_affinity:], lsd_target, lsd_mask)
+            sums = self._lsd_sums(logits[:, n_affinity:], *lsd_targets)
             return self._with_lsd(metrics, self._lsd_metrics(sums))
 
         # Chunked: decode and score one slab of the volume at a time, each inside its own
@@ -724,19 +807,11 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
         # than the sum of their parts: a slab's tensors drop back under cuDNN's 2^31 element limit,
         # where its convolutions stop falling back to the int64 direct kernels.
         patch = spatial[0] // grid[0]
-        lsd_halo = 0
-        if sigma is not None:
-            if patch % self.lsd_downsample:
-                raise ValueError(
-                    f"lsd_downsample={self.lsd_downsample} must divide the patch size {patch} "
-                    "when decode_chunks > 1: a slab starts on a patch boundary, and the "
-                    "descriptors' strided grid has to coincide there with the undivided volume's"
-                )
-            # The window's radius on the strided grid, widened back to fine voxels, so a slab's
-            # strided lattice is the undivided volume's own and every kept cell sees its whole
-            # window. The batch's widest window, since the samples may differ in voxel size.
-            lsd_halo = self.lsd_downsample * kernel_radius(
-                float(sigma[:, 0].max()) / self.lsd_downsample
+        if sigma is not None and patch % self.lsd_downsample:
+            raise ValueError(
+                f"lsd_downsample={self.lsd_downsample} must divide the patch size {patch} "
+                "when decode_chunks > 1: a slab starts on a patch boundary, and the "
+                "descriptors' strided grid has to coincide there with the undivided volume's"
             )
         totals: list[torch.Tensor] | None = None
         with torch.profiler.record_function("decoder"):
@@ -751,6 +826,7 @@ class AffinitySegmentation(DenseDecoding, BaseAlgorithm):
                     sigma,
                     lsd_halo,
                     volumes,
+                    margin,
                     use_reentrant=False,
                 )
                 totals = list(terms) if totals is None else [

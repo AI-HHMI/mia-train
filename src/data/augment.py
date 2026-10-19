@@ -292,6 +292,12 @@ class VolumeAugmentation:
     elastic warp is geometric and comes after the rotation: with probability `elastic_prob` a
     sample is warped by offsets of `elastic_sigma` voxels on control points `elastic_spacing`
     voxels apart (`elastic`).
+
+    A label may be larger than the image by a margin on each side (miao's `label_margin`).
+    Rotations and flips act about each tensor's own centre, which keeps a centred margin
+    registered. A section shift moves the part of the label over the image exactly as it moves the
+    image, wrap included, and leaves the margin in place: the image has nothing past its faces to
+    shift in, so the label shown with it must not either. The elastic warp refuses a margin.
     """
 
     def __init__(
@@ -411,6 +417,27 @@ class VolumeAugmentation:
                 "rotate='inplane' to hold the sectioning axis out of the permutation."
             )
 
+    def _over_image(
+        self, sample: dict[str, Any], key: str, image_key: str
+    ) -> tuple[slice, ...]:
+        """Index of the part of `sample[key]` over the image: all of it, unless it is a label
+        reaching past the image by a margin on each side, whose centre part it then is."""
+        tensor, image = sample[key], sample[image_key]
+        region = [slice(None)] * tensor.ndim
+        for axis, image_axis in zip(
+            _resolve(tensor, self._dims_for(key)),
+            _resolve(image, self._dims_for(image_key)),
+            strict=True,
+        ):
+            excess = tensor.shape[axis] - image.shape[image_axis]
+            if excess < 0 or excess % 2:
+                raise ValueError(
+                    f"{key!r} {tuple(tensor.shape)} must cover the image {tuple(image.shape)} by "
+                    "the same margin on both sides of each spatial axis"
+                )
+            region[axis] = slice(excess // 2, tensor.shape[axis] - excess // 2)
+        return tuple(region)
+
     @staticmethod
     def _coin(probability: float = APPLY_PROB) -> bool:
         return bool(torch.rand(()).item() < probability)
@@ -452,13 +479,19 @@ class VolumeAugmentation:
             sample.update(zip(geometric, warped, strict=True))
 
         if self.shift_slice_prob > 0 and self.shift_magnitude > 0 and self._coin():
+            regions = [self._over_image(sample, key, images[0]) for key in geometric]
             shifted = shift_sections(
-                [sample[key] for key in geometric],
+                [sample[key][region] for key, region in zip(geometric, regions, strict=True)],
                 [self._dims_for(key) for key in geometric],
                 prob=self.shift_slice_prob,
                 magnitude=self.shift_magnitude,
             )
-            sample.update(zip(geometric, shifted, strict=True))
+            for key, region, inner in zip(geometric, regions, shifted, strict=True):
+                if inner.shape != sample[key].shape:
+                    outer = sample[key].clone()
+                    outer[region] = inner
+                    inner = outer
+                sample[key] = inner
 
         if self.drop_slice_prob > 0 and self._coin():
             for key in images:

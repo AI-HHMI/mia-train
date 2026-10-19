@@ -29,12 +29,21 @@ catastrophically for small objects far from the origin.
 
 **Every voxel's statistics are its own object's.** They cannot come out of one convolution over the
 label volume, because a window mixes neighbouring objects. The reference loops over labels; this
-one-hots the labels present in the crop, in chunks of `CHUNK_ELEMENTS / coarse voxels` at a time,
-runs the separable passes over the chunk as a batch, and gathers each voxel's own channel. Cost is
-therefore proportional to *labels times voxels*, which is why `downsample` exists: the reference
-computes on a strided grid and nearest-upsamples, and so does this, with the gather addressed by
-the voxel's own fine-resolution label so that a voxel sitting in a coarse cell of another object
-still receives its own object's statistics -- the reference's `descriptor * mask` semantics.
+one-hots the labels present in the crop a chunk at a time, runs the separable passes over the
+chunk as a batch, and gathers each voxel's own channel. Cost is therefore proportional to *labels
+times voxels*, which is why `downsample` exists: the reference computes on a strided grid and
+nearest-upsamples, and so does this, with the gather addressed by the voxel's own fine-resolution
+label so that a voxel sitting in a coarse cell of another object still receives its own object's
+statistics -- the reference's `descriptor * mask` semantics.
+
+**Each chunk runs over its objects' box, not the crop.** An object's statistics are needed only in
+the cells its voxels fall in, and each of those reads at most `kernel_radius` cells around it, so
+the passes need only the cells of its bounding box widened by that radius: the same numbers, since
+the band matrix of a shorter axis is the leading block of the longer one and every cell kept sees
+its whole window. Objects are taken in Morton order of their boxes' centres, so a chunk's members
+are neighbours and their union box stays small, and a chunk grows while its objects times its box
+stay within `CHUNK_ELEMENTS`. On crops of many small objects -- 2,265 in a 316^3 CREMI crop, 9 s
+per crop over the whole volume -- that is most of the cost.
 
 **Each 1-D pass is a banded matrix product, not a convolution.** Measured on a B300 over real NISB
 crops (`/nrs/scicompsoft/orhane/mia-train-experiments/lsd_aux_v1/probes/lsd_target_cost`), `conv3d`
@@ -57,6 +66,7 @@ import contextlib
 import math
 from collections.abc import Iterator, Sequence
 
+import numpy as np
 import torch
 
 #: Where the truncated Gaussian stops, in standard deviations. scipy's `gaussian_filter` default,
@@ -154,9 +164,19 @@ def _exact_float32_matmul() -> Iterator[None]:
 
 
 def _apply_along(x: torch.Tensor, matrix: torch.Tensor, axis: int) -> torch.Tensor:
-    """`(N, *spatial) @ matrix` along spatial axis `axis`."""
+    """`(N, *spatial) @ matrix` along spatial axis `axis`.
+
+    Without moving the axis: the last one is a plain `x @ matrix`, any other `matrix.T @ x` over a
+    view that puts it in the middle of three. Moving it last instead made every pass copy the whole
+    tensor before multiplying, and back after -- twice the memory traffic of the product itself,
+    which is what bounds these passes.
+    """
     dim = axis + 1
-    return (x.movedim(dim, -1) @ matrix).movedim(-1, dim)
+    shape = x.shape
+    if dim == x.ndim - 1:
+        return (x.reshape(-1, shape[-1]) @ matrix).view(*shape[:-1], matrix.shape[1])
+    middle = x.reshape(math.prod(shape[:dim]), shape[dim], math.prod(shape[dim + 1 :]))
+    return torch.matmul(matrix.T, middle).view(*shape[:dim], matrix.shape[1], *shape[dim + 1 :])
 
 
 def _moments(
@@ -227,6 +247,64 @@ def _normalised_channels(
     return [c.clamp_(0.0, 1.0).mul_(reach) for c in channels], count
 
 
+def _object_boxes(
+    order: torch.Tensor, counts: torch.Tensor, shape: Sequence[int], downsample: int
+) -> torch.Tensor:
+    """`(n_ids, 2, rank)`: per dense id, the first and last coarse cell its voxels fall in.
+
+    `order` lists the voxels sorted by id and `counts` how many each id has, so every id is one
+    contiguous run and a segment reduction finds its box without atomics. A scatter of every voxel
+    onto its id's slot instead serialises on crops of few large objects: 148 of 172 ms per 316^3
+    crop of 23 objects on a B300.
+    """
+    bounds = []
+    for axis, extent in enumerate(shape):
+        stride = math.prod(shape[axis + 1 :])
+        # float32 holds every cell index exactly, and segment_reduce reduces floating types.
+        cells = (order // stride % extent // downsample).to(torch.float32)
+        bounds.append(torch.stack([
+            torch.segment_reduce(cells, "min", lengths=counts),
+            torch.segment_reduce(cells, "max", lengths=counts),
+        ]))
+    return torch.stack(bounds, dim=-1).transpose(0, 1).to(torch.int64)
+
+
+def _morton_order(points: np.ndarray) -> np.ndarray:
+    """Indices that sort integer points `(n, rank)` along a Z-order curve, so neighbours stay near."""
+    key = np.zeros(len(points), dtype=np.int64)
+    rank = points.shape[1]
+    for bit in range(int(points.max(initial=0)).bit_length()):
+        for axis in range(rank):
+            key |= ((points[:, axis] >> bit) & 1) << (bit * rank + axis)
+    return np.argsort(key, kind="stable")
+
+
+def _chunks(
+    boxes: np.ndarray, radius: Sequence[int], shape: Sequence[int]
+) -> list[tuple[int, int, tuple[int, ...], tuple[int, ...]]]:
+    """Consecutive objects (`boxes` in processing order) grouped into chunks: `(first, stop, lo,
+    hi)` per chunk, `[lo, hi)` the cells its passes run over -- the members' union box widened by
+    `radius` and clipped to `shape` -- grown while members times cells stay within
+    `CHUNK_ELEMENTS`, but never empty."""
+    def span(lo, hi):
+        lo = tuple(max(a - r, 0) for a, r in zip(lo, radius, strict=True))
+        hi = tuple(min(b + 1 + r, n) for b, r, n in zip(hi, radius, shape, strict=True))
+        return lo, hi, math.prod(b - a for a, b in zip(lo, hi, strict=True))
+
+    chunks = []
+    first, union = 0, None
+    for index, (lo, hi) in enumerate(boxes.tolist()):
+        grown = (lo, hi) if union is None else (
+            [min(a, b) for a, b in zip(union[0], lo)], [max(a, b) for a, b in zip(union[1], hi)]
+        )
+        if union is not None and (index - first + 1) * span(*grown)[2] > CHUNK_ELEMENTS:
+            chunks.append((first, index, *span(*union)[:2]))
+            first, grown = index, (lo, hi)
+        union = grown
+    chunks.append((first, len(boxes), *span(*union)[:2]))
+    return chunks
+
+
 def _descriptors(
     labels: torch.Tensor, sigma: Sequence[float], downsample: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -245,13 +323,14 @@ def _descriptors(
         )
     coarse_sigma = [s / downsample for s in sigma]
     coarse_shape = tuple(extent // downsample for extent in labels.shape)
+    radius = [kernel_radius(s) for s in coarse_sigma]
+    # Whole-axis band matrices; a chunk's box uses their leading blocks, which are its own.
     matrices = [
         [_band_matrix(kernel, extent) for kernel in moment_kernels(s, device)]
         for s, extent in zip(coarse_sigma, coarse_shape, strict=True)
     ]
 
-    # Dense ids, so a label chunk is a contiguous range and its one-hot is a comparison against
-    # `arange`. `unique` sorts, so negatives (ignore) come first, then 0, then the objects.
+    # Dense ids: `unique` sorts, so negatives (ignore) come first, then 0, then the objects.
     ids, dense = torch.unique(labels, return_inverse=True)
     n_objects = int((ids > 0).sum())
     descriptor = torch.zeros(
@@ -262,32 +341,45 @@ def _descriptors(
         return descriptor, defined
     first_object = ids.numel() - n_objects
 
-    coarse = dense[tuple(slice(None, None, downsample) for _ in range(rank))]
-    coarse_strides = [math.prod(coarse.shape[a + 1 :]) for a in range(rank)]
-
-    # Voxels sorted by object, so that the voxels of one label chunk are one contiguous run: the
-    # gather below then touches every foreground voxel exactly once over the whole loop, and the
-    # loop bounds come from one host round trip rather than one per chunk.
+    # Objects renumbered 0.. in Morton order of their boxes (everything else -1), so a chunk is a
+    # contiguous range of them and its one-hot is a comparison against `arange`.
     flat_dense, order = torch.sort(dense.reshape(-1))
-    bounds = torch.bincount(flat_dense, minlength=ids.numel()).cumsum(0).tolist()
-    chunk = max(1, min(n_objects, CHUNK_ELEMENTS // coarse.numel()))
+    counts = torch.bincount(flat_dense, minlength=ids.numel())
+    boxes = _object_boxes(order, counts, labels.shape, downsample)[first_object:]
+    host_boxes = boxes.cpu().numpy()
+    order_of_objects = _morton_order(host_boxes.sum(axis=1) // 2)
+    position = torch.full((ids.numel(),), -1, dtype=torch.int64, device=device)
+    position[first_object + torch.as_tensor(order_of_objects, device=device)] = torch.arange(
+        n_objects, device=device
+    )
+    ranked = position[dense]
+    coarse = ranked[tuple(slice(None, None, downsample) for _ in range(rank))]
 
-    for lo in range(first_object, ids.numel(), chunk):
-        hi = min(lo + chunk, ids.numel())
-        channel_ids = torch.arange(lo, hi, device=device).reshape(-1, *(1,) * rank)
-        onehot = (coarse.unsqueeze(0) == channel_ids).to(torch.float32)
-        channels, count = _normalised_channels(_moments(onehot, matrices), coarse_sigma)
+    # Voxels sorted by object, so that the voxels of one chunk are one contiguous run: the gather
+    # below then touches every foreground voxel exactly once over the whole loop, and the loop
+    # bounds come from one host round trip rather than one per chunk.
+    flat_ranked, order = torch.sort(ranked.reshape(-1))
+    bounds = (torch.bincount(flat_ranked + 1, minlength=n_objects + 1).cumsum(0)).tolist()
 
-        start, stop = (bounds[lo - 1] if lo > 0 else 0), bounds[hi - 1]
-        voxels = order[start:stop]
-        channel = flat_dense[start:stop] - lo
+    for first, stop, lo, hi in _chunks(host_boxes[order_of_objects], radius, coarse_shape):
+        box = tuple(slice(a, b) for a, b in zip(lo, hi, strict=True))
+        extent = [b - a for a, b in zip(lo, hi, strict=True)]
+        channel_ids = torch.arange(first, stop, device=device).reshape(-1, *(1,) * rank)
+        onehot = (coarse[box].unsqueeze(0) == channel_ids).to(torch.float32)
+        blocks = [[m[:n, :n] for m in axis] for axis, n in zip(matrices, extent, strict=True)]
+        channels, count = _normalised_channels(_moments(onehot, blocks), coarse_sigma)
+
+        start, end = bounds[first], bounds[stop]   # bounds[k]: voxels ranked below k, -1 included
+        voxels = order[start:end]
+        channel = flat_ranked[start:end] - first
+        box_strides = [math.prod(extent[a + 1 :]) for a in range(rank)]
         cell = torch.zeros_like(voxels)
         for axis, index in enumerate(torch.unravel_index(voxels, labels.shape)):
-            cell += (index // downsample) * coarse_strides[axis]
+            cell += (index // downsample - lo[axis]) * box_strides[axis]
 
-        gathered = torch.stack([c.reshape(hi - lo, -1)[channel, cell] for c in channels])
+        gathered = torch.stack([c.reshape(stop - first, -1)[channel, cell] for c in channels])
         descriptor.view(descriptor.shape[0], -1)[:, voxels] = gathered
-        defined.view(-1)[voxels] = count.reshape(hi - lo, -1)[channel, cell] > 0
+        defined.view(-1)[voxels] = count.reshape(stop - first, -1)[channel, cell] > 0
     return descriptor, defined
 
 
