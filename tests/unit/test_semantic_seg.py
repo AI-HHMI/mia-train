@@ -1,4 +1,5 @@
-"""`semantic_seg`: its heads, its ignored voxels, and slabs computing exactly the undivided decode.
+"""`semantic_seg`: its heads, its ignored voxels, its label sets, and slabs computing exactly the
+undivided decode.
 
 The slab half mirrors `test_affinity_chunked.py`, for the reason given there: decoding the volume in
 slabs is only worth having if it is not also a change of objective, and the ways it could become one
@@ -334,4 +335,140 @@ def test_interpolating_chunked_gradients_match_the_undivided_decode(decoder):
     scores at every slab face by far more than this.
     """
     assert _gradient_disagreement(decoder, torch.float32) < 5e-3
+
+
+# ---------------------------------------------------------------- label sets
+
+# 3 is also an output class, as CellMap's composite ids are; 6 is not one.
+SETS = {3: [1, 2], 6: [0, 2]}
+
+
+def _set_batch() -> dict[str, torch.Tensor]:
+    """`_batch`, with a block inside its supervised box relabelled with the set id 6."""
+    batch = _batch()
+    batch["label"][..., 12:20, 8:16, 14:30] = 6
+    return batch
+
+
+def _reference_set_terms(
+    algorithm: SemanticSegmentation, batch: dict[str, torch.Tensor]
+) -> tuple[float, float, float]:
+    """Loss, pixel accuracy and mean IoU of a `SETS` run, spelt out voxel by voxel."""
+    labels = algorithm._prepare_labels(batch["label"])
+    scores = algorithm.logits(algorithm.encoder.prepare_input(batch["img"], "lcxyz")).double()
+    valid = labels != IGNORE
+    log_probs = scores.log_softmax(dim=1)
+    target = log_probs.gather(1, labels.clamp(0, CLASSES - 1).unsqueeze(1)).squeeze(1)
+    argmax = scores.argmax(dim=1)
+    correct = argmax == labels
+    for label, members in SETS.items():
+        here = labels == label
+        target = torch.where(here, log_probs[:, members].logsumexp(dim=1), target)
+        correct = torch.where(here, torch.isin(argmax, torch.tensor(members)), correct)
+    single = valid & ~torch.isin(labels, torch.tensor(list(SETS)))
+    truth, predicted = labels[single], argmax[single]
+    ious = [
+        float(((truth == c) & (predicted == c)).sum() / ((truth == c) | (predicted == c)).sum())
+        for c in range(CLASSES)
+        if (truth == c).any()
+    ]
+    mean_iou = sum(ious) / len(ious)
+    return float(-target[valid].mean()), float(correct[valid].double().mean()), mean_iou
+
+
+@pytest.mark.unit
+def test_a_set_voxel_is_supervised_by_the_probability_on_its_set():
+    algorithm = _algorithm("linear", label_sets=SETS)
+    batch = _set_batch()
+    reported = algorithm.training_step(batch)
+
+    loss, accuracy, mean_iou = _reference_set_terms(algorithm, batch)
+    assert _value(reported["loss"]) == pytest.approx(loss, rel=1e-5)
+    assert _value(reported["pixel_accuracy"]) == pytest.approx(accuracy, rel=1e-6)
+    assert _value(reported["mean_iou"]) == pytest.approx(mean_iou, rel=1e-6)
+    # Configuration, not state, like `ignore_labels`.
+    assert not {"accepts", "label_set_ids"} & set(algorithm.state_dict())
+
+
+@pytest.mark.unit
+def test_voxels_with_one_class_train_as_cross_entropy_in_a_set_run():
+    """No voxel carries the set id here, so the set path has to reproduce the plain one."""
+    batch = _batch()
+    plain = _algorithm("linear").training_step(batch)
+    with_sets = _algorithm("linear", label_sets={6: [0, 1]}).training_step(batch)
+    assert set(with_sets) == set(plain)
+    for name, expected in plain.items():
+        assert _value(with_sets[name]) == pytest.approx(_value(expected), rel=1e-5), name
+
+
+@pytest.mark.unit
+def test_without_label_sets_the_plain_path_runs():
+    algorithm = _algorithm("linear", label_sets={})
+    assert algorithm.accepts is None and algorithm.label_set_ids is None
+    batch = _batch()
+    reported = algorithm.training_step(batch)
+    expected = _algorithm("linear").training_step(batch)
+    assert {k: _value(v) for k, v in reported.items()} == {
+        k: _value(v) for k, v in expected.items()
+    }
+
+
+@pytest.mark.unit
+def test_label_set_ids_may_arrive_as_toml_strings():
+    from_toml = _algorithm("linear", label_sets={str(k): v for k, v in SETS.items()})
+    assert torch.equal(from_toml.accepts, _algorithm("linear", label_sets=SETS).accepts)
+
+
+@pytest.mark.unit
+def test_set_voxels_stay_out_of_the_dice_term():
+    """Including id 3's, which is also an output class: they must not count as class 3's."""
+    algorithm = _algorithm("subpixel", label_sets=SETS, dice_weight=1.0)
+    batch = _set_batch()
+    reported = algorithm.training_step(batch)
+
+    labels = algorithm._prepare_labels(batch["label"])
+    scores = algorithm.logits(algorithm.encoder.prepare_input(batch["img"], "lcxyz"))
+    single_only = labels.masked_fill(torch.isin(labels, torch.tensor(list(SETS))), IGNORE)
+    dice = float(_reference_dice_loss(scores, single_only))
+    loss, _, _ = _reference_set_terms(algorithm, batch)
+    assert _value(reported["dice_loss"]) == pytest.approx(dice, rel=1e-5)
+    assert _value(reported["cross_entropy"]) == pytest.approx(loss, rel=1e-5)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        (dict(label_sets={3: []}), "empty"),
+        (dict(label_sets={3: [CLASSES]}), "output class"),
+        (dict(label_sets={3: [2], 2: [1]}), "label set itself"),
+        (dict(label_sets={3: [0, 1]}, ignore_labels=(0,)), "neither ignored"),
+        (dict(label_sets={0: [1]}, ignore_labels=(0,)), "both ignored"),
+        (dict(label_sets={IGNORE: [1]}), "both ignored"),
+        (dict(label_sets={-2: [1]}), "negative"),
+        (dict(label_sets=SETS, class_weights=(1.0,) * CLASSES), "class_weights"),
+    ],
+)
+def test_label_sets_that_name_no_class_a_voxel_can_be_are_refused(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        _algorithm("linear", **overrides)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("decoder", ["subpixel", "unetr"])
+def test_chunked_set_terms_match_the_undivided_decode(decoder):
+    batch = _set_batch()
+    whole = _algorithm(decoder, label_sets=SETS, dice_weight=1.0).training_step(batch)
+    split = _algorithm(
+        decoder, label_sets=SETS, dice_weight=1.0, decode_chunks=3
+    ).training_step(batch)
+    for name, expected in whole.items():
+        assert _value(split[name]) == pytest.approx(_value(expected), rel=1e-5, abs=1e-6), name
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("decoder", ["subpixel", "unetr"])
+def test_chunked_set_gradients_match_the_undivided_decode(decoder):
+    """`_batch`'s labels hold the set id 3 already, so set voxels cross every slab face."""
+    assert _gradient_disagreement(decoder, torch.float64, label_sets=SETS, dice_weight=1.0) < 1e-12
 

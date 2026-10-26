@@ -16,7 +16,7 @@ and the same slab decoding for crops whose voxel-resolution tensors would not fi
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -67,13 +67,28 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
     out more ids the same way. What 0 means depends on the label set, not on its source: in CMCT,
     three CellMap classes on crops annotated for exactly those, 0 is "annotated, and none of the
     three" and is learned like any class; in CellMap's all-organelles crops every annotated voxel
-    carries a class, so 0 is unannotated, and a composite id (a whole organelle where its parts
-    were not painted) names no single class -- both belong in `ignore_labels` there.
+    carries a class, so 0 is unannotated and belongs in `ignore_labels` there, and a composite id (a
+    whole organelle where its parts were not painted) names no single class -- left out the same
+    way, or supervised as the set of its parts with `label_sets`.
+
+    `label_sets` lets a label id stand for a set of classes, `{id: [classes]}`: "this voxel is one
+    of these, which one not said". Such a voxel's loss is minus the log of the probability on the
+    set as a whole -- cross-entropy with the target's logit replaced by a logsumexp over the set's
+    -- so it does not care how that probability is split among the members, and the voxels that do
+    carry a single class teach the split. A single class is the one-element set, for which this is
+    exactly cross-entropy. CellMap's composites are the case it was written for (`{50: [3, 4, 5]}`:
+    a mitochondrion, membrane, lumen or ribosome), and it fits any data annotated at different
+    granularity. Members must be output classes, neither ignored nor sets themselves; an id cannot
+    be both ignored and a set; a set id may lie at or above `num_classes`, naming no output of its
+    own. TOML table keys are strings, so `{ 50 = [3, 4, 5] }` reads as id 50. A set voxel counts as
+    correct in `pixel_accuracy` when the class predicted is in its set, and is left out of the
+    per-class counts behind `mean_iou` and out of the Dice term, having no single class to credit.
 
     `class_weights` reweights the loss per class. Dense EM segmentation is severely imbalanced --
     background dominates and small organelles are rare -- so a run that optimises plain accuracy
     can score well while never predicting a rare class at all. Left unset, no reweighting is
-    applied; the per-class IoU in the metrics is what exposes the problem.
+    applied; the per-class IoU in the metrics is what exposes the problem. It cannot be combined
+    with `label_sets`: a weight belongs to a voxel's one class, which a set voxel does not have.
 
     `decoder` picks how patch tokens become class scores at voxel resolution, from the heads in
     `layers.common.dense_heads`, built by `algorithms.dense.decoding`:
@@ -130,6 +145,7 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
         decoder_hidden_dim: int = 128,
         ignore_index: int = -1,
         ignore_labels: Sequence[int] = (),
+        label_sets: Mapping[int | str, Sequence[int]] | None = None,
         class_weights: tuple[float, ...] | list[float] | None = None,
         checkpoint_decoder: bool = False,
         decoder: str = "interpolate",
@@ -162,6 +178,43 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
             "ignored_ids", torch.tensor(sorted({int(i) for i in ignore_labels}), dtype=torch.long),
             persistent=False,
         )
+        sets = {
+            int(label): sorted({int(c) for c in classes})
+            for label, classes in (label_sets or {}).items()
+        }
+        ignored = {int(i) for i in ignore_labels} | {ignore_index}
+        for label, classes in sets.items():
+            if label < 0:
+                raise ValueError(f"label_sets id {label} is negative, and label ids are not")
+            if label in ignored:
+                raise ValueError(f"label {label} is both ignored and a label set; it can be one")
+            if not classes:
+                raise ValueError(
+                    f"label_sets[{label}] is empty; leave the id out with ignore_labels instead"
+                )
+            stray = [c for c in classes if not 0 <= c < num_classes or c in ignored or c in sets]
+            if stray:
+                raise ValueError(
+                    f"label_sets[{label}] lists {stray}: a member must be an output class below "
+                    f"num_classes={num_classes}, neither ignored nor a label set itself"
+                )
+        if sets and class_weights is not None:
+            raise ValueError(
+                "class_weights cannot be combined with label_sets: a weight belongs to a voxel's "
+                "one class, and a voxel labelled with a set has none"
+            )
+        # Row k: the classes label k allows -- itself for a class, its members for a set. None
+        # without sets, which keeps the plain cross-entropy path. Non-persistent, as `ignored_ids`.
+        accepts = set_ids = None
+        if sets:
+            accepts = torch.zeros(max(num_classes, max(sets) + 1), num_classes, dtype=torch.bool)
+            accepts[:num_classes] = torch.eye(num_classes, dtype=torch.bool)
+            for label, classes in sets.items():
+                accepts[label] = False
+                accepts[label, classes] = True
+            set_ids = torch.tensor(sorted(sets), dtype=torch.long)
+        self.register_buffer("accepts", accepts, persistent=False)
+        self.register_buffer("label_set_ids", set_ids, persistent=False)
         self.checkpoint_decoder = checkpoint_decoder
         self.decode_chunks = decode_chunks
         self.encoder = model
@@ -279,24 +332,47 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
         exactly what it would decoded whole, however the slabs are sized. In order: the summed
         cross-entropy and its normaliser (the supervised voxels, or their total class weight when
         `class_weights` is set -- `F.cross_entropy`'s own 'mean'), the correctly classified and the
-        supervised voxels, and per class the intersection, the predicted and the labelled count.
-        With `dice_weight > 0`, three more per class from 1 on, with gradients: the softmax mass
-        on the class's voxels, its whole softmax mass, and its voxel count.
+        supervised voxels, and per class the intersection, the predicted and the labelled count --
+        over the voxels with a single class: a `label_sets` voxel is supervised, and correct when
+        its prediction is in its set, but counts towards no class. With `dice_weight > 0`, three
+        more per class from 1 on, with gradients: the softmax mass on the class's voxels, its whole
+        softmax mass, and its voxel count.
         """
         # `register_buffer` widens the attribute's static type to Tensor | Module; it is a
         # tensor or None by construction here.
         weights: torch.Tensor | None = self.class_weights  # type: ignore[assignment]
+        accepts: torch.Tensor | None = self.accepts  # type: ignore[assignment]
         valid = labels != self.ignore_index
-        targets = labels[valid]
-        loss_sum = F.cross_entropy(
-            scores, labels, weight=weights, ignore_index=self.ignore_index, reduction="sum"
-        )
-        normaliser = (
-            valid.sum().to(loss_sum.dtype) if weights is None else weights[targets].sum()
-        )
+        accept: torch.Tensor | None = None
+        if accepts is None:
+            single = valid
+            targets = labels[single]
+            loss_sum = F.cross_entropy(
+                scores, labels, weight=weights, ignore_index=self.ignore_index, reduction="sum"
+            )
+            normaliser = (
+                valid.sum().to(loss_sum.dtype) if weights is None else weights[targets].sum()
+            )
+        else:
+            set_ids: torch.Tensor = self.label_set_ids  # type: ignore[assignment]
+            single = valid & ~torch.isin(labels, set_ids)
+            targets = labels[single]
+            # (B, C, *spatial): the classes each voxel's label allows.
+            accept = accepts[torch.where(valid, labels, 0)].movedim(-1, 1)
+            # Cross-entropy with the target's logit replaced by a logsumexp over the allowed ones:
+            # minus the log of the probability on the set, and exactly cross-entropy for one class.
+            z = scores.to(torch.promote_types(scores.dtype, torch.float32))
+            allowed = z.masked_fill(~accept, float("-inf")).logsumexp(dim=1)
+            loss_sum = (z.logsumexp(dim=1) - allowed).masked_fill(~valid, 0.0).sum()
+            normaliser = valid.sum().to(loss_sum.dtype)
         with torch.no_grad():
-            predicted = scores.argmax(dim=1)[valid]
+            argmax = scores.argmax(dim=1)
+            predicted = argmax[single]
             hit = predicted == targets
+            # A set voxel is right when the class predicted is one its label allows.
+            correct = hit.sum() if accept is None else (
+                accept.gather(1, argmax.unsqueeze(1)).squeeze(1) & valid
+            ).sum()
             intersection = torch.bincount(targets[hit], minlength=self.num_classes)
             predicted_count = torch.bincount(predicted, minlength=self.num_classes)
             labelled_count = torch.bincount(targets, minlength=self.num_classes)
@@ -307,14 +383,17 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
             probs = probs[:, 1:]
             classes = torch.arange(1, self.num_classes, device=labels.device)
             member = labels.unsqueeze(1) == classes.view(1, -1, *([1] * (labels.dim() - 1)))
+            if accept is not None:
+                # A set voxel is no class's member, even where its id is also an output class.
+                member = member & single.unsqueeze(1)
             dims = (0, *range(2, probs.dim()))
             dice = (
                 (probs * member).sum(dim=dims),
-                (probs * valid.unsqueeze(1)).sum(dim=dims),
+                (probs * single.unsqueeze(1)).sum(dim=dims),
                 member.sum(dim=dims).to(probs.dtype),
             )
         return (
-            loss_sum, normaliser, hit.sum(), valid.sum(),
+            loss_sum, normaliser, correct, valid.sum(),
             intersection, predicted_count, labelled_count, *dice,
         )
 
