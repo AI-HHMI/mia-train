@@ -175,6 +175,84 @@ def test_ground_truth_lines_up_with_the_tiles_the_model_sees(tmp_path, resolutio
         )
 
 
+def _write_two_level_slabs(root: Path) -> None:
+    """`raw` at 1 nm with a 2 nm level s1 placed by lmd's convention (translation (2 - 1) / 2):
+    slabs along z four level-0 voxels thick holding their index, s1 their 2x2x2 means."""
+    import json
+
+    import zarr
+    from zarr.storage import LocalStore
+
+    raw = zarr.open_group(LocalStore(str(root)), mode="a", zarr_format=2).create_group("raw")
+    shape = (96, 32, 32)
+    s0 = np.broadcast_to(np.floor((np.arange(shape[0]) + 0.5) / 4)[:, None, None], shape)
+    s1 = s0.reshape(48, 2, 16, 2, 16, 2).mean(axis=(1, 3, 5))
+    for level, data in (("s0", s0), ("s1", s1)):
+        array = raw.create_array(level, shape=data.shape, chunks=data.shape, dtype="float32")
+        array[:] = data.astype("float32")
+    (root / "raw" / ".zattrs").write_text(json.dumps({"multiscales": [{
+        "version": "0.4",
+        "axes": [{"name": a, "type": "space", "unit": "nanometer"} for a in "zyx"],
+        "datasets": [
+            {"path": "s0", "coordinateTransformations": [{"type": "scale", "scale": [1.0] * 3}]},
+            {"path": "s1", "coordinateTransformations": [
+                {"type": "scale", "scale": [2.0] * 3},
+                {"type": "translation", "translation": [0.5] * 3},
+            ]},
+        ],
+    }]}))
+
+
+def test_a_coarser_level_is_read_as_miao_reads_it_and_placed_where_it_came_from(tmp_path):
+    """A 1 nm store predicted at 2 nm reads its level 1, as an 8 nm model reads a 4 nm store.
+
+    The tile is miao's own level-1 read, to the bit; the artifact's geometry puts every output
+    voxel where its content came from (s1 holds a slab's index wherever the slab is two s1 voxels
+    thick, so every voxel is checkable); and the recorded `scale` is against level 0, so a scorer
+    that places predictions on the store's own voxels refuses this one rather than misplacing it.
+    """
+    from miao.config import MiaoConfig
+    from miao.dataset import VolumeDataset
+
+    from predict import shared_attrs
+    from prediction.artifact import ome_geometry
+    from prediction.grid import VolumeGrid
+
+    _write_two_level_slabs(tmp_path)
+    volume = {"name": "slabs", "path": str(tmp_path), "image_key": "raw",
+              "bounding_box": [[3, 93], [1, 31], [0, 32]]}
+    config = MiaoConfig(volumes=[volume], resolutions=[[2.0] * 3], output_axes="lczyx",
+                        patch_size=[8, 8, 8])
+    grid = VolumeGrid(config, "slabs", [8, 8, 8])
+    assert grid.image_level == 1 and grid.read == [8, 8, 8]
+    assert grid.box_low == [2, 1, 0] and grid.box_extent == [44, 14, 16]
+
+    geometry = ome_geometry(grid)
+    first, voxel = np.array(geometry["translation_nm"]), np.array(geometry["voxel_nm"])
+    handle = grid.image_handle()
+    for native, out in grid.tiles:
+        tile = grid.read_image(handle, native)
+        centres = first[0] + (out[0] + np.arange(8)) * voxel[0]
+        # Level-0 voxel j is centred at j nm, so slab k spans [4k - 0.5, 4k + 3.5) nm.
+        expected = np.floor((centres + 0.5) / 4)[:, None, None]
+        assert np.array_equal(tile, np.broadcast_to(expected, tile.shape)), native
+
+    sampler = VolumeDataset(config.model_copy(update={
+        "volumes": [config.volumes[0].model_copy(update={"bounding_box": [[20, 40], [6, 26],
+                                                                            [4, 24]]})],
+        "sampling": "sequential", "overlap": 0,
+    }))
+    sample = sampler[0]
+    low = sample["bbox"].numpy()[0, 0]      # miao's (origin * factor - offset) * 1 nm
+    origin = tuple(
+        int(round((low[a] + grid.level_offset[a]) / grid.level_factor[a])) for a in range(3)
+    )
+    assert np.abs(grid.read_image(handle, origin) - sample["img"].numpy()[0, 0]).max() == 0.0
+
+    attrs = shared_attrs(grid, tmp_path, 0, tmp_path / "data.yaml")
+    assert attrs["image_level"] == 1 and attrs["scale"] == [0.5, 0.5, 0.5]
+
+
 def test_normalisation_follows_the_volume_not_the_dtype():
     """A windowed uint16 volume must not be divided by 255 or by 65535."""
     block = np.array([100, 219, 569, 919, 2000], dtype=np.uint16)
@@ -742,6 +820,10 @@ def test_without_truth_only_the_prediction_is_written(tmp_path, monkeypatch):
     class _Grid:
         rank = 3
         reads = 0
+        checks = 0
+
+        def check_ground_truth_readable(self):
+            _Grid.checks += 1
 
         def read_ground_truth(self):
             _Grid.reads += 1
@@ -762,9 +844,10 @@ def test_without_truth_only_the_prediction_is_written(tmp_path, monkeypatch):
            torch.device("cpu"), None)
 
     predict.run_volume(*run, write_truth=False)
-    assert written == [tmp_path / "v.zarr"] and _Grid.reads == 0
+    assert written == [tmp_path / "v.zarr"] and _Grid.reads == 0 and _Grid.checks == 0
     predict.run_volume(*run)
     assert written[1:] == [tmp_path / "v.zarr", tmp_path / "v.gt.zarr"] and _Grid.reads == 1
+    assert _Grid.checks == 1                # the level check runs before the prediction
 
 
 @pytest.mark.unit
@@ -1039,18 +1122,54 @@ def test_a_volume_without_labels_still_gets_a_lattice():
     assert len(grid.tiles) > 0
 
 
-def test_a_volume_read_above_level_zero_is_refused_not_mislocated():
-    """The lattice is in level-0 voxels and reads the chosen level with them.
-
-    For a chosen level of 1 every tile would be read from twice the intended coordinate and cover
-    half the intended extent, and the ground truth -- read in level-0 units -- would describe a
-    different region. Nothing else would notice; the scores would be plausible. So it is refused.
-    """
+@pytest.mark.parametrize(("offset", "expected"), [
+    # lmd's pyramids: level 1's translation is (scale_1 - scale_0) / 2, so its voxel i covers
+    # level-0 voxels 2i and 2i + 1, and a box maps to [ceil(lo / 2), floor(hi / 2)).
+    (-0.5, [[5, 505], [3, 403], [0, 300]]),
+    # A level sharing level 0's origin: voxel i covers [2i - 1, 2i + 1) in level-0 coordinates,
+    # so a voxel the box's edge cuts through is left out.
+    (0.0, [[6, 505], [4, 403], [1, 300]]),
+])
+def test_a_coarser_level_is_tiled_in_its_own_voxels_inside_the_box(offset, expected):
+    """A 4 nm store asked for 8 nm is read at level 1: the level-0 box must become level-1 voxels
+    through the level's own origin, or every tile is read from twice its coordinate."""
     from prediction.grid import VolumeGrid
 
-    grid = _geometry_only_grid(chosen_levels=[1], label_chosen_levels=[0])
-    with pytest.raises(SystemExit, match="pyramid level 1"):
-        VolumeGrid._resolve_geometry(grid, None, "fine-store")
+    class FakeInfo:
+        img_spatial_axes = "zyx"
+        bounding_box = np.array([[10, 1010], [6, 806], [0, 600]])
+
+        class scales:
+            read_shapes = [np.array([256, 256, 256])]
+
+    grid = VolumeGrid.__new__(VolumeGrid)
+    grid.info, grid.patch, grid.image_level = FakeInfo(), [256, 256, 256], 1
+    grid.image_voxel = [8.0, 8.0, 8.0]
+    grid.level_factor, grid.level_offset = [2.0] * 3, [offset] * 3
+    VolumeGrid._resolve_geometry(grid, None, "fine-store")
+
+    box = zip(grid.box_low, grid.box_extent, strict=True)
+    assert [[low, low + extent] for low, extent in box] == expected
+    # Every tile lies inside the level-0 box: level-1 voxel i spans reference coordinates
+    # [2i - offset - 1, 2i - offset + 1), level-0 voxel j spans [j - 0.5, j + 0.5).
+    for origin, _ in grid.tiles:
+        for axis, o in enumerate(origin):
+            low, high = FakeInfo.bounding_box[axis]
+            assert low - 0.5 <= 2 * o - offset - 1 + 1e-9
+            assert 2 * (o + grid.read[axis]) - offset - 1 <= high - 0.5 + 1e-9
+
+
+def test_ground_truth_is_refused_above_level_zero():
+    """Its reader maps boxes by voxel size alone, which only holds on level-0 origins."""
+    from prediction.grid import VolumeGrid
+
+    grid = VolumeGrid.__new__(VolumeGrid)
+    grid.image_level = 1
+    grid.volume = SimpleNamespace(name="fine-store", label_key="labels/seg")
+    with pytest.raises(SystemExit, match="image level 1.*--no-truth"):
+        grid.check_ground_truth_readable()
+    with pytest.raises(SystemExit, match="--no-truth"):
+        grid.read_ground_truth()
 
 
 def test_every_volume_in_the_config_is_predicted_unless_one_is_named():

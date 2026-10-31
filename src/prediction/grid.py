@@ -34,11 +34,19 @@ that same region (mia-evals refuses a table whose rows score different regions).
 axis a flush tile would land between output voxels (a 7.5 nm axis read for an 8 nm model: native
 origin 1838 maps to output 1717.3), so that axis keeps the centred sub-box either way.
 
+**The lattice lives in the voxels of the pyramid level miao reads**, `image_level`: level 0 unless
+a coarser rung serves the target resolution better (a 4 nm store asked for 8 nm reads its level 1).
+The bounding box is stated in level-0 voxels, by the data config and by miao alike, so it is
+converted through that level's own origin -- most of the corpus's pyramids give each level its own
+translation -- to the level's voxels lying wholly inside it; tiles, `native_box()` and the artifact
+geometry are then all in those voxels, and level 0 is the identity.
+
 **The ground truth is read here too**, on the same lattice. Putting a labelling on this grid needs
 the volume's storage axis order, its image level, its *label* level -- which is not the same rung
 (zebrafish labels are 16x16x30 nm against an 8x8x7.5 nm image) -- and the label's own channel axis
 where it has one. That is the same transform chain the prediction went through, and duplicating it
-in the scorer would be a second chance to get it wrong in a way no test compares.
+in the scorer would be a second chance to get it wrong in a way no test compares. It maps boxes
+between the two arrays without their levels' origins, so above image level 0 it is refused.
 
 Every geometric value taken from miao is in **storage** axis order (`img_spatial_axes`), not the
 config's `output_axes`: miao permutes the config's xyz box into the store's zyx where they differ,
@@ -330,6 +338,13 @@ class VolumeGrid:
             if info.scales.label_chosen_levels is not None else None
         )
         self.image_voxel = [float(v) for v in info.img_level_voxels[self.image_level]]
+        # miao's own frame for that level: its voxel over level 0's, and the two levels' origin
+        # difference in level-0 voxels (zero unless the pyramid gives its levels separate origins).
+        offsets = info.scales.image_center_offsets
+        self.level_factor = [float(f) for f in info.scales.relative_scale_factors[0]]
+        self.level_offset = (
+            [float(o) for o in offsets[0]] if offsets is not None else [0.0] * len(self.axes)
+        )
         self.steps_per_patch = int(steps_per_patch)
         self.cover_box = bool(cover_box)
 
@@ -345,21 +360,6 @@ class VolumeGrid:
         `tests/unit/test_predict.py::test_tiles_and_ground_truth_cover_the_same_region`.
         """
         info = self.info
-        if self.image_level != 0:
-            # Every quantity below -- the bounding box, the tile origins, `native_box()` -- is in
-            # LEVEL-0 voxels, and `read_image` indexes the chosen level's array with them. That is
-            # one coordinate system only while the chosen level is 0. miao picks a coarser rung
-            # when it matches the target resolution better (a 4 nm store asked for 8 nm reads its
-            # level 1), and this lattice would then read from the wrong place and shrink every
-            # tile by the level's factor, with nothing downstream able to tell. Refused rather than
-            # generalised, because no volume this has been run on needs it: all eight eval volumes
-            # and all 87 unlabeled pretraining volumes resolve to level 0 at 8 nm (measured).
-            raise SystemExit(
-                f"volume {volume_name!r} would be read at pyramid level {self.image_level}, but "
-                "this lattice is expressed in level-0 voxels and only reads level 0. Predict at a "
-                "target resolution the store's level 0 serves, or extend VolumeGrid to convert "
-                "its box and origins into the chosen level's voxels (and its origin offset)."
-            )
         if info.bounding_box is None:
             raise SystemExit(
                 f"volume {volume_name!r} has no bounding_box. It is not optional for scoring: "
@@ -383,6 +383,8 @@ class VolumeGrid:
                     f"the requested box {box} does not overlap volume {volume_name!r}'s annotated "
                     f"box {declared.tolist()}"
                 )
+        if self.image_level != 0:
+            low, high = self._at_image_level(low, high)
         self.box_low = low
         self.box_extent = [h - lo for lo, h in zip(low, high, strict=True)]
 
@@ -423,9 +425,25 @@ class VolumeGrid:
             for r, v, p in zip(self.read, self.image_voxel, self.patch, strict=True)
         ]
 
+    def _at_image_level(self, low: list[int], high: list[int]) -> tuple[list[int], list[int]]:
+        """A level-0 box `[low, high)` -> the voxels of `image_level` lying wholly inside it.
+
+        In miao's frame (`VolumeDataset._resolve_scale`) level-0 voxel j sits at reference
+        coordinate j, and voxel i of the read level at `i * factor - offset`, `factor` wide. Wholly
+        inside rather than overlapping, for the reason the tiling shrinks rather than pads.
+        """
+        lows, highs = [], []
+        for lo, hi, factor, offset in zip(
+            low, high, self.level_factor, self.level_offset, strict=True
+        ):
+            lows.append(int(np.ceil((lo - 0.5 + offset) / factor + 0.5 - 1e-6)))
+            highs.append(int(np.floor((hi - 0.5 + offset) / factor + 0.5 + 1e-6)))
+        return lows, highs
+
     @property
     def tiles(self) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
-        """(native origin, output origin) per tile, storage axis order."""
+        """(native origin, output origin) per tile, storage axis order; native origins in voxels
+        of `image_level`."""
         out: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
         indices: list[tuple[int, ...]] = [()]
         for axis_origins in self.native_origins:
@@ -441,7 +459,7 @@ class VolumeGrid:
         return out
 
     def native_box(self) -> list[list[int]]:
-        """The aligned sub-box actually covered, in image level-0 voxels, storage order."""
+        """The aligned sub-box actually covered, in voxels of `image_level`, storage order."""
         return [
             [low + offset, low + offset + extent]
             for low, offset, extent in zip(
@@ -500,6 +518,20 @@ class VolumeGrid:
             out = patch_normalize(out)
         return out
 
+    def check_ground_truth_readable(self) -> None:
+        """Refuse a ground truth this lattice cannot place; callable before anything is predicted.
+
+        `read_ground_truth` converts boxes between image and label voxels by voxel size alone,
+        which holds where both sit on level-0 origins. Above level 0 the read level has an origin
+        of its own, and the truth would come back shifted against the tiles.
+        """
+        if self.image_level != 0:
+            raise SystemExit(
+                f"volume {self.volume.name!r} is read at image level {self.image_level}, where the "
+                "ground truth cannot be placed on the lattice. Predict with --no-truth; a task "
+                "scored against the store's own labels (CellMap's semantic tasks) needs none."
+            )
+
     def read_ground_truth(self) -> np.ndarray:
         """The whole aligned region's labelling, on the output lattice, as int64.
 
@@ -508,6 +540,7 @@ class VolumeGrid:
         voxels in each. The box is therefore converted through *physical* coordinates rather than by
         assuming the two arrays share a lattice.
         """
+        self.check_ground_truth_readable()
         if self.volume.label_key is None:
             raise SystemExit(
                 f"volume {self.volume.name!r} has no label_key, so there is no ground truth to "

@@ -374,7 +374,11 @@ def shared_attrs(
             for low, extent in zip(grid.box_low, grid.box_extent, strict=True)
         ],
         "read_shape": list(grid.read),
-        "scale": [p / r for p, r in zip(grid.patch, grid.read, strict=True)],
+        # Lattice voxels per voxel of the store's level 0, the lattice a scorer calls the store's
+        # own: a read of a coarser rung is resampled from it even where `read == patch`.
+        "scale": [
+            p / (r * f) for p, r, f in zip(grid.patch, grid.read, grid.level_factor, strict=True)
+        ],
         "effective_voxel_nm": [round(v, 6) for v in grid.effective_voxel],
         "covers_full_box": grid.covers_full_box,
         "box_coverage": round(grid.box_coverage, 6),
@@ -467,6 +471,8 @@ def run_volume(
     """
     grid = VolumeGrid(config, name, resolve_patch(config, resolved, name, patch_override),
                       cover_box=cover_box)
+    if write_truth and block is None:
+        grid.check_ground_truth_readable()          # before the prediction, not after it
     geometry = ome_geometry(grid)
 
     if block is not None:
