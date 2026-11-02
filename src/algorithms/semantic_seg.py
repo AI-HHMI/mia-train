@@ -112,6 +112,12 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
     `affinity_seg`'s meaning and default. Turn it off when the encoder is being trained too: a
     zeroed output sends the encoder no gradient until it grows (`SubPixelHead`).
 
+    The cross-entropy is each window's mean over its own supervised voxels, averaged over the
+    batch's windows: every window weighs the same whatever fraction of it is labelled, and the
+    loss and its gradient are the same however a global batch is split across data-parallel ranks,
+    whose gradients are averaged -- one GPU at batch 16 trains what eight at batch 2 do. At one
+    window per rank it is the window's own mean, as it always was.
+
     `decode_chunks` decodes and scores the volume in that many slabs along the first spatial axis,
     each inside its own checkpoint, so only one slab's voxel-resolution tensors exist at a time. At
     a 512^3 crop a single 16-channel tensor at voxel resolution already reaches cuDNN's 2^31-element
@@ -329,14 +335,15 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
         """Scores and labels -> the unnormalised sums every reported number is a ratio of.
 
         Sums rather than means because that is what composes: a volume decoded in slabs reports
-        exactly what it would decoded whole, however the slabs are sized. In order: the summed
-        cross-entropy and its normaliser (the supervised voxels, or their total class weight when
-        `class_weights` is set -- `F.cross_entropy`'s own 'mean'), the correctly classified and the
-        supervised voxels, and per class the intersection, the predicted and the labelled count --
-        over the voxels with a single class: a `label_sets` voxel is supervised, and correct when
-        its prediction is in its set, but counts towards no class. With `dice_weight > 0`, three
-        more per class from 1 on, with gradients: the softmax mass on the class's voxels, its whole
-        softmax mass, and its voxel count.
+        exactly what it would decoded whole, however the slabs are sized. In order: per window,
+        `(B,)`, the summed cross-entropy and its normaliser (the window's supervised voxels, or
+        their total class weight when `class_weights` is set -- `F.cross_entropy`'s own 'mean');
+        then over the batch, the correctly classified and the supervised voxels, and per class the
+        intersection, the predicted and the labelled count -- over the voxels with a single class:
+        a `label_sets` voxel is supervised, and correct when its prediction is in its set, but
+        counts towards no class. With `dice_weight > 0`, three more per class from 1 on, with
+        gradients: the softmax mass on the class's voxels, its whole softmax mass, and its voxel
+        count.
         """
         # `register_buffer` widens the attribute's static type to Tensor | Module; it is a
         # tensor or None by construction here.
@@ -347,12 +354,12 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
         if accepts is None:
             single = valid
             targets = labels[single]
-            loss_sum = F.cross_entropy(
-                scores, labels, weight=weights, ignore_index=self.ignore_index, reduction="sum"
+            per_voxel = F.cross_entropy(
+                scores, labels, weight=weights, ignore_index=self.ignore_index, reduction="none"
             )
-            normaliser = (
-                valid.sum().to(loss_sum.dtype) if weights is None else weights[targets].sum()
-            )
+            loss_sum = per_voxel.flatten(1).sum(dim=1)
+            counted = valid if weights is None else weights[torch.where(valid, labels, 0)] * valid
+            normaliser = counted.flatten(1).sum(dim=1).to(loss_sum.dtype)
         else:
             set_ids: torch.Tensor = self.label_set_ids  # type: ignore[assignment]
             single = valid & ~torch.isin(labels, set_ids)
@@ -363,8 +370,9 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
             # minus the log of the probability on the set, and exactly cross-entropy for one class.
             z = scores.to(torch.promote_types(scores.dtype, torch.float32))
             allowed = z.masked_fill(~accept, float("-inf")).logsumexp(dim=1)
-            loss_sum = (z.logsumexp(dim=1) - allowed).masked_fill(~valid, 0.0).sum()
-            normaliser = valid.sum().to(loss_sum.dtype)
+            per_voxel = (z.logsumexp(dim=1) - allowed).masked_fill(~valid, 0.0)
+            loss_sum = per_voxel.flatten(1).sum(dim=1)
+            normaliser = valid.flatten(1).sum(dim=1).to(loss_sum.dtype)
         with torch.no_grad():
             argmax = scores.argmax(dim=1)
             predicted = argmax[single]
@@ -452,11 +460,13 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
     def _metrics(self, totals: tuple[torch.Tensor, ...]) -> dict[str, torch.Tensor]:
         """`_terms`' sums over the whole volume -> the loss and the logged metrics."""
         loss_sum, normaliser, correct, supervised, intersection, predicted, labelled, *dice = totals
-        # A batch in which every voxel is ignored has nothing to learn from. Dividing its summed
-        # cross-entropy -- zero, over no voxels -- by 1 rather than by its zero normaliser keeps the
+        # A window in which every voxel is ignored has nothing to learn from. Dividing its summed
+        # cross-entropy -- zero, over no voxels -- by 1 rather than by its zero normaliser keeps its
         # loss at exactly 0 with a defined gradient, where a mean would be 0/0 and turn every
-        # parameter it reaches into NaN.
-        loss = loss_sum / torch.where(normaliser > 0, normaliser, torch.ones_like(normaliser))
+        # parameter it reaches into NaN. It still counts as a window in the batch's mean, so the
+        # mean does not depend on which windows share a rank.
+        per_window = loss_sum / torch.where(normaliser > 0, normaliser, torch.ones_like(normaliser))
+        loss = per_window.mean()
         parts: dict[str, torch.Tensor] = {}
         if dice:
             overlap, mass, count = (_sum_over_ranks(term) for term in dice)

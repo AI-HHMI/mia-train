@@ -170,7 +170,12 @@ def test_class_weights_normalise_as_cross_entropy_does_and_survive_chunking():
 
     labels = whole._prepare_labels(batch["label"])
     scores = whole.logits(whole.encoder.prepare_input(batch["img"], "lcxyz"))
-    expected = F.cross_entropy(scores, labels, weight=torch.tensor(weights), ignore_index=IGNORE)
+    # Per window, then averaged: the weighted normaliser differs from window to window.
+    expected = torch.stack([
+        F.cross_entropy(scores[b : b + 1], labels[b : b + 1], weight=torch.tensor(weights),
+                        ignore_index=IGNORE)
+        for b in range(len(labels))
+    ]).mean()
     whole_loss = _value(whole.training_step(batch)["loss"])
     assert whole_loss == pytest.approx(_value(expected), rel=1e-5)
     assert _value(split.training_step(batch)["loss"]) == pytest.approx(whole_loss, rel=1e-5)
@@ -472,3 +477,48 @@ def test_chunked_set_gradients_match_the_undivided_decode(decoder):
     """`_batch`'s labels hold the set id 3 already, so set voxels cross every slab face."""
     assert _gradient_disagreement(decoder, torch.float64, label_sets=SETS, dice_weight=1.0) < 1e-12
 
+
+# ---------------------------------------------------------------- the batch is a mean of windows
+
+
+def _uneven_batch() -> dict[str, torch.Tensor]:
+    """Four windows supervised over very different fractions of their voxels, one not at all."""
+    batch = _batch(4)
+    batch["label"][0, :, :, :, 30:] = IGNORE
+    batch["label"][1, :, :, 12:] = IGNORE
+    batch["label"][3] = IGNORE
+    return batch
+
+
+@pytest.mark.unit
+def test_the_loss_is_the_mean_of_its_windows_losses():
+    """Each window weighs the same, however much of it is labelled; an empty one counts as 0."""
+    batch = _uneven_batch()
+    algorithm = _algorithm("subpixel")
+    whole = _value(algorithm.training_step(batch)["loss"])
+    each = [
+        _value(algorithm.training_step({k: v[b : b + 1] for k, v in batch.items()})["loss"])
+        for b in range(4)
+    ]
+    assert each[3] == 0.0
+    assert whole == pytest.approx(sum(each) / 4, rel=1e-5)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("decoder", ["subpixel", "unetr"])
+def test_a_batch_split_across_ranks_trains_what_it_trains_whole(decoder):
+    """Data parallelism averages the ranks' gradients: two halves of a batch, averaged, must give
+    the whole batch's gradient -- which a loss pooled over each rank's voxels does not."""
+    batch = _uneven_batch()
+    whole = _algorithm(decoder)
+    whole.training_step(batch)["loss"].backward()
+    halves = _algorithm(decoder)
+    for part in (slice(0, 2), slice(2, 4)):
+        (halves.training_step({k: v[part] for k, v in batch.items()})["loss"] / 2).backward()
+    for (name, a), (_, b) in zip(
+        whole.named_parameters(), halves.named_parameters(), strict=True
+    ):
+        if a.grad is None:
+            assert b.grad is None, name
+            continue
+        torch.testing.assert_close(b.grad, a.grad, rtol=1e-4, atol=1e-7, msg=name)
