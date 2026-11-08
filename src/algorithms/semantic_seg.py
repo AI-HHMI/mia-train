@@ -458,7 +458,14 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
         return self._metrics(totals)
 
     def _metrics(self, totals: tuple[torch.Tensor, ...]) -> dict[str, torch.Tensor]:
-        """`_terms`' sums over the whole volume -> the loss and the logged metrics."""
+        """`_terms`' sums over the whole volume -> the loss and the logged metrics.
+
+        The metrics are ratios of counts summed over the global batch -- every slab and every rank,
+        as the Dice term's sums are -- so they describe the whole batch however its windows are
+        split across ranks. One rank's share alone can hold nothing to score: no supervised voxel,
+        or no voxel of a single class. Each rank used to report its own ratios, and the cross-rank
+        average in `reduce_metrics` then carried that one rank's NaN into the logged value.
+        """
         loss_sum, normaliser, correct, supervised, intersection, predicted, labelled, *dice = totals
         # A window in which every voxel is ignored has nothing to learn from. Dividing its summed
         # cross-entropy -- zero, over no voxels -- by 1 rather than by its zero normaliser keeps its
@@ -474,7 +481,12 @@ class SemanticSegmentation(DenseDecoding, BaseAlgorithm):
             parts = {"cross_entropy": loss.detach(), "dice_loss": dice_loss.detach()}
             loss = loss + self.dice_weight * dice_loss
         with torch.no_grad():
-            # NaN when nothing is supervised: there is no voxel to have got right.
+            counts = _sum_over_ranks(
+                torch.cat([torch.stack([correct, supervised]), intersection, predicted, labelled])
+            )
+            correct, supervised = counts[0], counts[1]
+            intersection, predicted, labelled = counts[2:].view(3, self.num_classes)
+            # NaN when nothing in the global batch is supervised: no voxel to have got right.
             accuracy = correct / supervised
             # Mean IoU over the classes *present in this batch*, which is the number that moves
             # when a rare organelle starts being predicted. Accuracy will not: background alone

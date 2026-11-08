@@ -1,10 +1,14 @@
-"""`semantic_seg`'s Dice term is pooled over the global batch, not over each rank's share of it.
+"""`semantic_seg`'s Dice term and logged metrics are pooled over the global batch, not over each
+rank's share of it.
 
 Two ranks with one crop each must report the Dice loss one process reports for both crops, and the
 average of their gradients -- what data-parallel training applies -- must be that loss's gradient.
 Per-rank Dice would fail both: a class missing from one rank's crop would cost that rank a full 1.0.
 The two crops have equal numbers of supervised voxels, so the per-rank cross-entropy means average
 to the single process's mean and the whole loss can be compared, not only its Dice half.
+
+The metrics likewise must be what one process reports for both crops, including when one rank's
+crop has nothing supervised and so has no ratio of its own.
 """
 
 from __future__ import annotations
@@ -81,3 +85,40 @@ def test_two_ranks_pool_the_dice_terms_like_one_process(run_distributed):
         torch.testing.assert_close(
             torch.from_numpy(averaged), torch.from_numpy(expected), rtol=1e-10, atol=1e-12, msg=name
         )
+
+
+METRICS = ("pixel_accuracy", "mean_iou", "classes_present")
+
+
+def _metric_batch(second: str) -> dict[str, torch.Tensor]:
+    """`_batch`'s crops; with `second="unsupervised"` every voxel of the second is ignored."""
+    batch = _batch()
+    if second == "unsupervised":
+        batch["label"][1] = IGNORE
+    return batch
+
+
+def _metrics_of_one_crop_per_rank(rank: int, world_size: int, second: str) -> dict[str, float]:
+    torch.set_default_dtype(torch.float64)
+    batch = {name: value[rank : rank + 1] for name, value in _metric_batch(second).items()}
+    reported = _algorithm().training_step(batch)
+    return {name: float(reported[name]) for name in METRICS}
+
+
+@pytest.mark.cpu_dist
+@pytest.mark.parametrize("second", ["labelled", "unsupervised"])
+def test_two_ranks_report_the_metrics_one_process_reports_for_both_crops(run_distributed, second):
+    """Each rank's own ratios, averaged across ranks, would fail both cases: an unsupervised crop
+    leaves its rank 0/0 for accuracy and mean IoU, and with class 3 in the first crop only the ranks
+    differ in mean IoU and in classes present."""
+    ranks = run_distributed(_metrics_of_one_crop_per_rank, world_size=2, args=(second,))
+
+    torch.set_default_dtype(torch.float64)
+    try:
+        reported = _algorithm().training_step(_metric_batch(second))
+    finally:
+        torch.set_default_dtype(torch.float32)
+    single = {name: float(reported[name]) for name in METRICS}
+
+    for result in ranks:
+        assert result == pytest.approx(single, rel=1e-12)
